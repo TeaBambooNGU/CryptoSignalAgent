@@ -69,6 +69,8 @@ class APITestCase(unittest.TestCase):
         self.assertIn("report", payload)
         self.assertIn("trace_id", payload)
         self.assertTrue(isinstance(payload["citations"], list))
+        self.assertEqual(len(payload["workflow_steps"]), 9)
+        self.assertTrue(all("node_id" in step and "duration_ms" in step for step in payload["workflow_steps"]))
         self.assertEqual(resp.headers.get("X-Trace-Id"), payload["trace_id"])
 
     def test_research_query_uses_request_trace_id(self) -> None:

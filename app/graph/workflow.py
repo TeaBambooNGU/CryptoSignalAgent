@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import re
 from collections import Counter
+from time import perf_counter
 from typing import Any
 from uuid import uuid4
 
@@ -89,6 +90,7 @@ class ResearchGraphRunner:
             "trace_id": final_trace_id,
             "errors": [],
             "retry_count": 0,
+            "workflow_steps": [],
         }
 
         with log_context(
@@ -110,6 +112,7 @@ class ResearchGraphRunner:
             citations=output.get("citations", []),
             trace_id=final_trace_id,
             errors=output.get("errors", []),
+            workflow_steps=output.get("workflow_steps", []),
         )
 
     # ===== 节点定义 =====
@@ -120,17 +123,20 @@ class ResearchGraphRunner:
         状态产出：`memory_profile`。
         """
 
-        user_id = state["user_id"]
-        with log_context(component="graph.load_user_memory"):
-            logger.info("节点开始")
-            self.memory_service.save_task_context(user_id=user_id, task_context=state.get("task_context"))
-            profile = self.memory_service.load_memory_profile(user_id=user_id)
-            logger.info(
-                "节点完成 long_term=%s session=%s",
-                len(profile.get("long_term_memory", [])),
-                len(profile.get("session_memory", [])),
-            )
-        return {"memory_profile": profile}
+        def _node_logic() -> ResearchState:
+            user_id = state["user_id"]
+            with log_context(component="graph.load_user_memory"):
+                logger.info("节点开始")
+                self.memory_service.save_task_context(user_id=user_id, task_context=state.get("task_context"))
+                profile = self.memory_service.load_memory_profile(user_id=user_id)
+                logger.info(
+                    "节点完成 long_term=%s session=%s",
+                    len(profile.get("long_term_memory", [])),
+                    len(profile.get("session_memory", [])),
+                )
+            return {"memory_profile": profile}
+
+        return self._run_tracked_node(state, node_id="load_user_memory", handler=_node_logic)
 
     def parse_intent_scope(self, state: ResearchState) -> ResearchState:
         """节点目标：解析查询范围与关注标的。
@@ -139,25 +145,28 @@ class ResearchGraphRunner:
         状态产出：`symbols`。
         """
 
-        query = state["query"]
-        with log_context(component="graph.parse_intent_scope"):
-            symbols = {token.upper() for token in SYMBOL_PATTERN.findall(query)}
+        def _node_logic() -> ResearchState:
+            query = state["query"]
+            with log_context(component="graph.parse_intent_scope"):
+                symbols = {token.upper() for token in SYMBOL_PATTERN.findall(query)}
 
-            profile_watchlist = state.get("memory_profile", {}).get("watchlist", [])
-            if isinstance(profile_watchlist, list):
-                symbols.update(str(item).upper() for item in profile_watchlist)
+                profile_watchlist = state.get("memory_profile", {}).get("watchlist", [])
+                if isinstance(profile_watchlist, list):
+                    symbols.update(str(item).upper() for item in profile_watchlist)
 
-            task_context = state.get("task_context") or {}
-            ctx_symbols = task_context.get("symbols") if isinstance(task_context, dict) else None
-            if isinstance(ctx_symbols, list):
-                symbols.update(str(item).upper() for item in ctx_symbols)
+                task_context = state.get("task_context") or {}
+                ctx_symbols = task_context.get("symbols") if isinstance(task_context, dict) else None
+                if isinstance(ctx_symbols, list):
+                    symbols.update(str(item).upper() for item in ctx_symbols)
 
-            if not symbols:
-                symbols = {"BTC", "ETH"}
+                if not symbols:
+                    symbols = {"BTC", "ETH"}
 
-            sorted_symbols = sorted(symbols)
-            logger.info("节点完成 symbols=%s", sorted_symbols)
-            return {"symbols": sorted_symbols}
+                sorted_symbols = sorted(symbols)
+                logger.info("节点完成 symbols=%s", sorted_symbols)
+                return {"symbols": sorted_symbols}
+
+        return self._run_tracked_node(state, node_id="parse_intent_scope", handler=_node_logic)
 
     def collect_signals_via_mcp(self, state: ResearchState) -> ResearchState:
         """节点目标：通过 MCP 拉取信号。
@@ -166,19 +175,22 @@ class ResearchGraphRunner:
         状态产出：`raw_signals`、`errors`。
         """
 
-        with log_context(component="graph.collect_signals"):
-            raw_signals, errors = self._collect_with_retry(
-                task_id=state["task_id"],
-                query=state["query"],
-                symbols=state.get("symbols", []),
-            )
-            logger.info("节点完成 raw_signals=%s errors=%s", len(raw_signals), len(errors))
+        def _node_logic() -> ResearchState:
+            with log_context(component="graph.collect_signals"):
+                raw_signals, errors = self._collect_with_retry(
+                    task_id=state["task_id"],
+                    query=state["query"],
+                    symbols=state.get("symbols", []),
+                )
+                logger.info("节点完成 raw_signals=%s errors=%s", len(raw_signals), len(errors))
 
-        merged_errors = [*state.get("errors", []), *errors]
-        return {
-            "raw_signals": [item.model_dump() for item in raw_signals],
-            "errors": merged_errors,
-        }
+            merged_errors = [*state.get("errors", []), *errors]
+            return {
+                "raw_signals": [item.model_dump() for item in raw_signals],
+                "errors": merged_errors,
+            }
+
+        return self._run_tracked_node(state, node_id="collect_signals_via_mcp", handler=_node_logic)
 
     @retry(
         stop=stop_after_attempt(3),
@@ -202,23 +214,26 @@ class ResearchGraphRunner:
         状态产出：`signals`。
         """
 
-        raw_signals = state.get("raw_signals", [])
-        task_id = state["task_id"]
+        def _node_logic() -> ResearchState:
+            raw_signals = state.get("raw_signals", [])
+            task_id = state["task_id"]
 
-        with log_context(component="graph.normalize_and_index"):
-            normalized = self.research_service.normalize_signals(
-                task_id=task_id,
-                raw_signals=[self._raw_signal_from_dict(item) for item in raw_signals],
-            )
-            if normalized:
-                inserted = self.research_service.ingest_signals(normalized)
-                logger.info("节点完成 normalized=%s inserted_chunks=%s", len(normalized), inserted)
-            else:
-                logger.warning("节点降级 raw_signals=0")
-                errors = [*state.get("errors", []), "MCP 未返回有效信号，使用历史检索降级生成报告"]
-                return {"signals": [], "errors": errors}
+            with log_context(component="graph.normalize_and_index"):
+                normalized = self.research_service.normalize_signals(
+                    task_id=task_id,
+                    raw_signals=[self._raw_signal_from_dict(item) for item in raw_signals],
+                )
+                if normalized:
+                    inserted = self.research_service.ingest_signals(normalized)
+                    logger.info("节点完成 normalized=%s inserted_chunks=%s", len(normalized), inserted)
+                else:
+                    logger.warning("节点降级 raw_signals=0")
+                    errors = [*state.get("errors", []), "MCP 未返回有效信号，使用历史检索降级生成报告"]
+                    return {"signals": [], "errors": errors}
 
-        return {"signals": normalized}
+            return {"signals": normalized}
+
+        return self._run_tracked_node(state, node_id="normalize_and_index", handler=_node_logic)
 
     def retrieve_context(self, state: ResearchState) -> ResearchState:
         """节点目标：检索历史证据与最新上下文。
@@ -227,22 +242,25 @@ class ResearchGraphRunner:
         状态产出：`retrieved_docs`。
         """
 
-        query = state["query"]
-        symbols = state.get("symbols", [])
+        def _node_logic() -> ResearchState:
+            query = state["query"]
+            symbols = state.get("symbols", [])
 
-        with log_context(component="graph.retrieve_context"):
-            docs = self._retrieve_with_retry(query=query, symbols=symbols)
-            fallback_used = False
-            if not docs and symbols:
-                # 检索不足时放宽条件重试一次。
-                docs = self._retrieve_with_retry(query=query, symbols=[])
-                fallback_used = True
-                if not docs:
-                    logger.warning("节点完成 docs=0 fallback=%s", fallback_used)
-                    return {"retrieved_docs": [], "errors": [*state.get("errors", []), "检索命中不足"]}
+            with log_context(component="graph.retrieve_context"):
+                docs = self._retrieve_with_retry(query=query, symbols=symbols)
+                fallback_used = False
+                if not docs and symbols:
+                    # 检索不足时放宽条件重试一次。
+                    docs = self._retrieve_with_retry(query=query, symbols=[])
+                    fallback_used = True
+                    if not docs:
+                        logger.warning("节点完成 docs=0 fallback=%s", fallback_used)
+                        return {"retrieved_docs": [], "errors": [*state.get("errors", []), "检索命中不足"]}
 
-            logger.info("节点完成 docs=%s fallback=%s", len(docs), fallback_used)
-            return {"retrieved_docs": docs}
+                logger.info("节点完成 docs=%s fallback=%s", len(docs), fallback_used)
+                return {"retrieved_docs": docs}
+
+        return self._run_tracked_node(state, node_id="retrieve_context", handler=_node_logic)
 
     @retry(
         stop=stop_after_attempt(2),
@@ -262,26 +280,29 @@ class ResearchGraphRunner:
         状态产出：`analysis_summary`。
         """
 
-        signals = state.get("signals", [])
-        docs = state.get("retrieved_docs", [])
+        def _node_logic() -> ResearchState:
+            signals = state.get("signals", [])
+            docs = state.get("retrieved_docs", [])
 
-        with log_context(component="graph.analyze_signals"):
-            if not signals:
-                summary = "实时信号不足，分析主要依赖历史证据与用户偏好。"
-                logger.info("节点完成 signals=0 docs=%s", len(docs))
+            with log_context(component="graph.analyze_signals"):
+                if not signals:
+                    summary = "实时信号不足，分析主要依赖历史证据与用户偏好。"
+                    logger.info("节点完成 signals=0 docs=%s", len(docs))
+                    return {"analysis_summary": summary}
+
+                symbol_counter = Counter(item.symbol for item in signals)
+                type_counter = Counter(item.signal_type.value for item in signals)
+                avg_conf = sum(item.confidence for item in signals) / len(signals)
+
+                summary = (
+                    f"信号总量={len(signals)}；覆盖标的={dict(symbol_counter)}；"
+                    f"类型分布={dict(type_counter)}；平均置信度={avg_conf:.2f}；"
+                    f"检索命中={len(docs)}。"
+                )
+                logger.info("节点完成 signals=%s docs=%s", len(signals), len(docs))
                 return {"analysis_summary": summary}
 
-            symbol_counter = Counter(item.symbol for item in signals)
-            type_counter = Counter(item.signal_type.value for item in signals)
-            avg_conf = sum(item.confidence for item in signals) / len(signals)
-
-            summary = (
-                f"信号总量={len(signals)}；覆盖标的={dict(symbol_counter)}；"
-                f"类型分布={dict(type_counter)}；平均置信度={avg_conf:.2f}；"
-                f"检索命中={len(docs)}。"
-            )
-            logger.info("节点完成 signals=%s docs=%s", len(signals), len(docs))
-            return {"analysis_summary": summary}
+        return self._run_tracked_node(state, node_id="analyze_signals", handler=_node_logic)
 
     def generate_report(self, state: ResearchState) -> ResearchState:
         """节点目标：生成结构化研报。
@@ -290,23 +311,26 @@ class ResearchGraphRunner:
         状态产出：`report_draft`、`final_report`、`citations`。
         """
 
-        payload = ReportGenerationInput(
-            user_id=state["user_id"],
-            query=state["query"],
-            task_id=state["task_id"],
-            memory_profile=state.get("memory_profile", {}),
-            signals=state.get("signals", []),
-            retrieved_docs=state.get("retrieved_docs", []),
-        )
+        def _node_logic() -> ResearchState:
+            payload = ReportGenerationInput(
+                user_id=state["user_id"],
+                query=state["query"],
+                task_id=state["task_id"],
+                memory_profile=state.get("memory_profile", {}),
+                signals=state.get("signals", []),
+                retrieved_docs=state.get("retrieved_docs", []),
+            )
 
-        with log_context(component="graph.generate_report"):
-            output = self._generate_report_with_retry(payload)
-            logger.info("节点完成 report_len=%s citations=%s", len(output.report), len(output.citations))
-            return {
-                "report_draft": output.draft,
-                "final_report": output.report,
-                "citations": output.citations,
-            }
+            with log_context(component="graph.generate_report"):
+                output = self._generate_report_with_retry(payload)
+                logger.info("节点完成 report_len=%s citations=%s", len(output.report), len(output.citations))
+                return {
+                    "report_draft": output.draft,
+                    "final_report": output.report,
+                    "citations": output.citations,
+                }
+
+        return self._run_tracked_node(state, node_id="generate_report", handler=_node_logic)
 
     @retry(
         stop=stop_after_attempt(3),
@@ -330,28 +354,61 @@ class ResearchGraphRunner:
         - 短期信息：任务上下文和一次性中间结论不进入长期记忆。
         """
 
-        with log_context(component="graph.persist_memory"):
-            self.memory_service.persist_report_memory(
-                user_id=state["user_id"],
-                query=state["query"],
-                report=state.get("final_report", ""),
-            )
-            logger.info("节点完成")
-        return {}
+        def _node_logic() -> ResearchState:
+            with log_context(component="graph.persist_memory"):
+                self.memory_service.persist_report_memory(
+                    user_id=state["user_id"],
+                    query=state["query"],
+                    report=state.get("final_report", ""),
+                )
+                logger.info("节点完成")
+            return {}
+
+        return self._run_tracked_node(state, node_id="persist_memory", handler=_node_logic)
 
     def finalize_response(self, state: ResearchState) -> ResearchState:
         """节点目标：收敛输出结构，保证字段完整。"""
 
-        with log_context(component="graph.finalize_response"):
-            final_report = state.get("final_report")
-            if not final_report:
-                final_report = "当前数据不足，无法生成稳定结论，请稍后重试。"
-            logger.info("节点完成 errors=%s", len(state.get("errors", [])))
-            return {
-                "final_report": final_report,
-                "citations": state.get("citations", []),
-                "errors": state.get("errors", []),
-            }
+        def _node_logic() -> ResearchState:
+            with log_context(component="graph.finalize_response"):
+                final_report = state.get("final_report")
+                if not final_report:
+                    final_report = "当前数据不足，无法生成稳定结论，请稍后重试。"
+                logger.info("节点完成 errors=%s", len(state.get("errors", [])))
+                return {
+                    "final_report": final_report,
+                    "citations": state.get("citations", []),
+                    "errors": state.get("errors", []),
+                }
+
+        return self._run_tracked_node(state, node_id="finalize_response", handler=_node_logic)
+
+    def _run_tracked_node(self, state: ResearchState, node_id: str, handler) -> ResearchState:
+        """执行节点并记录真实耗时与状态。"""
+
+        start = perf_counter()
+        try:
+            update = handler() or {}
+        except Exception:
+            state["workflow_steps"] = self._append_workflow_step(state, node_id=node_id, status="error", start=start)
+            raise
+        return {
+            **update,
+            "workflow_steps": self._append_workflow_step(state, node_id=node_id, status="success", start=start),
+        }
+
+    def _append_workflow_step(
+        self,
+        state: ResearchState,
+        node_id: str,
+        status: str,
+        start: float,
+    ) -> list[dict[str, Any]]:
+        """追加单个工作流节点执行记录。"""
+
+        duration_ms = max(int((perf_counter() - start) * 1000), 0)
+        step = {"node_id": node_id, "status": status, "duration_ms": duration_ms}
+        return [*state.get("workflow_steps", []), step]
 
     def _raw_signal_from_dict(self, item: dict[str, Any]):
         """将字典恢复为 RawSignal。"""

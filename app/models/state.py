@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from typing import Any, TypedDict
 
-from app.models.schemas import Citation, NormalizedSignal, RetrievedChunk
+from app.models.schemas import Citation, NormalizedSignal, RetrievedChunk, WorkflowStep
 
 
 class ResearchState(TypedDict, total=False):
@@ -31,6 +31,7 @@ class ResearchState(TypedDict, total=False):
     report_draft: str
     final_report: str
     citations: list[Citation]
+    workflow_steps: list[WorkflowStep]
 
     errors: list[str]
     retry_count: int

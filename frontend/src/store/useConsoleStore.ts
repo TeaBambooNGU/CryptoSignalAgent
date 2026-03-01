@@ -5,6 +5,7 @@ export interface WorkflowNode {
   id: string;
   label: string;
   status: "idle" | "running" | "success" | "error";
+  durationMs?: number;
 }
 
 interface ConsoleState {

@@ -20,7 +20,10 @@ export function PulseRail({ nodes }: PulseRailProps) {
             <span className="rail-dot" aria-hidden="true" />
             <div className="rail-content">
               <p className="rail-label">{node.label}</p>
-              <p className="rail-id">{node.id}</p>
+              <p className="rail-id">
+                {node.id}
+                {typeof node.durationMs === "number" ? ` · ${node.durationMs}ms` : ""}
+              </p>
             </div>
           </li>
         ))}

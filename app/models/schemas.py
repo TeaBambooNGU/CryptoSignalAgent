@@ -48,6 +48,14 @@ class Citation(BaseModel):
     published_at: datetime | None = Field(default=None, description="发布时间（可选）")
 
 
+class WorkflowStep(BaseModel):
+    """工作流节点执行信息。"""
+
+    node_id: str = Field(..., description="节点 ID")
+    status: str = Field(..., description="执行状态：success/error")
+    duration_ms: int = Field(..., ge=0, description="节点耗时（毫秒）")
+
+
 class QueryResponse(BaseModel):
     """研报查询响应。"""
 
@@ -55,6 +63,7 @@ class QueryResponse(BaseModel):
     citations: list[Citation] = Field(default_factory=list, description="引用列表")
     trace_id: str = Field(..., description="链路追踪 ID")
     errors: list[str] = Field(default_factory=list, description="非致命错误信息")
+    workflow_steps: list[WorkflowStep] = Field(default_factory=list, description="真实工作流执行轨迹")
 
 
 class UserPreferencesRequest(BaseModel):

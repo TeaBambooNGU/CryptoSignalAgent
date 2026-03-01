@@ -175,9 +175,21 @@ nav {
 
 .dashboard-shell {
   display: grid;
-  grid-template-columns: minmax(280px, 360px) minmax(240px, 1fr) minmax(320px, 460px);
+  grid-template-columns: minmax(300px, 380px) minmax(320px, 1fr);
   gap: var(--space-4);
   align-items: start;
+}
+
+.panel--query {
+  grid-column: 1;
+}
+
+.panel--rail {
+  grid-column: 2;
+}
+
+.panel--report {
+  grid-column: 1 / -1;
 }
 
 .stack-layout {
@@ -352,10 +364,115 @@ nav {
 }
 
 .report-body {
-  white-space: pre-wrap;
-  line-height: 1.66;
+  line-height: 1.7;
   font-size: 0.95rem;
   margin: var(--space-3) 0 var(--space-4);
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+}
+
+.report-body h1,
+.report-body h2,
+.report-body h3,
+.report-body h4,
+.report-body h5,
+.report-body h6 {
+  font-family: var(--font-display);
+  line-height: 1.35;
+}
+
+.report-body h1 {
+  font-size: 1.4rem;
+}
+
+.report-body h2 {
+  font-size: 1.2rem;
+}
+
+.report-body h3 {
+  font-size: 1.05rem;
+}
+
+.report-body p {
+  line-height: 1.7;
+}
+
+.report-body ul,
+.report-body ol {
+  margin: 0;
+  padding-left: 1.2rem;
+  display: grid;
+  gap: 0.35rem;
+}
+
+.report-body hr {
+  width: 100%;
+  border: none;
+  border-top: 1px solid var(--line);
+}
+
+.report-code {
+  margin: 0;
+  padding: var(--space-3);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  background: rgba(6, 9, 14, 0.9);
+  overflow-x: auto;
+}
+
+.report-table-wrap {
+  overflow-x: auto;
+}
+
+.report-table {
+  width: 100%;
+  min-width: 520px;
+  border-collapse: collapse;
+  border: 1px solid var(--line);
+}
+
+.report-table th,
+.report-table td {
+  border: 1px solid var(--line);
+  padding: var(--space-2);
+  text-align: left;
+  vertical-align: top;
+}
+
+.report-table th {
+  background: rgba(95, 255, 224, 0.08);
+}
+
+.report-body blockquote {
+  margin: 0;
+  padding: var(--space-2) var(--space-3);
+  border-left: 2px solid var(--accent-soft);
+  color: var(--text-muted);
+  background: rgba(95, 255, 224, 0.04);
+}
+
+.think-block {
+  margin: var(--space-3) 0;
+  border: 1px dashed var(--line);
+  border-radius: var(--radius-sm);
+  background: rgba(8, 12, 19, 0.7);
+}
+
+.think-block summary {
+  cursor: pointer;
+  padding: var(--space-2) var(--space-3);
+  color: var(--text-muted);
+  font-size: 0.84rem;
+}
+
+.think-block pre {
+  margin: 0;
+  padding: 0 var(--space-3) var(--space-3);
+  white-space: pre-wrap;
+  line-height: 1.55;
+  color: #b8c4db;
+  font-size: 0.83rem;
 }
 
 .trace-line {

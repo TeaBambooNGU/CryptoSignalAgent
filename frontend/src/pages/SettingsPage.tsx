@@ -2,7 +2,7 @@ const runtimeItems = [
   { key: "API Base", value: import.meta.env.VITE_API_BASE || "(same-origin/proxy)" },
   { key: "Transport", value: "MCP streamable_http / stdio / sse" },
   { key: "Pipeline", value: "9-node LangGraph workflow" },
-  { key: "Output", value: "report + citations + trace_id + errors" },
+  { key: "Output", value: "report + citations + trace_id + errors + workflow_steps" },
 ];
 
 const designItems = [

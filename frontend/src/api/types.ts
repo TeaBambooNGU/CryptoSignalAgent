@@ -13,11 +13,18 @@ export interface Citation {
   published_at?: string | null;
 }
 
+export interface WorkflowStep {
+  node_id: string;
+  status: "success" | "error";
+  duration_ms: number;
+}
+
 export interface QueryResponse {
   report: string;
   citations: Citation[];
   trace_id: string;
   errors: string[];
+  workflow_steps: WorkflowStep[];
 }
 
 export interface UserPreferencesRequest {
