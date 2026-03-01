@@ -100,10 +100,18 @@ REP --> U
 
 ## 6.4 采集链路
 1. LangGraph 节点触发采集任务。
-2. 调用 MCP 工具获取原始数据。
+2. 使用标准 MCP 客户端（支持 `streamable_http / stdio / sse`）调用工具获取原始数据。
 3. 标准化映射为统一信号结构。
 4. 落库 Milvus（研究语料）并生成可检索 chunk。
 5. 失败场景走 tenacity 重试；重试失败后降级返回“数据不足说明”。
+
+## 6.5 V1 推荐 MCP Servers（已验证可用）
+1. `coingecko`（`https://mcp.api.coingecko.com/mcp`）
+   - 能力：行情、币种、趋势与部分链上指标。
+2. `defillama`（`https://mcpllama.com/mcp`）
+   - 能力：链上 TVL、协议维度数据。
+3. `cryptonews`（stdio：`uvx cryptonewsmcp`）
+   - 能力：加密新闻 RSS 聚合（如 CoinDesk/Decrypt）。
 
 ---
 
@@ -340,6 +348,7 @@ uv add langchain langgraph llama-index mem0ai pymilvus tenacity langsmith pydant
 uv add llama-index-vector-stores-milvus
 uv add langchain-openai openai
 uv add langchain-community zhipuai
+uv add mcp
 ```
 
 ---

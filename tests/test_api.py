@@ -17,8 +17,9 @@ class APITestCase(unittest.TestCase):
         # 测试环境关闭外部依赖，保证本地可重复执行。
         os.environ["MILVUS_ENABLED"] = "false"
         os.environ["MEM0_ENABLED"] = "false"
-        os.environ["MCP_TOOL_ENDPOINTS"] = ""
+        os.environ["MCP_SERVERS"] = ""
         os.environ["MINIMAX_API_KEY"] = ""
+        os.environ["ZHIPUAI_API_KEY"] = ""
 
         import app.config.settings as settings_module
 

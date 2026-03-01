@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import hashlib
+import inspect
 import json
 import logging
 from datetime import datetime, timezone
@@ -43,17 +44,40 @@ class MemoryService:
         try:
             import mem0  # type: ignore
 
+            client_cls = getattr(mem0, "MemoryClient", None)
+            if client_cls is not None:
+                client = client_cls(
+                    api_key=self.settings.mem0_api_key,
+                    org_id=self.settings.mem0_org_id or None,
+                    project_id=self.settings.mem0_project_id or None,
+                )
+                logger.info("Mem0 MemoryClient 初始化成功")
+                return client
+
             memory_cls = getattr(mem0, "Memory", None)
             if memory_cls is None:
-                logger.warning("mem0 包未提供 Memory 类，自动降级")
+                logger.warning("mem0 包未提供可用客户端（MemoryClient/Memory），自动降级")
                 return None
 
-            client = memory_cls(
-                api_key=self.settings.mem0_api_key,
-                org_id=self.settings.mem0_org_id or None,
-                project_id=self.settings.mem0_project_id or None,
-            )
-            logger.info("Mem0 客户端初始化成功")
+            parameters = inspect.signature(memory_cls).parameters
+            supports_kwargs = any(param.kind == inspect.Parameter.VAR_KEYWORD for param in parameters.values())
+            candidate_kwargs = {
+                "api_key": self.settings.mem0_api_key,
+                "org_id": self.settings.mem0_org_id or None,
+                "project_id": self.settings.mem0_project_id or None,
+            }
+            init_kwargs = {
+                key: value
+                for key, value in candidate_kwargs.items()
+                if value is not None and (supports_kwargs or key in parameters)
+            }
+
+            if not init_kwargs and not supports_kwargs:
+                logger.warning("mem0.Memory 构造函数不支持 API 凭据参数，自动降级")
+                return None
+
+            client = memory_cls(**init_kwargs)
+            logger.info("Mem0 Memory 初始化成功")
             return client
         except Exception:
             logger.exception("Mem0 客户端初始化失败，自动降级")
@@ -267,8 +291,19 @@ class MemoryService:
             if not callable(search_fn):
                 return []
             result = search_fn(query=query, user_id=user_id, limit=limit)
-            if isinstance(result, list):
-                return [item for item in result if isinstance(item, dict)]
+            return self._normalize_mem0_search_result(result)
         except Exception:
             logger.exception("Mem0 search 调用失败，已忽略")
+        return []
+
+    def _normalize_mem0_search_result(self, result: Any) -> list[dict[str, Any]]:
+        """兼容 Mem0 不同客户端的 search 返回结构。"""
+
+        if isinstance(result, list):
+            return [item for item in result if isinstance(item, dict)]
+        if isinstance(result, dict):
+            for key in ("results", "data"):
+                items = result.get(key)
+                if isinstance(items, list):
+                    return [item for item in items if isinstance(item, dict)]
         return []

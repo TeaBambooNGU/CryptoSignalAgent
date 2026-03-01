@@ -63,7 +63,7 @@ class Settings:
     mem0_org_id: str = ""
     mem0_project_id: str = ""
 
-    mcp_tool_endpoints: tuple[str, ...] = ()
+    mcp_servers: tuple[dict[str, Any], ...] = ()
 
     report_disclaimer: str = "免责声明：本报告仅用于研究与信息交流，不构成任何投资建议。"
 
@@ -100,18 +100,21 @@ class Settings:
             except ValueError:
                 return default
 
-        def _as_tuple(name: str) -> tuple[str, ...]:
+        def _as_dict_tuple(name: str) -> tuple[dict[str, Any], ...]:
             raw = os.getenv(name, "")
             if not raw:
                 return ()
-            # 优先支持 JSON 数组，便于多环境配置。
             try:
                 parsed: Any = json.loads(raw)
-                if isinstance(parsed, list):
-                    return tuple(str(item).strip() for item in parsed if str(item).strip())
             except json.JSONDecodeError:
-                pass
-            return tuple(part.strip() for part in raw.split(",") if part.strip())
+                return ()
+            if not isinstance(parsed, list):
+                return ()
+            result: list[dict[str, Any]] = []
+            for item in parsed:
+                if isinstance(item, dict):
+                    result.append(item)
+            return tuple(result)
 
         return cls(
             app_name=os.getenv("APP_NAME", defaults.app_name),
@@ -152,7 +155,7 @@ class Settings:
             mem0_api_key=os.getenv("MEM0_API_KEY", ""),
             mem0_org_id=os.getenv("MEM0_ORG_ID", ""),
             mem0_project_id=os.getenv("MEM0_PROJECT_ID", ""),
-            mcp_tool_endpoints=_as_tuple("MCP_TOOL_ENDPOINTS"),
+            mcp_servers=_as_dict_tuple("MCP_SERVERS"),
             report_disclaimer=os.getenv("REPORT_DISCLAIMER", defaults.report_disclaimer),
         )
 

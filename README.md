@@ -83,7 +83,8 @@ MEM0_ORG_ID=
 MEM0_PROJECT_ID=
 
 # MCP（逗号分隔或 JSON 数组）
-MCP_TOOL_ENDPOINTS=
+# 标准 MCP Server（JSON 数组，推荐）
+MCP_SERVERS=
 ```
 
 ## 启动方式
@@ -110,6 +111,37 @@ uv run python main.py
 - `POST /v1/user/preferences`
 - `GET /v1/user/profile/{user_id}`
 - `POST /v1/research/ingest`
+
+## 标准 MCP 配置示例（已验证）
+
+```env
+MCP_SERVERS=[{"name":"coingecko","transport":"streamable_http","url":"https://mcp.api.coingecko.com/mcp"},{"name":"defillama","transport":"streamable_http","url":"https://mcpllama.com/mcp"},{"name":"cryptonews","transport":"stdio","command":"uvx","args":["cryptonewsmcp"]}]
+```
+
+- `coingecko`：行情/币种/趋势数据
+- `defillama`：链上 TVL/协议维度数据
+- `cryptonews`：新闻 RSS 聚合（stdio 启动）
+
+可用性验证：
+
+```bash
+uv run python scripts/verify_mcp_servers.py
+```
+
+## 用户如何拿到研报
+
+1. 可选：先写入用户偏好
+2. 调用 `POST /v1/research/query` 获取 `report + citations + trace_id`
+
+```bash
+curl -X POST http://127.0.0.1:8000/v1/research/query \
+  -H "Content-Type: application/json" \
+  -d '{
+    "user_id":"u001",
+    "query":"请给我 BTC 和 ETH 的 24 小时风险信号研报",
+    "task_context":{"symbols":["BTC","ETH"]}
+  }'
+```
 
 ## 测试
 
