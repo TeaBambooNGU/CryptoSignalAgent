@@ -1,0 +1,63 @@
+# =========================
+# Python
+# =========================
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Build / packaging
+build/
+dist/
+wheels/
+*.egg-info/
+.eggs/
+pip-wheel-metadata/
+
+# =========================
+# Virtual environments
+# =========================
+.venv/
+venv/
+env/
+ENV/
+
+# =========================
+# Env files / secrets
+# =========================
+.env
+.env.*
+!.env.example
+.envrc
+
+# =========================
+# Test / coverage / lint caches
+# =========================
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+.hypothesis/
+
+# =========================
+# Logs / runtime artifacts
+# =========================
+*.log
+logs/
+*.pid
+
+# Local databases / vector runtime files
+*.db
+*.sqlite
+*.sqlite3
+milvus-data/
+milvus_data/
+
+# =========================
+# IDE / OS
+# =========================
+.vscode/
+.idea/
+.DS_Store
