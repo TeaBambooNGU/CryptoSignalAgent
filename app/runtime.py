@@ -7,6 +7,7 @@ from __future__ import annotations
 
 from app.agents.llm import create_llm_client
 from app.agents.report_agent import ReportAgent
+from app.config.logging import get_logger, log_context
 from app.config.settings import Settings
 from app.graph.workflow import ResearchGraphRunner
 from app.memory.mem0_service import MemoryService
@@ -15,32 +16,42 @@ from app.retrieval.milvus_store import MilvusStore
 from app.retrieval.research_service import ResearchService
 from app.tools.mcp_client import MCPClient
 
+logger = get_logger(__name__)
+
 
 class AppRuntime:
     """运行时依赖容器。"""
 
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
-        configure_langsmith(settings)
 
-        self.milvus_store = MilvusStore(settings)
-        self.milvus_store.connect()
+        with log_context(component="runtime.bootstrap"):
+            logger.info("运行时初始化开始")
+            configure_langsmith(settings)
 
-        self.memory_service = MemoryService(settings=settings, milvus_store=self.milvus_store)
-        self.mcp_client = MCPClient(settings=settings)
-        self.research_service = ResearchService(settings=settings, milvus_store=self.milvus_store)
+            self.milvus_store = MilvusStore(settings)
+            self.milvus_store.connect()
+            logger.info("MilvusStore 初始化完成")
 
-        self.llm_client = create_llm_client(settings)
-        self.report_agent = ReportAgent(settings=settings, llm_client=self.llm_client)
+            self.memory_service = MemoryService(settings=settings, milvus_store=self.milvus_store)
+            self.mcp_client = MCPClient(settings=settings)
+            self.research_service = ResearchService(settings=settings, milvus_store=self.milvus_store)
+            logger.info("核心服务初始化完成")
 
-        self.graph_runner = ResearchGraphRunner(
-            memory_service=self.memory_service,
-            mcp_client=self.mcp_client,
-            research_service=self.research_service,
-            report_agent=self.report_agent,
-        )
+            self.llm_client = create_llm_client(settings)
+            self.report_agent = ReportAgent(settings=settings, llm_client=self.llm_client)
+
+            self.graph_runner = ResearchGraphRunner(
+                memory_service=self.memory_service,
+                mcp_client=self.mcp_client,
+                research_service=self.research_service,
+                report_agent=self.report_agent,
+            )
+            logger.info("运行时初始化完成")
 
     def close(self) -> None:
         """释放运行时资源。"""
 
-        self.milvus_store.close()
+        with log_context(component="runtime.shutdown"):
+            self.milvus_store.close()
+            logger.info("运行时资源已释放")

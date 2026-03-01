@@ -112,6 +112,30 @@ uv run python main.py
 - `GET /v1/user/profile/{user_id}`
 - `POST /v1/research/ingest`
 
+## 前端控制台（极简科技风）
+
+前端工程位于 `frontend/`，技术栈为 `React + Vite + TypeScript + TanStack Query + Zustand`。
+
+1. 安装依赖：
+
+```bash
+cd frontend
+npm install
+```
+
+2. 启动前端：
+
+```bash
+npm run dev
+```
+
+3. 默认通过 Vite 代理请求后端 `http://127.0.0.1:8000` 的 `/v1/*` 接口。  
+   若需要自定义后端地址，设置环境变量：
+
+```bash
+VITE_API_BASE=http://127.0.0.1:8000
+```
+
 ## 标准 MCP 配置示例（已验证）
 
 ```env

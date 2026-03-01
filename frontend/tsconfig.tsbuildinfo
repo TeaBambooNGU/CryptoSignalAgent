@@ -1,0 +1,1 @@
+{"root":["./src/app.tsx","./src/main.tsx","./src/api/client.ts","./src/api/types.ts","./src/components/pulserail.tsx","./src/components/sidenav.tsx","./src/pages/dashboardpage.tsx","./src/pages/ingestpage.tsx","./src/pages/memorypage.tsx","./src/pages/settingspage.tsx","./src/store/useconsolestore.ts"],"version":"5.9.3"}

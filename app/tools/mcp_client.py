@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import logging
 import re
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -22,10 +21,11 @@ from mcp.client.stdio import StdioServerParameters, stdio_client
 from mcp.client.streamable_http import streamablehttp_client
 from tenacity import Retrying, retry_if_exception_type, stop_after_attempt, wait_exponential
 
+from app.config.logging import get_logger, log_context
 from app.config.settings import Settings
 from app.models.schemas import RawSignal, SignalType
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 URL_PATTERN = re.compile(r"https?://\\S+")
 SYMBOL_TO_CG_ID = {
@@ -70,6 +70,8 @@ class MCPClient:
 
         errors: list[str] = []
         specs = self._load_server_specs()
+        with log_context(component="mcp.collect"):
+            logger.info("MCP 采集开始 servers=%s symbols=%s", len(specs), symbols or ["BTC"])
         if not specs:
             errors.append("未配置 MCP_SERVERS，跳过实时采集")
             return [], errors
@@ -94,12 +96,17 @@ class MCPClient:
                                 symbols=symbols,
                             )
                         )
+                with log_context(component="mcp.collect"):
+                    logger.info("MCP 服务完成 server=%s rows=%s", spec.name, len(rows))
                 raw_rows.extend(rows)
             except Exception as exc:
                 logger.exception("MCP 服务采集失败: %s", spec.name)
                 errors.append(f"MCP 服务失败: {spec.name} ({type(exc).__name__})")
 
-        return self._normalize_raw_rows(task_id=task_id, rows=raw_rows), errors
+        normalized = self._normalize_raw_rows(task_id=task_id, rows=raw_rows)
+        with log_context(component="mcp.collect"):
+            logger.info("MCP 采集结束 raw_rows=%s normalized=%s errors=%s", len(raw_rows), len(normalized), len(errors))
+        return normalized, errors
 
     def _load_server_specs(self) -> list[MCPServerSpec]:
         """从配置加载 MCP server 列表。"""
@@ -147,6 +154,8 @@ class MCPClient:
                 )
             )
 
+        with log_context(component="mcp.collect"):
+            logger.info("MCP 服务配置加载完成 servers=%s", len(specs))
         return specs
 
     async def _collect_from_server(
@@ -164,6 +173,8 @@ class MCPClient:
             if not selected_tools:
                 return []
 
+            with log_context(component="mcp.collect"):
+                logger.info("工具筛选完成 server=%s selected_tools=%s", spec.name, len(selected_tools))
             rows: list[dict[str, Any]] = []
             for tool in selected_tools[: spec.max_tools_per_server]:
                 arguments = self._build_tool_arguments(tool=tool, query=query, symbols=symbols)
@@ -190,6 +201,8 @@ class MCPClient:
                         symbols=symbols,
                     )
                 )
+                with log_context(component="mcp.collect"):
+                    logger.info("工具调用完成 server=%s tool=%s rows=%s", spec.name, tool.name, len(rows))
 
             return rows
 

@@ -1,0 +1,29 @@
+@import url("https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=Noto+Sans+SC:wght@400;500;700&family=Space+Grotesk:wght@400;600;700&display=swap");
+
+:root {
+  --bg: #0a0d12;
+  --bg-elev: #101621;
+  --bg-soft: #131c2b;
+  --text-main: #eaf2ff;
+  --text-muted: #8a93a3;
+  --accent: #5fffe0;
+  --accent-soft: #49cbb5;
+  --warn: #ffb86a;
+  --danger: #ff6074;
+  --line: #253047;
+
+  --font-display: "Space Grotesk", "Noto Sans SC", sans-serif;
+  --font-body: "Noto Sans SC", "PingFang SC", sans-serif;
+  --font-mono: "IBM Plex Mono", "SFMono-Regular", ui-monospace, monospace;
+
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 20px;
+  --space-5: 32px;
+  --space-6: 52px;
+
+  --radius-sm: 10px;
+  --radius-md: 14px;
+  --radius-lg: 20px;
+}

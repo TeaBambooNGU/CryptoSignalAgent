@@ -69,6 +69,23 @@ class APITestCase(unittest.TestCase):
         self.assertIn("report", payload)
         self.assertIn("trace_id", payload)
         self.assertTrue(isinstance(payload["citations"], list))
+        self.assertEqual(resp.headers.get("X-Trace-Id"), payload["trace_id"])
+
+    def test_research_query_uses_request_trace_id(self) -> None:
+        request_trace_id = "trace-test-fixed-id"
+        resp = self.client.post(
+            "/v1/research/query",
+            headers={"X-Trace-Id": request_trace_id},
+            json={
+                "user_id": "u-test-2",
+                "query": "请分析 BTC 和 ETH 的短线风险",
+                "task_context": {"symbols": ["BTC", "ETH"]},
+            },
+        )
+        self.assertEqual(resp.status_code, 200)
+        payload = resp.json()
+        self.assertEqual(payload["trace_id"], request_trace_id)
+        self.assertEqual(resp.headers.get("X-Trace-Id"), request_trace_id)
 
     def test_research_ingest(self) -> None:
         resp = self.client.post(

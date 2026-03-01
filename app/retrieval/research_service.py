@@ -9,17 +9,17 @@ from __future__ import annotations
 
 import hashlib
 import json
-import logging
 import math
 from datetime import datetime, timezone
 from typing import Any
 
+from app.config.logging import get_logger, log_context
 from app.config.settings import Settings
 from app.models.schemas import IngestDocument, NormalizedSignal, RawSignal, RetrievedChunk
 from app.retrieval.embedding import embed_texts, text_to_embedding
 from app.retrieval.milvus_store import MilvusStore
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 try:
     from llama_index.core.node_parser import SentenceSplitter
@@ -56,6 +56,9 @@ class ResearchService:
                     task_id=task_id,
                 )
             )
+
+        with log_context(component="retrieval.normalize"):
+            logger.info("标准化信号完成 raw=%s normalized=%s", len(raw_signals), len(normalized))
         return normalized
 
     def ingest_signals(self, signals: list[NormalizedSignal]) -> int:
@@ -88,11 +91,19 @@ class ResearchService:
                 )
                 texts.append(chunk)
 
+        if not rows:
+            with log_context(component="retrieval.ingest"):
+                logger.warning("信号入库跳过 rows=0")
+            return 0
+
         embeddings = embed_texts(texts=texts, settings=self.settings)
         for row, embedding in zip(rows, embeddings, strict=True):
             row["embedding"] = embedding
 
-        return self.milvus_store.upsert_research_chunks(rows)
+        inserted = self.milvus_store.upsert_research_chunks(rows)
+        with log_context(component="retrieval.ingest"):
+            logger.info("信号入库完成 signals=%s chunks=%s inserted=%s", len(signals), len(rows), inserted)
+        return inserted
 
     def ingest_documents(self, task_id: str, docs: list[IngestDocument]) -> int:
         """将外部文档入库到研究集合。"""
@@ -117,17 +128,32 @@ class ResearchService:
                 )
                 texts.append(chunk)
 
+        if not rows:
+            with log_context(component="retrieval.ingest"):
+                logger.warning("文档入库跳过 docs=%s chunks=0", len(docs))
+            return 0
+
         embeddings = embed_texts(texts=texts, settings=self.settings)
         for row, embedding in zip(rows, embeddings, strict=True):
             row["embedding"] = embedding
 
-        return self.milvus_store.upsert_research_chunks(rows)
+        inserted = self.milvus_store.upsert_research_chunks(rows)
+        with log_context(component="retrieval.ingest"):
+            logger.info("文档入库完成 docs=%s chunks=%s inserted=%s", len(docs), len(rows), inserted)
+        return inserted
 
     def retrieve(self, query: str, symbols: list[str], top_k: int = 8) -> list[RetrievedChunk]:
         """执行召回与重排。"""
 
+        with log_context(component="retrieval.search"):
+            logger.info("检索开始 symbols=%s top_k=%s", symbols or ["ALL"], top_k)
+
         query_vector = text_to_embedding(query, self.settings)
-        rows = self.milvus_store.search_research_chunks(query_vector=query_vector, symbols=symbols, top_k=max(top_k * 2, 10))
+        rows = self.milvus_store.search_research_chunks(
+            query_vector=query_vector,
+            symbols=symbols,
+            top_k=max(top_k * 2, 10),
+        )
         reranked = self._rerank_rows(rows=rows, now=datetime.now(timezone.utc), top_k=top_k)
 
         result: list[RetrievedChunk] = []
@@ -148,6 +174,9 @@ class ResearchService:
                     metadata=row.get("metadata", {}),
                 )
             )
+
+        with log_context(component="retrieval.search"):
+            logger.info("检索完成 raw_hits=%s returned=%s", len(rows), len(result))
         return result
 
     def _signal_to_text(self, signal: NormalizedSignal) -> str:
