@@ -6,7 +6,9 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc --noEmit && vite build",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "ui:debug": "node scripts/ui-debug.mjs --url http://127.0.0.1:5173 --run-agent --headless",
+    "ui:debug:live": "node scripts/ui-debug.mjs --url http://127.0.0.1:5173 --run-agent"
   },
   "dependencies": {
     "@tanstack/react-query": "^5.73.3",
@@ -19,6 +21,7 @@
     "@types/react": "^18.3.20",
     "@types/react-dom": "^18.3.5",
     "@vitejs/plugin-react": "^4.3.4",
+    "playwright": "^1.58.2",
     "typescript": "^5.8.2",
     "vite": "^5.4.14"
   }

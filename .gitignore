@@ -23,6 +23,7 @@ venv/
 env/
 ENV/
 frontend/node_modules/
+frontend/artifacts/
 
 # =========================
 # Env files / secrets

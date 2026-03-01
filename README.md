@@ -136,6 +136,21 @@ npm run dev
 VITE_API_BASE=http://127.0.0.1:8000
 ```
 
+4. UI 联调（浏览器页面 + 终端日志）：
+
+```bash
+# 无头模式：自动抓日志与截图（推荐先用）
+npm run ui:debug
+
+# 有头模式：会真实打开 Chromium 页面
+npm run ui:debug:live
+```
+
+截图输出到 `frontend/artifacts/`，终端会打印：
+- 浏览器 Console（`[browser-console:*]`）
+- 页面运行错误（`[browser-pageerror]`）
+- 失败请求/4xx/5xx（`[browser-requestfailed]` / `[browser-http-*]`）
+
 ## 标准 MCP 配置示例（已验证）
 
 ```env
