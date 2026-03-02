@@ -9,13 +9,12 @@ from app.agents.llm import create_llm_client
 from app.agents.report_agent import ReportAgent
 from app.config.logging import get_logger, log_context
 from app.config.settings import Settings
-from app.graph.workflow import ResearchGraphRunner
 from app.graph.mcp_subgraph import MCPSignalSubgraphRunner
+from app.graph.workflow import ResearchGraphRunner
 from app.memory.mem0_service import MemoryService
 from app.observability.langsmith import configure_langsmith
 from app.retrieval.milvus_store import MilvusStore
 from app.retrieval.research_service import ResearchService
-from app.tools.mcp_gateway import OfficialMCPGateway
 
 logger = get_logger(__name__)
 
@@ -36,10 +35,9 @@ class AppRuntime:
 
             self.llm_client = create_llm_client(settings)
             self.memory_service = MemoryService(settings=settings, milvus_store=self.milvus_store)
-            self.mcp_gateway = OfficialMCPGateway(settings=settings)
             self.mcp_subgraph = MCPSignalSubgraphRunner(
                 llm_client=self.llm_client,
-                mcp_gateway=self.mcp_gateway,
+                mcp_connections=MCPSignalSubgraphRunner.build_connections_from_settings(settings.mcp_servers),
                 max_rounds=settings.mcp_max_rounds,
             )
             self.research_service = ResearchService(settings=settings, milvus_store=self.milvus_store)

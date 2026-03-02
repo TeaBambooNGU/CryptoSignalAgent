@@ -3,15 +3,10 @@
 from __future__ import annotations
 
 import unittest
-from datetime import datetime, timezone
 from typing import Any
-
-from mcp import types
 
 from app.agents.llm.base import BaseLLMClient
 from app.graph.mcp_subgraph import MCPSignalSubgraphRunner
-from app.models.schemas import RawSignal, SignalType
-from app.tools.mcp_gateway import MCPExecutionResult
 
 
 class _DummyLLM(BaseLLMClient):
@@ -19,28 +14,34 @@ class _DummyLLM(BaseLLMClient):
         return '{"calls":[]}'
 
 
-class _DummyGateway:
-    def discover_tools(self):
-        return {}, []
+class _FakeTool:
+    def __init__(self, name: str, description: str, schema: dict[str, Any]) -> None:
+        self.name = name
+        self.description = description
+        self.args_schema = schema
 
-    def execute_calls(self, *, task_id: str, symbols: list[str], calls: list[dict[str, Any]]) -> MCPExecutionResult:
-        return MCPExecutionResult(rows=[], successes=[], failures=[], errors=[])
+    async def ainvoke(self, arguments: dict[str, Any]):
+        return ([{"type": "text", "text": '{"symbol":"BTC","value":{"k":"v"}}'}], None)
 
-    def normalize_rows_to_signals(self, *, task_id: str, rows: list[dict[str, Any]]) -> list[RawSignal]:
-        signals: list[RawSignal] = []
-        for row in rows:
-            signals.append(
-                RawSignal(
-                    symbol=str(row.get("symbol", "BTC")),
-                    source=str(row.get("source", "mcp:test")),
-                    signal_type=SignalType(str(row.get("signal_type", SignalType.NEWS.value))),
-                    value=row.get("value", {}),
-                    raw_ref=str(row.get("raw_ref", "mcp://test/tool")),
-                    published_at=datetime.now(timezone.utc),
-                    metadata={},
-                )
+
+class _FakeMCPClient:
+    def __init__(self, connections: dict[str, dict[str, Any]], tool_name_prefix: bool = False) -> None:
+        self.connections = connections
+        self.tool_name_prefix = tool_name_prefix
+
+    async def get_tools(self):
+        prefix = "srv_" if self.tool_name_prefix else ""
+        return [
+            _FakeTool(
+                name=f"{prefix}get_news",
+                description="fetch news",
+                schema={
+                    "type": "object",
+                    "properties": {"limit": {"type": "integer", "default": 10}},
+                    "required": ["limit"],
+                },
             )
-        return signals
+        ]
 
 
 class MCPSubgraphRuleTestCase(unittest.TestCase):
@@ -141,7 +142,12 @@ class MCPSubgraphRuleTestCase(unittest.TestCase):
         )
 
     def test_should_continue_hits_repeated_blind_plan(self) -> None:
-        runner = MCPSignalSubgraphRunner(llm_client=_DummyLLM(), mcp_gateway=_DummyGateway(), max_rounds=4)
+        runner = MCPSignalSubgraphRunner(
+            llm_client=_DummyLLM(),
+            mcp_connections={},
+            max_rounds=4,
+            mcp_client_factory=_FakeMCPClient,
+        )
         decision = runner.mcp_should_continue(
             {
                 "mcp_round": 2,
@@ -167,26 +173,39 @@ class MCPSubgraphRuleTestCase(unittest.TestCase):
         self.assertEqual(decision["mcp_termination_reason"], "repeated_blind_plan")
 
     def test_prepare_discovers_tools_catalog(self) -> None:
-        class _GatewayWithTools(_DummyGateway):
-            def discover_tools(self):
-                return {
-                    "srv": [
-                        types.Tool(
-                            name="get_news",
-                            description="fetch news",
-                            inputSchema={
-                                "type": "object",
-                                "properties": {"limit": {"type": "integer", "default": 10}},
-                                "required": ["limit"],
-                            },
-                        )
-                    ]
-                }, []
-
-        runner = MCPSignalSubgraphRunner(llm_client=_DummyLLM(), mcp_gateway=_GatewayWithTools(), max_rounds=4)
+        runner = MCPSignalSubgraphRunner(
+            llm_client=_DummyLLM(),
+            mcp_connections={"srv": {"transport": "streamable_http", "url": "http://localhost:3000/mcp"}},
+            max_rounds=4,
+            mcp_client_factory=_FakeMCPClient,
+        )
         prepared = runner.mcp_prepare({"errors": [], "raw_signals": []})
         self.assertEqual(prepared["mcp_tool_catalog"]["srv"][0]["name"], "get_news")
         self.assertIn("limit", prepared["mcp_tool_schemas"]["srv"]["get_news"]["properties"])
+        self.assertIn("srv|get_news", prepared["mcp_runtime_tools"])
+
+    def test_build_connections_from_settings(self) -> None:
+        settings_servers = (
+            {
+                "name": "s1",
+                "transport": "streamable_http",
+                "url": "http://localhost:3000/mcp",
+                "headers": {"Authorization": "Bearer x"},
+            },
+            {
+                "name": "s2",
+                "transport": "stdio",
+                "command": "python",
+                "args": ["server.py"],
+                "env": {"A": "B"},
+                "cwd": "/tmp",
+            },
+        )
+        connections = MCPSignalSubgraphRunner.build_connections_from_settings(settings_servers)
+        self.assertEqual(connections["s1"]["transport"], "streamable_http")
+        self.assertEqual(connections["s1"]["url"], "http://localhost:3000/mcp")
+        self.assertEqual(connections["s2"]["command"], "python")
+        self.assertEqual(connections["s2"]["args"], ["server.py"])
 
 
 if __name__ == "__main__":
