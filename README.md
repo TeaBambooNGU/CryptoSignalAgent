@@ -165,12 +165,19 @@ npm run ui:debug:live
 ## 标准 MCP 配置示例（已验证）
 
 ```env
-MCP_SERVERS=[{"name":"coingecko","transport":"streamable_http","url":"https://mcp.api.coingecko.com/mcp"},{"name":"defillama","transport":"streamable_http","url":"https://mcpllama.com/mcp"},{"name":"cryptonews","transport":"stdio","command":"uvx","args":["cryptonewsmcp"]}]
+MCP_SERVERS=[{"name":"coingecko","transport":"streamable_http","url":"https://mcp.api.coingecko.com/mcp"},{"name":"defillama","transport":"streamable_http","url":"https://mcpllama.com/mcp"},{"name":"crypto-news-mcp","transport":"stdio","command":"uv","args":["run","crypto-news-mcp"],"cwd":"/Users/teabamboo/Documents/AIplusLLM/cryptorNewsMCP","env":{"CRYPTOPANIC_AUTH_TOKEN":"<YOUR_CRYPTOPANIC_TOKEN>"},"tool_allowlist":["get_research_signals","get_news_digest","build_market_brief"],"max_tools_per_server":3}]
 ```
 
 - `coingecko`：行情/币种/趋势数据
 - `defillama`：链上 TVL/协议维度数据
-- `cryptonews`：新闻 RSS 聚合（stdio 启动）
+- `crypto-news-mcp`：CryptoPanic 新闻/投研信号（stdio，本地 `uv run crypto-news-mcp`）
+
+对接 `crypto-news-mcp` 前请先在对应目录完成一次初始化：
+
+```bash
+cd /Users/teabamboo/Documents/AIplusLLM/cryptorNewsMCP
+uv sync
+```
 
 可用性验证：
 
