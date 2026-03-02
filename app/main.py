@@ -20,7 +20,13 @@ logger = get_logger(__name__)
 async def lifespan(app: FastAPI):
     """应用生命周期：启动时初始化运行时容器，关闭时释放资源。"""
 
-    setup_logging(settings.log_level)
+    setup_logging(
+        settings.log_level,
+        log_to_file=settings.log_to_file,
+        log_file_path=settings.log_file_path,
+        log_file_max_mb=settings.log_file_max_mb,
+        log_file_backup_days=settings.log_file_backup_days,
+    )
     runtime = AppRuntime(settings=settings)
     app.state.runtime = runtime
     try:

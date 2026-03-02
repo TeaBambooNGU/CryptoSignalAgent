@@ -9,9 +9,9 @@
 from __future__ import annotations
 
 import hashlib
-import inspect
 import json
 import logging
+import os
 from datetime import datetime, timezone
 from typing import Any
 
@@ -37,51 +37,113 @@ class MemoryService:
 
         if not self.settings.mem0_enabled:
             return None
-        if not self.settings.mem0_api_key:
-            logger.warning("MEM0_ENABLED=true 但未配置 MEM0_API_KEY，将使用降级模式")
-            return None
+        mode = self._mem0_mode()
 
         try:
             import mem0  # type: ignore
 
-            client_cls = getattr(mem0, "MemoryClient", None)
-            if client_cls is not None:
+            if mode == "platform":
+                if not self.settings.mem0_api_key:
+                    logger.warning("MEM0_MODE=platform 但未配置 MEM0_API_KEY，将使用降级模式")
+                    return None
+                client_cls = getattr(mem0, "MemoryClient", None)
+                if client_cls is None:
+                    logger.warning("mem0 包未提供 MemoryClient，自动降级")
+                    return None
                 client = client_cls(
                     api_key=self.settings.mem0_api_key,
                     org_id=self.settings.mem0_org_id or None,
                     project_id=self.settings.mem0_project_id or None,
                 )
-                logger.info("Mem0 MemoryClient 初始化成功")
+                logger.info("Mem0 MemoryClient 初始化成功（mode=platform）")
                 return client
 
             memory_cls = getattr(mem0, "Memory", None)
             if memory_cls is None:
-                logger.warning("mem0 包未提供可用客户端（MemoryClient/Memory），自动降级")
+                logger.warning("mem0 包未提供 Memory（mode=oss），自动降级")
                 return None
 
-            parameters = inspect.signature(memory_cls).parameters
-            supports_kwargs = any(param.kind == inspect.Parameter.VAR_KEYWORD for param in parameters.values())
-            candidate_kwargs = {
-                "api_key": self.settings.mem0_api_key,
-                "org_id": self.settings.mem0_org_id or None,
-                "project_id": self.settings.mem0_project_id or None,
-            }
-            init_kwargs = {
-                key: value
-                for key, value in candidate_kwargs.items()
-                if value is not None and (supports_kwargs or key in parameters)
-            }
-
-            if not init_kwargs and not supports_kwargs:
-                logger.warning("mem0.Memory 构造函数不支持 API 凭据参数，自动降级")
+            if not self.settings.milvus_enabled:
+                logger.warning("MEM0_MODE=oss 需要 Milvus，可当前 MILVUS_ENABLED=false，自动降级")
                 return None
 
-            client = memory_cls(**init_kwargs)
-            logger.info("Mem0 Memory 初始化成功")
+            from_config = getattr(memory_cls, "from_config", None)
+            if callable(from_config):
+                client = from_config(self._build_mem0_oss_config())
+            else:
+                # 极老版本兼容：若无 from_config，则退化到默认构造（不保证使用工程 Milvus）。
+                client = memory_cls()
+                logger.warning("mem0.Memory 未提供 from_config，OSS 无法保证复用工程 Milvus 配置")
+            logger.info("Mem0 Memory 初始化成功（mode=oss, vector_store=milvus)")
             return client
         except Exception:
             logger.exception("Mem0 客户端初始化失败，自动降级")
             return None
+
+    def _mem0_mode(self) -> str:
+        """返回规范化后的 Mem0 运行模式。"""
+
+        raw_mode = self.settings.mem0_mode.strip().lower()
+        if raw_mode in {"platform", "oss"}:
+            return raw_mode
+        logger.warning("MEM0_MODE=%s 非法，回退为 platform", self.settings.mem0_mode)
+        return "platform"
+
+    def _build_mem0_oss_config(self) -> dict[str, Any]:
+        """构造 Mem0 OSS 配置，复用工程现有 Milvus。"""
+
+        llm_config: dict[str, Any] = {
+            "model": self.settings.llm_model,
+        }
+        embedder_config: dict[str, Any] = {
+            "model": self.settings.zhipu_embedding_model,
+            "embedding_dims": self.settings.vector_dim,
+        }
+
+        # LLM 走工程现有 Minimax 配置；Mem0 侧用 openai provider 接入 openai-compatible endpoint。
+        llm_api_key = self.settings.minimax_api_key or self.settings.openai_compatible_api_key or os.getenv("OPENAI_API_KEY", "")
+        llm_base_url = self.settings.minimax_base_url or self.settings.openai_compatible_base_url or os.getenv("OPENAI_BASE_URL", "")
+        if llm_api_key:
+            llm_config["api_key"] = llm_api_key
+        if llm_base_url:
+            llm_config["openai_base_url"] = llm_base_url
+
+        # Embedder 走工程现有智谱配置，默认使用智谱兼容 OpenAI 的 endpoint。
+        embedder_api_key = os.getenv("ZHIPUAI_API_KEY", "") or self.settings.openai_compatible_api_key or os.getenv("OPENAI_API_KEY", "")
+        embedder_base_url = (
+            os.getenv("ZHIPU_OPENAI_BASE_URL", "")
+            or self.settings.openai_compatible_base_url
+            or "https://open.bigmodel.cn/api/paas/v4"
+        )
+        if embedder_api_key:
+            embedder_config["api_key"] = embedder_api_key
+        if embedder_base_url:
+            embedder_config["openai_base_url"] = embedder_base_url
+
+        milvus_config: dict[str, Any] = {
+            "url": self.settings.milvus_uri,
+            "token": self.settings.milvus_token or None,
+            "collection_name": self.settings.mem0_oss_collection,
+            "embedding_model_dims": self.settings.vector_dim,
+            "metric_type": "COSINE",
+            "db_name": self.settings.milvus_db_name,
+        }
+
+        return {
+            "vector_store": {
+                "provider": "milvus",
+                "config": milvus_config,
+            },
+            "llm": {
+                "provider": "openai",
+                "config": llm_config,
+            },
+            "embedder": {
+                "provider": "openai",
+                "config": embedder_config,
+            },
+            "version": "v1.1",
+        }
 
     def _build_memory_id(self, user_id: str, memory_type: MemoryType, content: str) -> str:
         """生成幂等记忆 ID。"""
@@ -290,11 +352,30 @@ class MemoryService:
             search_fn = getattr(self._mem0_client, "search", None)
             if not callable(search_fn):
                 return []
-            result = search_fn(query=query, user_id=user_id, limit=limit)
+            result = search_fn(**self._build_mem0_search_kwargs(user_id=user_id, query=query, limit=limit))
             return self._normalize_mem0_search_result(result)
         except Exception:
             logger.exception("Mem0 search 调用失败，已忽略")
         return []
+
+    def _build_mem0_search_kwargs(self, user_id: str, query: str, limit: int) -> dict[str, Any]:
+        """构造兼容 Mem0 Platform / OSS 的 search 参数。
+
+        - Platform (`MemoryClient`) 要求通过 `filters` 指定实体范围。
+        - OSS (`Memory`) 兼容 `user_id + limit` 形式。
+        """
+
+        if self._mem0_mode() == "platform":
+            return {
+                "query": query,
+                "top_k": limit,
+                "filters": {"user_id": user_id},
+            }
+        return {
+            "query": query,
+            "user_id": user_id,
+            "limit": limit,
+        }
 
     def _normalize_mem0_search_result(self, result: Any) -> list[dict[str, Any]]:
         """兼容 Mem0 不同客户端的 search 返回结构。"""

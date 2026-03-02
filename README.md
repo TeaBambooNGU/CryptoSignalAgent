@@ -39,6 +39,10 @@ APP_ENV=dev
 APP_HOST=0.0.0.0
 APP_PORT=8000
 LOG_LEVEL=INFO
+LOG_TO_FILE=false
+LOG_FILE_PATH=logs/app.log
+LOG_FILE_MAX_MB=10
+LOG_FILE_BACKUP_DAYS=5
 
 # LangSmith
 LANGSMITH_TRACING=false
@@ -78,6 +82,13 @@ VECTOR_DIM=384
 
 # Mem0
 MEM0_ENABLED=false
+# 可选: platform / oss
+MEM0_MODE=platform
+# 仅在 MEM0_MODE=oss 时生效（建议独立 collection）
+MEM0_OSS_COLLECTION=mem0_memory
+# 可选：覆盖 OSS 模式下智谱 Embedding 的 OpenAI-compatible Base URL
+ZHIPU_OPENAI_BASE_URL=https://open.bigmodel.cn/api/paas/v4
+# 仅在 MEM0_MODE=platform 时生效
 MEM0_API_KEY=
 MEM0_ORG_ID=
 MEM0_PROJECT_ID=

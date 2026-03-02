@@ -28,6 +28,10 @@ class Settings:
     app_port: int = 8000
     app_env: str = "dev"
     log_level: str = "INFO"
+    log_to_file: bool = False
+    log_file_path: str = "logs/app.log"
+    log_file_max_mb: int = 10
+    log_file_backup_days: int = 5
 
     langsmith_tracing: bool = False
     langsmith_api_key: str = ""
@@ -59,6 +63,8 @@ class Settings:
     vector_dim: int = 384
 
     mem0_enabled: bool = False
+    mem0_mode: str = "platform"
+    mem0_oss_collection: str = "mem0_memory"
     mem0_api_key: str = ""
     mem0_org_id: str = ""
     mem0_project_id: str = ""
@@ -122,6 +128,10 @@ class Settings:
             app_port=_as_int("APP_PORT", defaults.app_port),
             app_env=os.getenv("APP_ENV", defaults.app_env),
             log_level=os.getenv("LOG_LEVEL", defaults.log_level),
+            log_to_file=_as_bool("LOG_TO_FILE", defaults.log_to_file),
+            log_file_path=os.getenv("LOG_FILE_PATH", defaults.log_file_path),
+            log_file_max_mb=_as_int("LOG_FILE_MAX_MB", defaults.log_file_max_mb),
+            log_file_backup_days=_as_int("LOG_FILE_BACKUP_DAYS", defaults.log_file_backup_days),
             langsmith_tracing=_as_bool("LANGSMITH_TRACING", defaults.langsmith_tracing),
             langsmith_api_key=os.getenv("LANGSMITH_API_KEY", ""),
             langsmith_project=os.getenv("LANGSMITH_PROJECT", defaults.langsmith_project),
@@ -152,6 +162,8 @@ class Settings:
             milvus_memory_collection=os.getenv("MILVUS_MEMORY_COLLECTION", defaults.milvus_memory_collection),
             vector_dim=_as_int("VECTOR_DIM", defaults.vector_dim),
             mem0_enabled=_as_bool("MEM0_ENABLED", defaults.mem0_enabled),
+            mem0_mode=os.getenv("MEM0_MODE", defaults.mem0_mode),
+            mem0_oss_collection=os.getenv("MEM0_OSS_COLLECTION", defaults.mem0_oss_collection),
             mem0_api_key=os.getenv("MEM0_API_KEY", ""),
             mem0_org_id=os.getenv("MEM0_ORG_ID", ""),
             mem0_project_id=os.getenv("MEM0_PROJECT_ID", ""),

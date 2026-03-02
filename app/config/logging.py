@@ -10,7 +10,12 @@ import contextlib
 import contextvars
 import logging
 import logging.config
+import os
+import time
 from collections.abc import Iterator
+from datetime import date, datetime, timezone, timedelta
+from logging.handlers import TimedRotatingFileHandler
+from pathlib import Path
 
 TRACE_ID_KEY = "trace_id"
 TASK_ID_KEY = "task_id"
@@ -41,7 +46,119 @@ class _ContextFilter(logging.Filter):
         return True
 
 
-def setup_logging(level: str = "INFO") -> None:
+class SizeAndTimeRotatingFileHandler(TimedRotatingFileHandler):
+    """按天轮转，并在单文件超大小时继续切分。"""
+
+    def __init__(
+        self,
+        filename: str,
+        *,
+        max_bytes: int,
+        backup_days: int,
+        encoding: str = "utf-8",
+        utc: bool = False,
+        delay: bool = False,
+    ) -> None:
+        super().__init__(
+            filename=filename,
+            when="midnight",
+            interval=1,
+            backupCount=0,
+            encoding=encoding,
+            delay=delay,
+            utc=utc,
+        )
+        self.max_bytes = max(1, int(max_bytes))
+        self.backup_days = max(1, int(backup_days))
+        self.suffix = "%Y-%m-%d"
+        self._rollover_reason: str | None = None
+
+    def shouldRollover(self, record: logging.LogRecord) -> int:  # noqa: N802
+        if super().shouldRollover(record):
+            self._rollover_reason = "time"
+            return 1
+
+        if self.stream is None:
+            self.stream = self._open()
+
+        message = f"{self.format(record)}\n"
+        message_size = len(message.encode(self.encoding or "utf-8", errors="replace"))
+
+        if self.stream.tell() + message_size >= self.max_bytes:
+            self._rollover_reason = "size"
+            return 1
+        return 0
+
+    def doRollover(self) -> None:  # noqa: N802
+        if self.stream:
+            self.stream.close()
+            self.stream = None
+
+        now_ts = int(time.time())
+        suffix_ts = now_ts if self._rollover_reason == "size" else int(self.rolloverAt - self.interval)
+        time_tuple = time.gmtime(suffix_ts) if self.utc else time.localtime(suffix_ts)
+        date_suffix = time.strftime(self.suffix, time_tuple)
+
+        dated_filename = f"{self.baseFilename}.{date_suffix}"
+        target_filename = self._next_indexed_filename(dated_filename)
+
+        if os.path.exists(self.baseFilename):
+            os.replace(self.baseFilename, target_filename)
+
+        if not self.delay:
+            self.stream = self._open()
+
+        if now_ts >= self.rolloverAt:
+            next_rollover_at = self.computeRollover(now_ts)
+            while next_rollover_at <= now_ts:
+                next_rollover_at += self.interval
+            self.rolloverAt = next_rollover_at
+
+        self._cleanup_expired_files()
+        self._rollover_reason = None
+
+    def _next_indexed_filename(self, dated_filename: str) -> str:
+        if not os.path.exists(dated_filename):
+            return dated_filename
+
+        index = 1
+        while True:
+            candidate = f"{dated_filename}.{index}"
+            if not os.path.exists(candidate):
+                return candidate
+            index += 1
+
+    def _cleanup_expired_files(self) -> None:
+        base_path = Path(self.baseFilename)
+        base_name = base_path.name
+        prefix = f"{base_name}."
+
+        today = datetime.now(timezone.utc).date() if self.utc else date.today()
+        cutoff = today - timedelta(days=self.backup_days - 1)
+
+        for path in base_path.parent.glob(f"{base_name}.*"):
+            suffix = path.name[len(prefix) :]
+            day_token = suffix.split(".", 1)[0]
+            try:
+                day_value = datetime.strptime(day_token, "%Y-%m-%d").date()
+            except ValueError:
+                continue
+
+            if day_value < cutoff:
+                try:
+                    path.unlink()
+                except FileNotFoundError:
+                    continue
+
+
+def setup_logging(
+    level: str = "INFO",
+    *,
+    log_to_file: bool = False,
+    log_file_path: str = "logs/app.log",
+    log_file_max_mb: int = 10,
+    log_file_backup_days: int = 5,
+) -> None:
     """初始化全局日志配置。"""
 
     global _LOGGING_INITIALIZED
@@ -50,6 +167,41 @@ def setup_logging(level: str = "INFO") -> None:
     if _LOGGING_INITIALIZED:
         logging.getLogger().setLevel(log_level)
         return
+
+    handlers: dict[str, dict[str, object]] = {
+        "console": {
+            "class": "logging.StreamHandler",
+            "level": log_level,
+            "formatter": "standard",
+            "filters": ["context"],
+        }
+    }
+    root_handlers = ["console"]
+
+    file_config_error = ""
+    resolved_file_path = ""
+    if log_to_file:
+        try:
+            raw_path = log_file_path.strip()
+            if not raw_path:
+                raise ValueError("LOG_FILE_PATH 不能为空")
+            log_path = Path(raw_path).expanduser()
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            resolved_file_path = str(log_path)
+            max_bytes = max(1, int(log_file_max_mb)) * 1024 * 1024
+            handlers["file"] = {
+                "()": SizeAndTimeRotatingFileHandler,
+                "level": log_level,
+                "formatter": "standard",
+                "filters": ["context"],
+                "filename": resolved_file_path,
+                "max_bytes": max_bytes,
+                "backup_days": max(1, int(log_file_backup_days)),
+                "encoding": "utf-8",
+            }
+            root_handlers.append("file")
+        except Exception as exc:  # pragma: no cover
+            file_config_error = f"{type(exc).__name__}: {exc}"
 
     logging.config.dictConfig(
         {
@@ -66,21 +218,25 @@ def setup_logging(level: str = "INFO") -> None:
                     )
                 }
             },
-            "handlers": {
-                "console": {
-                    "class": "logging.StreamHandler",
-                    "level": log_level,
-                    "formatter": "standard",
-                    "filters": ["context"],
-                }
-            },
+            "handlers": handlers,
             "root": {
                 "level": log_level,
-                "handlers": ["console"],
+                "handlers": root_handlers,
             },
         }
     )
     _LOGGING_INITIALIZED = True
+
+    logger = logging.getLogger(__name__)
+    if file_config_error:
+        logger.warning("日志文件输出启用失败，已降级为控制台输出: %s", file_config_error)
+    elif log_to_file:
+        logger.info(
+            "日志文件输出已启用: %s (max_mb=%s backup_days=%s)",
+            resolved_file_path,
+            max(1, int(log_file_max_mb)),
+            max(1, int(log_file_backup_days)),
+        )
 
 
 def get_logger(name: str) -> logging.Logger:
