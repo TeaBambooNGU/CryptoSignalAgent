@@ -70,6 +70,7 @@ class Settings:
     mem0_project_id: str = ""
 
     mcp_servers: tuple[dict[str, Any], ...] = ()
+    mcp_max_rounds: int = 4
 
     report_disclaimer: str = "免责声明：本报告仅用于研究与信息交流，不构成任何投资建议。"
 
@@ -168,6 +169,7 @@ class Settings:
             mem0_org_id=os.getenv("MEM0_ORG_ID", ""),
             mem0_project_id=os.getenv("MEM0_PROJECT_ID", ""),
             mcp_servers=_as_dict_tuple("MCP_SERVERS"),
+            mcp_max_rounds=_as_int("MCP_MAX_ROUNDS", defaults.mcp_max_rounds),
             report_disclaimer=os.getenv("REPORT_DISCLAIMER", defaults.report_disclaimer),
         )
 

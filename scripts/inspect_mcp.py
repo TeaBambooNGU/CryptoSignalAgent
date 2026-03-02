@@ -25,7 +25,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from app.config.settings import Settings
-from app.tools.mcp_client import MCPClient
+from app.tools.mcp_gateway import OfficialMCPGateway
 
 # 固定执行配置（无 CLI 参数）
 QUERY = "请提供 BTC 与 ETH 的最新市场、链上与新闻数据"
@@ -172,7 +172,7 @@ def _build_inspect_arguments(tool: types.Tool) -> dict[str, Any]:
 
 async def _inspect_server(
     *,
-    client: MCPClient,
+    client: OfficialMCPGateway,
     spec,
     output_handle,
 ) -> None:
@@ -227,8 +227,8 @@ async def _inspect_server(
 
 async def main() -> None:
     settings = Settings.from_env()
-    client = MCPClient(settings=settings)
-    specs = client._load_server_specs()
+    client = OfficialMCPGateway(settings=settings)
+    specs = client.load_server_specs()
 
     if not specs:
         raise SystemExit("未配置 MCP_SERVERS，无法巡检。")

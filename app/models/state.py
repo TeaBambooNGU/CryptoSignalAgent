@@ -35,5 +35,29 @@ class ResearchState(TypedDict, total=False):
 
     errors: list[str]
     retry_count: int
-    mcp_failures: list[dict[str, Any]]
-    mcp_corrections: list[dict[str, Any]]
+
+    mcp_round: int
+    mcp_max_rounds: int
+    transient_grace_used: bool
+
+    mcp_raw_plan_calls: list[dict[str, Any]]
+    mcp_filtered_plan_calls: list[dict[str, Any]]
+    mcp_admissible_calls_count: int
+    mcp_filtered_out_calls: list[dict[str, Any]]
+    mcp_ban_reasons: list[str]
+    mcp_active_constraints_summary: list[str]
+
+    mcp_round_rows: list[dict[str, Any]]
+    mcp_round_successes: list[dict[str, Any]]
+    mcp_round_failures: list[dict[str, Any]]
+    mcp_failure_classes: dict[str, Any]
+    mcp_rules: list[dict[str, Any]]
+    mcp_new_rules_added: bool
+
+    mcp_new_unique_signal_count: int
+    mcp_signal_hash_set: list[str]
+    mcp_raw_plan_hash_history: list[str]
+    mcp_no_progress_streak: int
+
+    mcp_should_continue: bool
+    mcp_termination_reason: str
