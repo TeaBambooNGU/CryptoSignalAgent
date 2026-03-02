@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import unittest
 from importlib import reload
+from types import MethodType
 
 from fastapi.testclient import TestClient
 
@@ -18,7 +19,8 @@ class APITestCase(unittest.TestCase):
         os.environ["MILVUS_ENABLED"] = "false"
         os.environ["MEM0_ENABLED"] = "false"
         os.environ["MCP_SERVERS"] = ""
-        os.environ["MINIMAX_API_KEY"] = ""
+        os.environ["LLM_PROVIDER"] = "minimax"
+        os.environ["MINIMAX_API_KEY"] = "test-minimax-key"
         os.environ["ZHIPUAI_API_KEY"] = ""
 
         import app.config.settings as settings_module
@@ -31,8 +33,17 @@ class APITestCase(unittest.TestCase):
         cls._client_cm = TestClient(cls._app)
         cls.client = cls._client_cm.__enter__()
 
+        runtime = cls._app.state.runtime
+        cls._original_llm_generate = runtime.report_agent.llm_client.generate
+        runtime.report_agent.llm_client.generate = MethodType(
+            lambda _self, system_prompt, user_prompt, metadata=None: "测试报告正文",
+            runtime.report_agent.llm_client,
+        )
+
     @classmethod
     def tearDownClass(cls) -> None:
+        runtime = cls._app.state.runtime
+        runtime.report_agent.llm_client.generate = cls._original_llm_generate
         cls._client_cm.__exit__(None, None, None)
 
     def test_update_preferences_and_get_profile(self) -> None:
@@ -110,6 +121,28 @@ class APITestCase(unittest.TestCase):
         payload = resp.json()
         self.assertTrue(payload["success"])
         self.assertGreaterEqual(payload["inserted_chunks"], 1)
+
+    def test_research_query_returns_500_when_llm_unavailable(self) -> None:
+        runtime = self._app.state.runtime
+        original_generate = runtime.report_agent.llm_client.generate
+        runtime.report_agent.llm_client.generate = MethodType(
+            lambda _self, system_prompt, user_prompt, metadata=None: (_ for _ in ()).throw(
+                RuntimeError("llm unavailable")
+            ),
+            runtime.report_agent.llm_client,
+        )
+        try:
+            resp = self.client.post(
+                "/v1/research/query",
+                json={
+                    "user_id": "u-test-500",
+                    "query": "请分析 BTC 和 ETH 的短线风险",
+                    "task_context": {"symbols": ["BTC", "ETH"]},
+                },
+            )
+            self.assertEqual(resp.status_code, 500)
+        finally:
+            runtime.report_agent.llm_client.generate = original_generate
 
 
 if __name__ == "__main__":

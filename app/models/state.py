@@ -35,3 +35,5 @@ class ResearchState(TypedDict, total=False):
 
     errors: list[str]
     retry_count: int
+    mcp_failures: list[dict[str, Any]]
+    mcp_corrections: list[dict[str, Any]]

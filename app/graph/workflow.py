@@ -25,6 +25,7 @@ from app.tools.mcp_client import MCPClient
 logger = get_logger(__name__)
 
 SYMBOL_PATTERN = re.compile(r"\b[A-Z]{2,10}\b")
+MCP_FEEDBACK_MAX_ROUNDS = 2
 
 
 class ResearchGraphRunner:
@@ -177,17 +178,63 @@ class ResearchGraphRunner:
 
         def _node_logic() -> ResearchState:
             with log_context(component="graph.collect_signals"):
-                raw_signals, errors = self._collect_with_retry(
-                    task_id=state["task_id"],
-                    query=state["query"],
-                    symbols=state.get("symbols", []),
-                )
-                logger.info("节点完成 raw_signals=%s errors=%s", len(raw_signals), len(errors))
+                historical_corrections = self._load_tool_corrections_for_planner(state=state)
+                combined_signals = []
+                combined_errors: list[str] = []
+                combined_failures: list[dict[str, Any]] = []
+                correction_events: list[dict[str, Any]] = []
+                feedback_for_retry: dict[str, list[dict[str, Any]]] = {}
+                previous_feedback: dict[str, list[dict[str, Any]]] = {}
 
-            merged_errors = [*state.get("errors", []), *errors]
+                for round_index in range(MCP_FEEDBACK_MAX_ROUNDS):
+                    result = self._collect_with_retry(
+                        task_id=state["task_id"],
+                        query=state["query"],
+                        symbols=state.get("symbols", []),
+                        planning_context={
+                            "historical_corrections": historical_corrections,
+                            "server_failures": feedback_for_retry,
+                        },
+                    )
+                    combined_signals = self._merge_raw_signals(combined_signals, result.signals)
+                    combined_errors.extend(result.errors)
+                    combined_failures.extend(result.failures)
+
+                    deterministic_feedback = self._group_deterministic_failures(result.failures)
+                    if deterministic_feedback and round_index + 1 < MCP_FEEDBACK_MAX_ROUNDS:
+                        previous_feedback = deterministic_feedback
+                        feedback_for_retry = deterministic_feedback
+                        logger.info(
+                            "触发 MCP 纠错重试 round=%s deterministic_failures=%s",
+                            round_index + 2,
+                            sum(len(items) for items in deterministic_feedback.values()),
+                        )
+                        continue
+
+                    if previous_feedback:
+                        correction_events = self._build_correction_events(
+                            previous_feedback=previous_feedback,
+                            successes=result.successes,
+                        )
+                        if correction_events:
+                            self._persist_tool_corrections(user_id=state["user_id"], corrections=correction_events)
+                            logger.info("MCP 纠错经验写回长期记忆 count=%s", len(correction_events))
+                    break
+
+                logger.info(
+                    "节点完成 raw_signals=%s errors=%s failures=%s corrections=%s",
+                    len(combined_signals),
+                    len(combined_errors),
+                    len(combined_failures),
+                    len(correction_events),
+                )
+
+            merged_errors = [*state.get("errors", []), *combined_errors]
             return {
-                "raw_signals": [item.model_dump() for item in raw_signals],
+                "raw_signals": [item.model_dump() for item in combined_signals],
                 "errors": merged_errors,
+                "mcp_failures": combined_failures,
+                "mcp_corrections": correction_events,
             }
 
         return self._run_tracked_node(state, node_id="collect_signals_via_mcp", handler=_node_logic)
@@ -198,14 +245,121 @@ class ResearchGraphRunner:
         retry=retry_if_exception_type(Exception),
         reraise=True,
     )
-    def _collect_with_retry(self, task_id: str, query: str, symbols: list[str]):
+    def _collect_with_retry(
+        self,
+        task_id: str,
+        query: str,
+        symbols: list[str],
+        planning_context: dict[str, Any] | None,
+    ):
         """MCP 采集重试包装。
 
         触发条件：网络异常、超时、上游瞬时错误。
         停止条件：最多 3 次。
         """
 
-        return self.mcp_client.collect_signals(task_id=task_id, query=query, symbols=symbols)
+        return self.mcp_client.collect_signals_detailed(
+            task_id=task_id,
+            query=query,
+            symbols=symbols,
+            planning_context=planning_context,
+        )
+
+    def _load_tool_corrections_for_planner(self, state: ResearchState) -> list[dict[str, Any]]:
+        """从状态画像读取 MCP 纠错记忆。"""
+
+        profile = state.get("memory_profile", {})
+        corrections = profile.get("tool_corrections", []) if isinstance(profile, dict) else []
+        if isinstance(corrections, list):
+            return [item for item in corrections if isinstance(item, dict)]
+        return []
+
+    def _merge_raw_signals(self, existing: list[Any], incoming: list[Any]) -> list[Any]:
+        """跨轮次去重合并 RawSignal，避免重复写入。"""
+
+        merged: list[Any] = []
+        seen: set[tuple[str, str, str, str]] = set()
+        for signal in [*existing, *incoming]:
+            key = (
+                str(getattr(signal, "source", "")),
+                str(getattr(signal, "symbol", "")),
+                str(getattr(signal, "raw_ref", "")),
+                str(getattr(signal, "published_at", "")),
+            )
+            if key in seen:
+                continue
+            seen.add(key)
+            merged.append(signal)
+        return merged
+
+    def _group_deterministic_failures(self, failures: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
+        """按 server 聚合可用于纠错重规划的确定性失败。"""
+
+        grouped: dict[str, list[dict[str, Any]]] = {}
+        for item in failures:
+            if not isinstance(item, dict) or not item.get("deterministic"):
+                continue
+            server = str(item.get("server", "")).strip()
+            if not server:
+                continue
+            grouped.setdefault(server, []).append(item)
+        return grouped
+
+    def _build_correction_events(
+        self,
+        *,
+        previous_feedback: dict[str, list[dict[str, Any]]],
+        successes: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """从“上一轮失败 + 本轮成功”提取可复用纠错样本。"""
+
+        success_by_server: dict[str, list[dict[str, Any]]] = {}
+        for success in successes:
+            if not isinstance(success, dict):
+                continue
+            server = str(success.get("server", "")).strip()
+            if not server:
+                continue
+            success_by_server.setdefault(server, []).append(success)
+
+        events: list[dict[str, Any]] = []
+        for server, failures in previous_feedback.items():
+            server_successes = success_by_server.get(server, [])
+            if not failures or not server_successes:
+                continue
+            representative_success = next(
+                (item for item in server_successes if int(item.get("rows", 0) or 0) > 0),
+                server_successes[0],
+            )
+            for failure in failures[:3]:
+                error_detail = failure.get("error_detail", {})
+                events.append(
+                    {
+                        "server": server,
+                        "failed_tool": str(failure.get("tool_name", "")),
+                        "failed_arguments": failure.get("arguments", {}),
+                        "error_signature": self._build_error_signature_from_detail(
+                            error_detail if isinstance(error_detail, dict) else {}
+                        ),
+                        "fixed_tool": str(representative_success.get("tool_name", "")),
+                        "fixed_arguments": representative_success.get("arguments", {}),
+                    }
+                )
+        return events
+
+    def _persist_tool_corrections(self, *, user_id: str, corrections: list[dict[str, Any]]) -> None:
+        """将纠错经验写入长期记忆。"""
+
+        for item in corrections:
+            self.memory_service.save_tool_correction(user_id=user_id, correction=item, confidence=0.78)
+
+    def _build_error_signature_from_detail(self, detail: dict[str, Any]) -> str:
+        """构建轻量错误签名，便于记忆检索。"""
+
+        status = detail.get("status_code", "unknown")
+        message = detail.get("error_message") or detail.get("message") or detail.get("response_body") or ""
+        raw = f"status={status} message={message}"
+        return raw.replace("\n", " ")[:220]
 
     def normalize_and_index(self, state: ResearchState) -> ResearchState:
         """节点目标：标准化信号并入库。

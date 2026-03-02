@@ -33,12 +33,12 @@ class AppRuntime:
             self.milvus_store.connect()
             logger.info("MilvusStore 初始化完成")
 
+            self.llm_client = create_llm_client(settings)
             self.memory_service = MemoryService(settings=settings, milvus_store=self.milvus_store)
-            self.mcp_client = MCPClient(settings=settings)
+            self.mcp_client = MCPClient(settings=settings, llm_client=self.llm_client)
             self.research_service = ResearchService(settings=settings, milvus_store=self.milvus_store)
             logger.info("核心服务初始化完成")
 
-            self.llm_client = create_llm_client(settings)
             self.report_agent = ReportAgent(settings=settings, llm_client=self.llm_client)
 
             self.graph_runner = ResearchGraphRunner(

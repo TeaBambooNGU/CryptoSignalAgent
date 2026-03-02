@@ -2,13 +2,9 @@
 
 from __future__ import annotations
 
-import logging
-
-from app.agents.llm.base import BaseLLMClient, RuleBasedFallbackLLM
+from app.agents.llm.base import BaseLLMClient
 from app.agents.llm.openai_compatible import OpenAICompatibleLLMClient
 from app.config.settings import Settings
-
-logger = logging.getLogger(__name__)
 
 
 def create_llm_client(settings: Settings) -> BaseLLMClient:
@@ -21,8 +17,7 @@ def create_llm_client(settings: Settings) -> BaseLLMClient:
 
     if provider == "minimax":
         if not settings.minimax_api_key:
-            logger.warning("未配置 MINIMAX_API_KEY，降级为规则引擎报告")
-            return RuleBasedFallbackLLM()
+            raise ValueError("MINIMAX_API_KEY 未配置，无法初始化 LLM 客户端")
 
         return OpenAICompatibleLLMClient(
             api_key=settings.minimax_api_key,
@@ -35,8 +30,7 @@ def create_llm_client(settings: Settings) -> BaseLLMClient:
 
     if provider in {"openai_compatible", "openai-compatible"}:
         if not settings.openai_compatible_api_key or not settings.openai_compatible_base_url:
-            logger.warning("OpenAI-compatible 配置不完整，降级为规则引擎报告")
-            return RuleBasedFallbackLLM()
+            raise ValueError("OPENAI_COMPATIBLE_API_KEY 或 OPENAI_COMPATIBLE_BASE_URL 未配置，无法初始化 LLM 客户端")
 
         return OpenAICompatibleLLMClient(
             api_key=settings.openai_compatible_api_key,
@@ -47,5 +41,4 @@ def create_llm_client(settings: Settings) -> BaseLLMClient:
             provider_name="openai_compatible",
         )
 
-    logger.warning("未知 LLM_PROVIDER=%s，降级为规则引擎报告", provider)
-    return RuleBasedFallbackLLM()
+    raise ValueError(f"未知 LLM_PROVIDER={provider}")

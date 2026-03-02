@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import json
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import sys
 from typing import Any
@@ -113,6 +113,63 @@ def _write_json_block(handle, title: str, data: Any) -> None:
     handle.flush()
 
 
+def _build_inspect_arguments(tool: types.Tool) -> dict[str, Any]:
+    """巡检脚本内置参数猜测，仅用于尽量提高工具可调用率。"""
+
+    schema = tool.inputSchema if isinstance(tool.inputSchema, dict) else {}
+    properties = schema.get("properties", {}) if isinstance(schema.get("properties", {}), dict) else {}
+    required = schema.get("required", []) or []
+    now = datetime.now(timezone.utc)
+
+    def suggest(name: str, prop_schema: dict[str, Any]) -> Any | None:
+        lowered = name.lower()
+        enums = prop_schema.get("enum")
+        if isinstance(enums, list) and enums:
+            return enums[0]
+        if "default" in prop_schema:
+            return prop_schema["default"]
+        if lowered in {"vs_currency", "currency"}:
+            return "usd"
+        if lowered in {"id", "coin_id"}:
+            return "bitcoin"
+        if lowered in {"ids", "coin_ids"}:
+            return "bitcoin,ethereum"
+        if lowered in {"symbol"}:
+            return "btc"
+        if lowered in {"symbols"}:
+            return "btc,eth"
+        if lowered in {"query", "keyword", "search"}:
+            return QUERY
+        if lowered in {"from", "start"}:
+            return int((now - timedelta(hours=24)).timestamp())
+        if lowered in {"to", "end"}:
+            return int(now.timestamp())
+        if lowered in {"page", "offset"}:
+            return 1
+        if lowered in {"per_page", "limit", "count"}:
+            return 10
+        if lowered == "date":
+            return now.strftime("%Y-%m-%d")
+        return None
+
+    arguments: dict[str, Any] = {}
+    for prop_name, prop_schema in properties.items():
+        schema_item = prop_schema if isinstance(prop_schema, dict) else {}
+        value = suggest(str(prop_name), schema_item)
+        if value is not None:
+            arguments[str(prop_name)] = value
+
+    for req_name in required:
+        req_text = str(req_name)
+        if req_text in arguments:
+            continue
+        value = suggest(req_text, {})
+        if value is not None:
+            arguments[req_text] = value
+
+    return arguments
+
+
 async def _inspect_server(
     *,
     client: MCPClient,
@@ -139,14 +196,13 @@ async def _inspect_server(
             if CALL_ALL_TOOLS:
                 tools_to_call = tools
             else:
-                selected = client._select_tools(spec=spec, tools=tools, query=QUERY, symbols=SYMBOLS)
-                tools_to_call = selected[:MAX_TOOLS_PER_SERVER]
+                tools_to_call = tools[:MAX_TOOLS_PER_SERVER]
 
             output_handle.write(f"### Calls ({len(tools_to_call)})\n\n")
             output_handle.flush()
 
             for index, tool in enumerate(tools_to_call, start=1):
-                arguments = client._build_tool_arguments(tool=tool, query=QUERY, symbols=SYMBOLS)
+                arguments = _build_inspect_arguments(tool)
                 output_handle.write(f"### Tool #{index}: `{tool.name}`\n\n")
                 _write_json_block(
                     output_handle,

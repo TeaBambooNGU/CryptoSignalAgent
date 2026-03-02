@@ -12,11 +12,17 @@ from app.memory.mem0_service import MemoryService
 
 
 class _DummyMilvusStore:
+    def __init__(self) -> None:
+        self.records: list[dict[str, Any]] = []
+
     def upsert_user_memory(self, records: list[dict[str, Any]]) -> None:
+        self.records.extend(records)
         return None
 
     def query_user_memory(self, user_id: str, limit: int) -> list[dict[str, Any]]:
-        return []
+        rows = [item for item in self.records if item.get("user_id") == user_id]
+        rows.sort(key=lambda item: int(item.get("updated_at", 0)), reverse=True)
+        return rows[:limit]
 
 
 class _SearchClient:
@@ -100,6 +106,29 @@ class Mem0ServiceCompatibilityTestCase(unittest.TestCase):
         self.assertEqual(client.last_kwargs["limit"], 3)
         self.assertNotIn("filters", client.last_kwargs)
         self.assertNotIn("top_k", client.last_kwargs)
+
+    def test_save_tool_correction_written_to_long_term_profile(self) -> None:
+        with patch.dict(os.environ, {"ZHIPUAI_API_KEY": ""}, clear=False):
+            settings = Settings(mem0_enabled=False)
+            milvus = _DummyMilvusStore()
+            service = MemoryService(settings=settings, milvus_store=milvus)
+
+            service.save_tool_correction(
+                user_id="u-3",
+                correction={
+                    "server": "defillama",
+                    "failed_tool": "protocol_information",
+                    "failed_arguments": {"protocol": "BTC"},
+                    "fixed_tool": "protocol_information",
+                    "fixed_arguments": {"protocol": "bitcoin"},
+                },
+            )
+
+            profile = service.load_memory_profile("u-3")
+            corrections = profile.get("tool_corrections", [])
+            self.assertEqual(len(corrections), 1)
+            self.assertEqual(corrections[0]["server"], "defillama")
+            self.assertEqual(corrections[0]["fixed_arguments"]["protocol"], "bitcoin")
 
 
 if __name__ == "__main__":

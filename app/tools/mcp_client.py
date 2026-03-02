@@ -10,9 +10,10 @@ from __future__ import annotations
 import asyncio
 import json
 import re
+import time
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from typing import Any
 
 from mcp import ClientSession, types
@@ -20,8 +21,8 @@ from mcp.client.sse import sse_client
 from mcp.client.stdio import StdioServerParameters, stdio_client
 from mcp.client.streamable_http import streamablehttp_client
 from mcp.shared.exceptions import McpError
-from tenacity import Retrying, retry_if_exception_type, stop_after_attempt, wait_exponential
 
+from app.agents.llm.base import BaseLLMClient
 from app.config.logging import get_logger, log_context
 from app.config.settings import Settings
 from app.models.schemas import RawSignal, SignalType
@@ -34,15 +35,15 @@ LOG_MAX_LIST_ITEMS = 5
 LOG_MAX_DEPTH = 4
 ERROR_LOG_MAX_LIST_ITEMS = 50
 SENSITIVE_MASK = "***"
-SYMBOL_TO_CG_ID = {
-    "BTC": "bitcoin",
-    "ETH": "ethereum",
-    "SOL": "solana",
-    "BNB": "binancecoin",
-    "XRP": "ripple",
-    "ADA": "cardano",
-    "DOGE": "dogecoin",
-}
+PLANNER_MAX_DESCRIPTION_CHARS = 220
+PLANNER_MAX_PROPERTIES_PER_TOOL = 16
+PLANNER_MAX_RETRY_ATTEMPTS = 2
+PLANNER_MAX_HISTORY_ITEMS = 6
+PLANNER_MAX_FEEDBACK_ITEMS = 8
+SERVER_MAX_RETRY_ATTEMPTS = 3
+SERVER_REPLAN_MAX_ROUNDS = 2
+SERVER_RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
+REPLAN_REPEAT_5XX_THRESHOLD = 2
 
 
 @dataclass(slots=True)
@@ -60,11 +61,22 @@ class MCPServerSpec:
     max_tools_per_server: int = 3
 
 
+@dataclass(slots=True)
+class MCPCollectResult:
+    """MCP 采集结果（含诊断信息）。"""
+
+    signals: list[RawSignal]
+    errors: list[str]
+    failures: list[dict[str, Any]]
+    successes: list[dict[str, Any]]
+
+
 class MCPClient:
     """MCP 采集适配层。"""
 
-    def __init__(self, settings: Settings) -> None:
+    def __init__(self, settings: Settings, llm_client: BaseLLMClient | None = None) -> None:
         self.settings = settings
+        self.llm_client = llm_client
 
     def collect_signals(
         self,
@@ -74,47 +86,155 @@ class MCPClient:
     ) -> tuple[list[RawSignal], list[str]]:
         """通过标准 MCP 协议采集原始信号。"""
 
+        result = self.collect_signals_detailed(
+            task_id=task_id,
+            query=query,
+            symbols=symbols,
+            planning_context=None,
+        )
+        return result.signals, result.errors
+
+    def collect_signals_detailed(
+        self,
+        *,
+        task_id: str,
+        query: str,
+        symbols: list[str],
+        planning_context: dict[str, Any] | None,
+    ) -> MCPCollectResult:
+        """通过标准 MCP 协议采集原始信号，并返回诊断信息。"""
+
         errors: list[str] = []
+        failures: list[dict[str, Any]] = []
+        successes: list[dict[str, Any]] = []
         specs = self._load_server_specs()
         with log_context(component="mcp.collect"):
             logger.info("MCP 采集开始 servers=%s symbols=%s", len(specs), symbols or ["BTC"])
         if not specs:
             errors.append("未配置 MCP_SERVERS，跳过实时采集")
-            return [], errors
+            return MCPCollectResult(signals=[], errors=errors, failures=failures, successes=successes)
+
+        historical_corrections = planning_context.get("historical_corrections", []) if planning_context else []
+        server_failures_raw = planning_context.get("server_failures", {}) if planning_context else {}
+        server_failures: dict[str, list[dict[str, Any]]] = {}
+        if isinstance(server_failures_raw, dict):
+            for server_name, items in server_failures_raw.items():
+                if isinstance(items, list):
+                    server_failures[str(server_name)] = [item for item in items if isinstance(item, dict)]
 
         raw_rows: list[dict[str, Any]] = []
         for spec in specs:
+            server_feedback = [item for item in server_failures.get(spec.name, []) if isinstance(item, dict)]
+            exception_signature_counts: dict[str, int] = {}
+            attempt_context: dict[str, Any] = {}
             try:
-                # 对服务级采集增加重试，覆盖临时网络抖动或上游瞬态故障。
                 rows: list[dict[str, Any]] = []
                 server_errors: list[str] = []
-                for attempt in Retrying(
-                    stop=stop_after_attempt(3),
-                    wait=wait_exponential(multiplier=1, min=1, max=16),
-                    retry=retry_if_exception_type(Exception),
-                    reraise=True,
-                ):
-                    with attempt:
-                        rows, server_errors = asyncio.run(
+                server_failures_result: list[dict[str, Any]] = []
+                server_successes_result: list[dict[str, Any]] = []
+                last_exc: Exception | None = None
+
+                for attempt in range(1, SERVER_MAX_RETRY_ATTEMPTS + 1):
+                    try:
+                        rows, server_errors, server_failures_result, server_successes_result = asyncio.run(
                             self._collect_from_server(
                                 spec=spec,
                                 task_id=task_id,
                                 query=query,
                                 symbols=symbols,
+                                historical_corrections=historical_corrections,
+                                failure_feedback=server_feedback,
+                                attempt_context=attempt_context,
                             )
                         )
+                        break
+                    except Exception as exc:
+                        last_exc = exc
+                        error_detail = self._build_exception_error_detail(exc)
+                        failure_tool_name = str(attempt_context.get("tool_name") or "__server__")
+                        failure_arguments = (
+                            attempt_context.get("arguments")
+                            if isinstance(attempt_context.get("arguments"), dict)
+                            else {}
+                        )
+                        failure_reason = str(attempt_context.get("reason") or "server_exception")
+                        transient_failure = {
+                            "server": spec.name,
+                            "tool_name": failure_tool_name,
+                            "arguments": failure_arguments,
+                            "reason": failure_reason,
+                            "error_detail": error_detail,
+                            "deterministic": self._is_deterministic_error_detail(error_detail),
+                        }
+                        if self._should_replan_on_failure(item=transient_failure):
+                            server_feedback.append(transient_failure)
+
+                        signature = self._build_failure_signature(transient_failure)
+                        if signature:
+                            exception_signature_counts[signature] = exception_signature_counts.get(signature, 0) + 1
+
+                        retryable = self._is_retryable_server_exception(exc)
+                        repeated_5xx = (
+                            signature
+                            and exception_signature_counts.get(signature, 0) >= REPLAN_REPEAT_5XX_THRESHOLD
+                            and self._is_failure_status_5xx(error_detail)
+                        )
+
+                        if not retryable or attempt >= SERVER_MAX_RETRY_ATTEMPTS:
+                            raise
+
+                        if repeated_5xx:
+                            logger.warning(
+                                "MCP 服务重试前注入重复5xx反馈 server=%s signature=%s attempt=%s",
+                                spec.name,
+                                self._truncate_log_text(signature, max_text_chars=180),
+                                attempt + 1,
+                            )
+                        else:
+                            logger.warning("MCP 服务重试 server=%s attempt=%s", spec.name, attempt + 1)
+
+                        backoff_seconds = min(16, 2 ** (attempt - 1))
+                        time.sleep(backoff_seconds)
+                else:
+                    if last_exc is not None:
+                        raise last_exc
+
                 errors.extend(server_errors)
+                failures.extend(server_failures_result)
+                successes.extend(server_successes_result)
                 with log_context(component="mcp.collect"):
                     logger.info("MCP 服务完成 server=%s rows=%s errors=%s", spec.name, len(rows), len(server_errors))
                 raw_rows.extend(rows)
             except Exception as exc:
-                logger.exception("MCP 服务采集失败: %s", spec.name)
-                errors.append(f"MCP 服务失败: {spec.name} ({type(exc).__name__})")
+                error_detail = self._build_exception_error_detail(exc)
+                failure_tool_name = str(attempt_context.get("tool_name") or "__server__")
+                failure_arguments = (
+                    attempt_context.get("arguments")
+                    if isinstance(attempt_context.get("arguments"), dict)
+                    else {}
+                )
+                failure_reason = str(attempt_context.get("reason") or "server_collect")
+                logger.exception(
+                    "MCP 服务采集失败: %s detail=%s",
+                    spec.name,
+                    self._format_log_payload(error_detail),
+                )
+                errors.append(f"MCP 服务失败: {spec.name} {self._format_log_payload(error_detail)}")
+                failures.append(
+                    {
+                        "server": spec.name,
+                        "tool_name": failure_tool_name,
+                        "arguments": failure_arguments,
+                        "reason": failure_reason,
+                        "error_detail": error_detail,
+                        "deterministic": self._is_deterministic_error_detail(error_detail),
+                    }
+                )
 
         normalized = self._normalize_raw_rows(task_id=task_id, rows=raw_rows)
         with log_context(component="mcp.collect"):
             logger.info("MCP 采集结束 raw_rows=%s normalized=%s errors=%s", len(raw_rows), len(normalized), len(errors))
-        return normalized, errors
+        return MCPCollectResult(signals=normalized, errors=errors, failures=failures, successes=successes)
 
     def _load_server_specs(self) -> list[MCPServerSpec]:
         """从配置加载 MCP server 列表。"""
@@ -172,93 +292,244 @@ class MCPClient:
         task_id: str,
         query: str,
         symbols: list[str],
-    ) -> tuple[list[dict[str, Any]], list[str]]:
+        historical_corrections: list[dict[str, Any]],
+        failure_feedback: list[dict[str, Any]],
+        attempt_context: dict[str, Any] | None = None,
+    ) -> tuple[list[dict[str, Any]], list[str], list[dict[str, Any]], list[dict[str, Any]]]:
         """连接单个 MCP 服务并采集数据。"""
+
+        if attempt_context is not None:
+            attempt_context.clear()
+            attempt_context.update({"tool_name": "__server__", "arguments": {}, "reason": "session_open"})
 
         async with self._open_session(spec) as session:
             tools_result = await session.list_tools()
-            selected_tools = self._select_tools(
-                spec=spec,
-                tools=tools_result.tools,
-                query=query,
-                symbols=symbols,
-            )
-            if not selected_tools:
-                return [], [f"MCP 无可用工具: {spec.name}"]
-
-            with log_context(component="mcp.collect"):
-                logger.info("工具筛选完成 server=%s selected_tools=%s", spec.name, len(selected_tools))
             rows: list[dict[str, Any]] = []
             errors: list[str] = []
-            for tool in selected_tools[: spec.max_tools_per_server]:
-                arguments = self._build_tool_arguments(tool=tool, query=query, symbols=symbols)
-                safe_arguments = self._sanitize_for_log(arguments)
+            failures: list[dict[str, Any]] = []
+            successes: list[dict[str, Any]] = []
+            planning_feedback: list[dict[str, Any]] = [item for item in failure_feedback if isinstance(item, dict)]
+            seen_call_signatures: set[str] = set()
+
+            for planning_round in range(SERVER_REPLAN_MAX_ROUNDS):
+                tool_calls = self._plan_tool_calls_with_llm(
+                    spec=spec,
+                    tools=tools_result.tools,
+                    query=query,
+                    symbols=symbols,
+                    errors=errors,
+                    historical_corrections=historical_corrections,
+                    failure_feedback=planning_feedback,
+                )
+                if not tool_calls:
+                    return [], [f"MCP 无可用工具: {spec.name}"], failures, successes
+
                 with log_context(component="mcp.collect"):
                     logger.info(
-                        "MCP 工具调用开始 server=%s tool=%s arguments=%s",
+                        "LLM 规划完成 server=%s planned_calls=%s round=%s",
                         spec.name,
-                        tool.name,
-                        self._format_log_payload(safe_arguments),
+                        len(tool_calls),
+                        planning_round + 1,
                     )
-                try:
-                    result = await session.call_tool(tool.name, arguments=arguments)
-                except Exception as exc:
-                    error_detail = self._build_exception_error_detail(exc)
-                    errors.append(
-                        "MCP 工具异常: "
-                        f"{spec.name}/{tool.name} {self._format_log_payload(error_detail)}"
-                    )
-                    logger.warning(
-                        "MCP 工具调用失败 server=%s tool=%s arguments=%s error=%s",
-                        spec.name,
-                        tool.name,
-                        self._format_log_payload(safe_arguments),
-                        self._format_log_payload(error_detail),
-                    )
-                    continue
 
-                if result.isError:
-                    error_detail = self._extract_tool_error_detail(result)
-                    errors.append(
-                        "MCP 工具返回错误: "
-                        f"{spec.name}/{tool.name} {self._format_log_payload(error_detail)}"
-                    )
+                round_failures: list[dict[str, Any]] = []
+                executed_calls = 0
+                for tool, arguments, rationale in tool_calls:
+                    call_signature = self._build_call_signature(tool_name=tool.name, arguments=arguments)
+                    if call_signature in seen_call_signatures:
+                        errors.append(
+                            f"MCP 规划重复调用已跳过: {spec.name}/{tool.name} {self._format_log_payload(self._sanitize_for_log(arguments))}"
+                        )
+                        continue
+                    seen_call_signatures.add(call_signature)
+
+                    executed_calls += 1
+                    safe_arguments = self._sanitize_for_log(arguments)
+                    if attempt_context is not None:
+                        attempt_context.update(
+                            {
+                                "tool_name": tool.name,
+                                "arguments": arguments,
+                                "reason": rationale,
+                            }
+                        )
                     with log_context(component="mcp.collect"):
-                        logger.warning(
-                            "MCP 工具返回错误 server=%s tool=%s arguments=%s error=%s",
+                        logger.info(
+                            "MCP 工具调用开始 server=%s tool=%s arguments=%s rationale=%s round=%s",
                             spec.name,
                             tool.name,
                             self._format_log_payload(safe_arguments),
+                            self._truncate_log_text(rationale or ""),
+                            planning_round + 1,
+                        )
+                    try:
+                        result = await session.call_tool(tool.name, arguments=arguments)
+                    except Exception as exc:
+                        error_detail = self._build_exception_error_detail(exc)
+                        error_index = len(errors)
+                        errors.append(
+                            "MCP 工具异常: "
+                            f"{spec.name}/{tool.name} {self._format_log_payload(error_detail)}"
+                        )
+                        logger.warning(
+                            "MCP 工具调用失败 server=%s tool=%s arguments=%s rationale=%s round=%s error=%s",
+                            spec.name,
+                            tool.name,
+                            self._format_log_payload(safe_arguments),
+                            self._truncate_log_text(rationale or ""),
+                            planning_round + 1,
                             self._format_log_payload(error_detail),
                         )
-                    continue
+                        failure_item = {
+                            "server": spec.name,
+                            "tool_name": tool.name,
+                            "arguments": arguments,
+                            "reason": rationale,
+                            "error_detail": error_detail,
+                            "deterministic": self._is_deterministic_error_detail(error_detail),
+                            "_error_index": error_index,
+                            "_resolved": False,
+                        }
+                        failures.append(failure_item)
+                        round_failures.append(failure_item)
+                        continue
 
-                extracted_rows = self._extract_rows_from_tool_result(
-                    result=result,
-                    server_name=spec.name,
-                    tool_name=tool.name,
-                    symbols=symbols,
-                    task_id=task_id,
-                )
-                tool_rows = self._post_process_rows(rows=extracted_rows, symbols=symbols)
-                rows.extend(tool_rows)
-                with log_context(component="mcp.collect"):
-                    logger.info(
-                        "工具调用完成 server=%s tool=%s tool_rows=%s total_rows=%s result=%s",
-                        spec.name,
-                        tool.name,
-                        len(tool_rows),
-                        len(rows),
-                        self._format_log_payload(
-                            self._summarize_tool_result(
-                                result=result,
-                                extracted_rows=len(extracted_rows),
-                                post_processed_rows=len(tool_rows),
+                    if result.isError:
+                        error_detail = self._extract_tool_error_detail(result)
+                        error_index = len(errors)
+                        errors.append(
+                            "MCP 工具返回错误: "
+                            f"{spec.name}/{tool.name} {self._format_log_payload(error_detail)}"
+                        )
+                        with log_context(component="mcp.collect"):
+                            logger.warning(
+                                "MCP 工具返回错误 server=%s tool=%s arguments=%s rationale=%s round=%s error=%s",
+                                spec.name,
+                                tool.name,
+                                self._format_log_payload(safe_arguments),
+                                self._truncate_log_text(rationale or ""),
+                                planning_round + 1,
+                                self._format_log_payload(error_detail),
                             )
-                        ),
-                    )
+                        failure_item = {
+                            "server": spec.name,
+                            "tool_name": tool.name,
+                            "arguments": arguments,
+                            "reason": rationale,
+                            "error_detail": error_detail,
+                            "deterministic": self._is_deterministic_error_detail(error_detail),
+                            "_error_index": error_index,
+                            "_resolved": False,
+                        }
+                        failures.append(failure_item)
+                        round_failures.append(failure_item)
+                        continue
 
-            return rows, errors
+                    extracted_rows = self._extract_rows_from_tool_result(
+                        result=result,
+                        server_name=spec.name,
+                        tool_name=tool.name,
+                        symbols=symbols,
+                        task_id=task_id,
+                    )
+                    tool_rows = self._post_process_rows(rows=extracted_rows, symbols=symbols)
+                    rows.extend(tool_rows)
+                    with log_context(component="mcp.collect"):
+                        logger.info(
+                            "工具调用完成 server=%s tool=%s tool_rows=%s total_rows=%s rationale=%s round=%s result=%s",
+                            spec.name,
+                            tool.name,
+                            len(tool_rows),
+                            len(rows),
+                            self._truncate_log_text(rationale or ""),
+                            planning_round + 1,
+                            self._format_log_payload(
+                                self._summarize_tool_result(
+                                    result=result,
+                                    extracted_rows=len(extracted_rows),
+                                    post_processed_rows=len(tool_rows),
+                                )
+                            ),
+                        )
+                    successes.append(
+                        {
+                            "server": spec.name,
+                            "tool_name": tool.name,
+                            "arguments": arguments,
+                            "reason": rationale,
+                            "rows": len(tool_rows),
+                        }
+                    )
+                    self._mark_failures_resolved_by_success(failures=failures, success_tool_name=tool.name)
+
+                if planning_round + 1 >= SERVER_REPLAN_MAX_ROUNDS:
+                    break
+                if executed_calls == 0:
+                    break
+
+                replan_feedback = self._build_replan_feedback(
+                    previous_failures=planning_feedback,
+                    current_failures=round_failures,
+                )
+                if not replan_feedback:
+                    break
+                planning_feedback = self._merge_feedback_items(existing=planning_feedback, incoming=replan_feedback)
+                logger.info(
+                    "触发单服务重规划 server=%s round=%s feedback=%s",
+                    spec.name,
+                    planning_round + 2,
+                    len(replan_feedback),
+                )
+
+            final_errors, final_failures = self._finalize_failures(errors=errors, failures=failures)
+            if len(final_failures) < len(failures):
+                logger.info(
+                    "折叠已修复失败 server=%s resolved=%s remaining=%s",
+                    spec.name,
+                    len(failures) - len(final_failures),
+                    len(final_failures),
+                )
+            return rows, final_errors, final_failures, successes
+
+    def _mark_failures_resolved_by_success(self, *, failures: list[dict[str, Any]], success_tool_name: str) -> None:
+        """同一工具后续调用成功时，标记此前确定性失败为已修复。"""
+
+        for item in failures:
+            if not isinstance(item, dict):
+                continue
+            if item.get("_resolved"):
+                continue
+            if not bool(item.get("deterministic")):
+                continue
+            if str(item.get("tool_name", "")).strip() != success_tool_name:
+                continue
+            item["_resolved"] = True
+
+    def _finalize_failures(
+        self,
+        *,
+        errors: list[str],
+        failures: list[dict[str, Any]],
+    ) -> tuple[list[str], list[dict[str, Any]]]:
+        """剔除同轮已修复失败，避免把已解决问题继续向上游放大。"""
+
+        removed_error_indexes: set[int] = set()
+        output_failures: list[dict[str, Any]] = []
+        for item in failures:
+            if not isinstance(item, dict):
+                continue
+            if item.get("_resolved"):
+                error_index = item.get("_error_index")
+                if isinstance(error_index, int):
+                    removed_error_indexes.add(error_index)
+                continue
+            payload = dict(item)
+            payload.pop("_resolved", None)
+            payload.pop("_error_index", None)
+            output_failures.append(payload)
+
+        output_errors = [text for index, text in enumerate(errors) if index not in removed_error_indexes]
+        return output_errors, output_failures
 
     def _post_process_rows(self, rows: list[dict[str, Any]], symbols: list[str]) -> list[dict[str, Any]]:
         """对工具返回行做轻量过滤，避免无关大批量数据淹没主信号。"""
@@ -324,187 +595,437 @@ class MCPClient:
                 await session.initialize()
                 yield session
 
-    def _select_tools(
+    def _plan_tool_calls_with_llm(
         self,
+        *,
         spec: MCPServerSpec,
         tools: list[types.Tool],
         query: str,
         symbols: list[str],
-    ) -> list[types.Tool]:
-        """按服务器配置或关键词策略筛选工具。"""
+        errors: list[str],
+        historical_corrections: list[dict[str, Any]],
+        failure_feedback: list[dict[str, Any]],
+    ) -> list[tuple[types.Tool, dict[str, Any], str]]:
+        """使用 LLM 规划当前 server 的工具调用与参数。"""
 
-        if spec.tool_allowlist:
-            allow = set(spec.tool_allowlist)
-            return [tool for tool in tools if tool.name in allow]
+        if self.llm_client is None:
+            raise RuntimeError("MCPClient 未注入 llm_client，无法执行工具规划")
 
-        intents = self._infer_query_intents(query)
-        scored_tools: list[tuple[float, types.Tool]] = []
-        for tool in tools:
-            score = self._score_tool(tool=tool, intents=intents, symbols=symbols)
-            if score > 0:
-                scored_tools.append((score, tool))
+        if not tools:
+            return []
 
-        if scored_tools:
-            scored_tools.sort(key=lambda item: (-item[0], item[1].name))
-            candidate_limit = max(spec.max_tools_per_server * 3, spec.max_tools_per_server)
-            return [tool for _, tool in scored_tools[:candidate_limit]]
+        candidate_tools = self._filter_tools_for_planner(spec=spec, tools=tools)
+        if not candidate_tools:
+            return []
 
-        return tools[:3]
+        base_user_prompt = self._build_planner_user_prompt(
+            server_name=spec.name,
+            query=query,
+            symbols=symbols,
+            tools=candidate_tools,
+            max_calls=spec.max_tools_per_server,
+            historical_corrections=historical_corrections,
+            failure_feedback=failure_feedback,
+        )
+        planner_error: Exception | None = None
+        planner_text = ""
 
-    def _infer_query_intents(self, query: str) -> set[str]:
-        """从查询语义提取意图标签。"""
+        for attempt in range(PLANNER_MAX_RETRY_ATTEMPTS):
+            user_prompt = base_user_prompt
+            if attempt > 0 and planner_error is not None:
+                user_prompt = self._build_planner_repair_user_prompt(
+                    original_prompt=base_user_prompt,
+                    previous_output=planner_text,
+                    error_message=str(planner_error),
+                )
 
-        lowered = query.lower()
-        intents: set[str] = set()
-        if any(token in lowered for token in ("news", "headline", "digest", "brief", "article", "新闻", "快讯")):
-            intents.add("news")
-        if any(token in lowered for token in ("chain", "onchain", "tvl", "protocol", "defi", "链上", "协议")):
-            intents.add("onchain")
-        if any(token in lowered for token in ("price", "market", "funding", "ticker", "行情", "价格")):
-            intents.add("price")
-        if not intents:
-            intents.add("market")
-        return intents
-
-    def _score_tool(self, *, tool: types.Tool, intents: set[str], symbols: list[str]) -> float:
-        """根据意图与 symbol 可控性对工具打分。"""
-
-        text = f"{tool.name} {tool.description or ''}".lower()
-        schema = tool.inputSchema if isinstance(tool.inputSchema, dict) else {}
-        properties = schema.get("properties", {})
-        property_names = {str(name).lower() for name in properties}
-
-        symbol_params = {"symbol", "symbols", "ticker", "tickers", "id", "coin_id", "ids", "coin_ids", "currencies"}
-        query_params = {"query", "keyword", "search"}
-
-        score = 0.0
-
-        intent_tokens: dict[str, tuple[str, ...]] = {
-            "news": ("news", "digest", "brief", "headline", "article", "research", "catalyst"),
-            "onchain": ("onchain", "chain", "protocol", "defi", "tvl"),
-            "price": ("price", "market", "ticker", "funding", "ohlc", "volume"),
-            "market": ("market", "coin", "token", "trend", "signal"),
-        }
-        for intent in intents:
-            tokens = intent_tokens.get(intent, ())
-            if any(token in text for token in tokens):
-                score += 2.5
-
-        if property_names & symbol_params:
-            score += 2.0
-        if property_names & query_params:
-            score += 1.0
-        if symbols and any(symbol.lower() in text for symbol in symbols):
-            score += 0.5
-
-        tool_name = tool.name.lower()
-        if any(token in tool_name for token in ("list_coins_categories", "new_coins_list", "all_categories")):
-            score -= 4.0
-        if "list" in tool_name and not (property_names & symbol_params or property_names & query_params):
-            score -= 2.0
-
-        return score
-
-    def _build_tool_arguments(self, tool: types.Tool, query: str, symbols: list[str]) -> dict[str, Any]:
-        """根据 inputSchema 生成调用参数。"""
-
-        schema = tool.inputSchema if isinstance(tool.inputSchema, dict) else {}
-        properties = schema.get("properties", {})
-        required = schema.get("required", []) or []
-
-        args: dict[str, Any] = {}
-        for name, info in properties.items():
-            value = self._suggest_argument_value(
-                name=name,
-                schema=info if isinstance(info, dict) else {},
-                query=query,
-                symbols=symbols,
+            planner_text = self.llm_client.generate(
+                system_prompt=self._build_planner_system_prompt(),
+                user_prompt=user_prompt,
+                metadata={
+                    "component": "mcp_tool_planner",
+                    "server": spec.name,
+                    "attempt": attempt + 1,
+                },
             )
-            if value is not None:
-                args[name] = value
+            try:
+                plan_payload = self._parse_planner_payload(planner_text)
+                return self._validate_and_normalize_plan(
+                    spec=spec,
+                    tools=candidate_tools,
+                    plan_payload=plan_payload,
+                    errors=errors,
+                )
+            except ValueError as exc:
+                planner_error = exc
 
-        # required 参数兜底，避免遗漏。
-        for name in required:
-            if name in args:
-                continue
-            value = self._suggest_argument_value(name=name, schema={}, query=query, symbols=symbols)
-            if value is not None:
-                args[name] = value
+        raise ValueError(f"LLM 规划失败: {spec.name} {planner_error}")
 
-        return args
+    def _filter_tools_for_planner(self, *, spec: MCPServerSpec, tools: list[types.Tool]) -> list[types.Tool]:
+        """根据 allowlist 过滤候选工具，不做规则推断。"""
 
-    def _suggest_argument_value(
+        if not spec.tool_allowlist:
+            return tools
+        allow = set(spec.tool_allowlist)
+        return [tool for tool in tools if tool.name in allow]
+
+    def _build_planner_system_prompt(self) -> str:
+        """构建 MCP 工具规划器系统提示词。"""
+
+        return (
+            "你是严谨的 MCP 工具调用规划器。"
+            "你的任务是从候选工具中选择最相关工具，并为每个工具生成可执行 arguments。"
+            "你必须严格遵守工具 schema，避免虚构字段。"
+            "你只能输出一个 JSON 对象，且必须能被 json.loads 直接解析。"
+            "禁止输出 markdown 代码块、前后缀说明、注释、自然语言解释。"
+            '输出顶层必须是 {"calls":[...]}。'
+        )
+
+    def _build_planner_user_prompt(
         self,
-        name: str,
-        schema: dict[str, Any],
+        *,
+        server_name: str,
         query: str,
         symbols: list[str],
-    ) -> Any | None:
-        """按参数名语义推断参数值。"""
+        tools: list[types.Tool],
+        max_calls: int,
+        historical_corrections: list[dict[str, Any]],
+        failure_feedback: list[dict[str, Any]],
+    ) -> str:
+        """构建 MCP 工具规划器用户提示词。"""
 
-        lowered = name.lower()
-        enums = schema.get("enum")
-        if isinstance(enums, list) and enums:
-            return enums[0]
-        if "default" in schema:
-            return schema["default"]
+        tool_summaries = self._summarize_tools_for_planning(tools)
+        symbols_text = ",".join(symbols) if symbols else "BTC,ETH"
+        tools_text = json.dumps(tool_summaries, ensure_ascii=False, indent=2)
+        correction_text = json.dumps(
+            self._summarize_historical_corrections(server_name=server_name, corrections=historical_corrections),
+            ensure_ascii=False,
+            indent=2,
+        )
+        feedback_text = json.dumps(
+            self._summarize_failure_feedback(feedback=failure_feedback),
+            ensure_ascii=False,
+            indent=2,
+        )
+        return (
+            f"server={server_name}\n"
+            f"user_query={query}\n"
+            f"target_symbols={symbols_text}\n"
+            f"max_calls={max_calls}\n\n"
+            "请输出 JSON：\n"
+            "{\n"
+            '  "calls":[\n'
+            "    {\n"
+            '      "tool_name":"候选工具名",\n'
+            '      "arguments":{"参数名":"参数值"},\n'
+            '      "reason":"不超过30字"\n'
+            "    }\n"
+            "  ]\n"
+            "}\n\n"
+            "强约束：\n"
+            "1) 仅可使用候选工具名；\n"
+            "2) 必须补齐工具 required 字段；\n"
+            "3) 不确定必填 path 参数时，不要选择该工具；\n"
+            "4) 优先返回能直接覆盖目标 symbols 的工具；\n"
+            "5) calls 数量必须在 1..max_calls。\n"
+            "6) 若存在“最近失败反馈”，必须优先避免重复使用同一组失败参数。\n\n"
+            "输出格式约束（必须同时满足）：\n"
+            "A) 回复内容只能是 JSON 对象本体；\n"
+            "B) 不要输出 ```json 或 ```；\n"
+            "C) 不要输出任何解释性文字。\n\n"
+            f"历史纠错经验:\n{correction_text}\n\n"
+            f"最近失败反馈:\n{feedback_text}\n\n"
+            f"候选工具:\n{tools_text}"
+        )
 
-        mapped_ids = [SYMBOL_TO_CG_ID.get(symbol.upper(), symbol.lower()) for symbol in symbols] or ["bitcoin"]
+    def _summarize_historical_corrections(
+        self,
+        *,
+        server_name: str,
+        corrections: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """压缩长期纠错记忆，供 planner 参考。"""
 
-        if lowered in {"vs_currency", "currency", "quote_currency"}:
-            return "usd"
-        if lowered in {"id", "coin_id", "token_id", "asset_id", "protocol"}:
-            return mapped_ids[0]
-        if lowered in {"ids", "coin_ids", "token_ids"}:
-            return ",".join(mapped_ids)
-        if lowered in {"currencies"}:
-            if schema.get("type") == "array":
-                return symbols or ["BTC", "ETH"]
-            return ",".join(symbols) if symbols else "BTC,ETH"
-        if lowered in {"symbol", "ticker"}:
-            return (symbols[0] if symbols else "BTC").lower()
-        if lowered in {"symbols", "tickers"}:
-            return ",".join(symbols).lower() if symbols else "btc,eth"
-        if lowered in {"region", "lang", "language"}:
-            return "en"
-        if lowered in {"kind"}:
-            return "news"
-        if lowered in {"news_filter"}:
-            return "important"
-        if lowered in {"lookback_hours"}:
-            return 24
-        if lowered in {"top_k"}:
-            return 10
-        if lowered in {"min_score"}:
-            return 0
-        if lowered in {"public_mode"}:
-            return False
-        if lowered in {"horizon"}:
-            return "intraday"
-        if "query" in lowered or "search" in lowered or "keyword" in lowered:
-            return query
-        if lowered in {"per_page", "limit", "count", "size"}:
-            return 10
-        if lowered in {"page", "offset"}:
-            return 1
-        if lowered in {"from", "start", "from_timestamp"}:
-            return int((datetime.now(timezone.utc) - timedelta(hours=24)).timestamp())
-        if lowered in {"to", "end", "to_timestamp"}:
-            return int(datetime.now(timezone.utc).timestamp())
-        if lowered == "date":
-            return datetime.now(timezone.utc).strftime("%d-%m-%Y")
-        if lowered == "site":
-            return "coindesk"
+        summarized: list[dict[str, Any]] = []
+        for item in corrections[:PLANNER_MAX_HISTORY_ITEMS]:
+            if not isinstance(item, dict):
+                continue
+            if str(item.get("server", "")).strip() not in {server_name, ""}:
+                continue
+            summarized.append(
+                {
+                    "server": str(item.get("server", "")),
+                    "failed_tool": str(item.get("failed_tool", "")),
+                    "failed_arguments": self._sanitize_for_log(item.get("failed_arguments", {})),
+                    "error_signature": self._truncate_log_text(str(item.get("error_signature", ""))),
+                    "fixed_tool": str(item.get("fixed_tool", "")),
+                    "fixed_arguments": self._sanitize_for_log(item.get("fixed_arguments", {})),
+                }
+            )
+        return summarized
+
+    def _summarize_failure_feedback(self, *, feedback: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """压缩最近失败反馈，避免 prompt 过长。"""
+
+        summarized: list[dict[str, Any]] = []
+        for item in feedback[:PLANNER_MAX_FEEDBACK_ITEMS]:
+            if not isinstance(item, dict):
+                continue
+            error_detail = item.get("error_detail", {})
+            signature = self._build_error_signature(error_detail if isinstance(error_detail, dict) else {})
+            summarized.append(
+                {
+                    "tool_name": str(item.get("tool_name", "")),
+                    "arguments": self._sanitize_for_log(item.get("arguments", {})),
+                    "error_signature": signature,
+                }
+            )
+        return summarized
+
+    def _build_planner_repair_user_prompt(
+        self,
+        *,
+        original_prompt: str,
+        previous_output: str,
+        error_message: str,
+    ) -> str:
+        """当规划输出不合法时，要求 LLM 按错误原因自修复。"""
+
+        return (
+            "上一次输出未通过校验，请严格修复。\n"
+            f"校验错误: {error_message}\n\n"
+            "请重新输出符合约束的 JSON 对象，禁止输出额外解释。\n"
+            "你的回复将被 json.loads 直接解析。\n"
+            "禁止 markdown 代码块、禁止任何前后缀文本，只能输出 JSON 对象。\n"
+            "如果某工具无法满足 required 字段，请直接删除该调用。\n\n"
+            f"原始任务:\n{original_prompt}\n\n"
+            f"上次输出:\n{previous_output}"
+        )
+
+    def _summarize_tools_for_planning(self, tools: list[types.Tool]) -> list[dict[str, Any]]:
+        """压缩工具 schema，避免 planner prompt 过长。"""
+
+        summaries: list[dict[str, Any]] = []
+        for tool in tools:
+            schema = tool.inputSchema if isinstance(tool.inputSchema, dict) else {}
+            properties = schema.get("properties", {})
+            required = schema.get("required", []) or []
+
+            property_summaries: dict[str, Any] = {}
+            required_names = [str(name) for name in required]
+            ordered_property_names = list(dict.fromkeys([*required_names, *[str(name) for name in properties.keys()]]))
+            if len(ordered_property_names) > PLANNER_MAX_PROPERTIES_PER_TOOL:
+                ordered_property_names = ordered_property_names[:PLANNER_MAX_PROPERTIES_PER_TOOL]
+
+            for prop_name in ordered_property_names:
+                prop_schema = properties.get(prop_name, {})
+                if not isinstance(prop_schema, dict):
+                    property_summaries[str(prop_name)] = {}
+                    continue
+                item: dict[str, Any] = {}
+                if "type" in prop_schema:
+                    item["type"] = prop_schema["type"]
+                enums = prop_schema.get("enum")
+                if isinstance(enums, list) and enums:
+                    item["enum"] = enums[:10]
+                if "default" in prop_schema:
+                    item["default"] = prop_schema["default"]
+                if "description" in prop_schema:
+                    item["description"] = self._truncate_log_text(
+                        str(prop_schema["description"]),
+                        max_text_chars=PLANNER_MAX_DESCRIPTION_CHARS,
+                    )
+                property_summaries[str(prop_name)] = item
+
+            summaries.append(
+                {
+                    "name": tool.name,
+                    "description": self._truncate_log_text(
+                        tool.description or "",
+                        max_text_chars=PLANNER_MAX_DESCRIPTION_CHARS,
+                    ),
+                    "required": [str(name) for name in required],
+                    "properties": property_summaries,
+                    "total_properties": len(properties),
+                }
+            )
+        return summaries
+
+    def _parse_planner_payload(self, planner_text: str) -> dict[str, Any]:
+        """解析 LLM 输出的 JSON 规划结果。"""
+
+        cleaned = planner_text.strip()
+        if not cleaned:
+            raise ValueError("LLM 规划输出为空")
+
+        candidates: list[str] = [cleaned]
+        stripped_fence = re.sub(r"^```(?:json)?\\s*|\\s*```$", "", cleaned, flags=re.IGNORECASE).strip()
+        if stripped_fence and stripped_fence != cleaned:
+            candidates.append(stripped_fence)
+
+        decoder = json.JSONDecoder()
+        text = stripped_fence or cleaned
+        for index, char in enumerate(text):
+            if char != "{":
+                continue
+            try:
+                obj, _ = decoder.raw_decode(text[index:])
+            except json.JSONDecodeError:
+                continue
+            if isinstance(obj, dict):
+                return obj
+
+        for candidate in candidates:
+            parsed = self._try_parse_json(candidate)
+            if isinstance(parsed, dict):
+                return parsed
+
+        raise ValueError("LLM 规划输出不是有效 JSON 对象（仅允许 JSON object）")
+
+    def _validate_and_normalize_plan(
+        self,
+        *,
+        spec: MCPServerSpec,
+        tools: list[types.Tool],
+        plan_payload: dict[str, Any],
+        errors: list[str],
+    ) -> list[tuple[types.Tool, dict[str, Any], str]]:
+        """校验 planner 结果并转换为可执行调用列表。"""
+
+        calls = plan_payload.get("calls")
+        if not isinstance(calls, list) or not calls:
+            raise ValueError("LLM 规划缺少 calls 列表")
+
+        tool_map = {tool.name: tool for tool in tools}
+        normalized_calls: list[tuple[types.Tool, dict[str, Any], str]] = []
+        seen_tools: set[str] = set()
+
+        for item in calls:
+            if not isinstance(item, dict):
+                continue
+
+            tool_name = str(item.get("tool_name", "")).strip()
+            if not tool_name or tool_name not in tool_map:
+                errors.append(f"MCP 规划忽略未知工具: {spec.name}/{tool_name or '<empty>'}")
+                continue
+            if tool_name in seen_tools:
+                continue
+
+            raw_arguments = item.get("arguments", {})
+            if raw_arguments is None:
+                raw_arguments = {}
+            if not isinstance(raw_arguments, dict):
+                errors.append(f"MCP 规划参数格式非法: {spec.name}/{tool_name}")
+                continue
+
+            tool = tool_map[tool_name]
+            coerced_args, validation_errors = self._validate_arguments_against_schema(tool=tool, arguments=raw_arguments)
+            if validation_errors:
+                errors.extend(f"MCP 规划参数无效: {spec.name}/{tool_name} {message}" for message in validation_errors)
+                continue
+
+            reason = str(item.get("reason", "")).strip()
+            normalized_calls.append((tool, coerced_args, reason))
+            seen_tools.add(tool_name)
+
+            if len(normalized_calls) >= spec.max_tools_per_server:
+                break
+
+        if not normalized_calls:
+            raise ValueError(f"LLM 规划无有效调用: {spec.name}")
+        return normalized_calls
+
+    def _validate_arguments_against_schema(
+        self,
+        *,
+        tool: types.Tool,
+        arguments: dict[str, Any],
+    ) -> tuple[dict[str, Any], list[str]]:
+        """按 inputSchema 校验并规范化 arguments。"""
+
+        schema = tool.inputSchema if isinstance(tool.inputSchema, dict) else {}
+        properties = schema.get("properties", {}) if isinstance(schema.get("properties", {}), dict) else {}
+        required = schema.get("required", []) or []
+
+        normalized: dict[str, Any] = {}
+        errors: list[str] = []
+
+        for key, value in arguments.items():
+            key_text = str(key)
+            if properties and key_text not in properties:
+                errors.append(f"{key_text}: unknown argument")
+                continue
+            prop_schema = properties.get(key_text, {})
+            if not isinstance(prop_schema, dict):
+                prop_schema = {}
+            coerced, error = self._coerce_argument_value(value=value, schema=prop_schema)
+            if error:
+                errors.append(f"{key_text}: {error}")
+                continue
+            normalized[key_text] = coerced
+
+        for req in required:
+            req_name = str(req)
+            value = normalized.get(req_name)
+            if value is None or (isinstance(value, str) and not value.strip()):
+                errors.append(f"missing required `{req_name}`")
+
+        for key, prop_schema in properties.items():
+            key_text = str(key)
+            if key_text not in normalized or not isinstance(prop_schema, dict):
+                continue
+            enums = prop_schema.get("enum")
+            if isinstance(enums, list) and enums and normalized[key_text] not in enums:
+                errors.append(f"{key_text}: not in enum")
+
+        return normalized, errors
+
+    def _coerce_argument_value(self, *, value: Any, schema: dict[str, Any]) -> tuple[Any, str | None]:
+        """按 schema 对 LLM 参数进行最小必要类型转换。"""
 
         value_type = schema.get("type")
         if value_type == "integer":
-            return 1
-        if value_type == "number":
-            return 1
-        if value_type == "boolean":
-            return False
+            if isinstance(value, bool):
+                return value, "expected integer"
+            if isinstance(value, int):
+                return value, None
+            if isinstance(value, float):
+                return int(value), None
+            if isinstance(value, str) and value.strip().lstrip("-").isdigit():
+                return int(value.strip()), None
+            return value, "expected integer"
 
-        return None
+        if value_type == "number":
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                return value, None
+            if isinstance(value, str):
+                try:
+                    return float(value.strip()), None
+                except ValueError:
+                    return value, "expected number"
+            return value, "expected number"
+
+        if value_type == "boolean":
+            if isinstance(value, bool):
+                return value, None
+            if isinstance(value, str):
+                lowered = value.strip().lower()
+                if lowered in {"true", "1", "yes"}:
+                    return True, None
+                if lowered in {"false", "0", "no"}:
+                    return False, None
+            return value, "expected boolean"
+
+        if value_type == "array":
+            if isinstance(value, list):
+                return value, None
+            if isinstance(value, str):
+                tokens = [token.strip() for token in value.split(",") if token.strip()]
+                if tokens:
+                    return tokens, None
+            return value, "expected array"
+
+        return value, None
 
     def _extract_rows_from_tool_result(
         self,
@@ -726,13 +1247,29 @@ class MCPClient:
             detail["error_message"] = text_blocks[0] if text_blocks else "unknown_error"
         return detail
 
-    def _build_exception_error_detail(self, exc: Exception) -> dict[str, Any]:
+    def _build_exception_error_detail(self, exc: BaseException, *, depth: int = 0) -> dict[str, Any]:
         """提取异常详情，避免丢失状态码与响应体。"""
 
         detail: dict[str, Any] = {
             "exception_type": type(exc).__name__,
             "message": self._truncate_log_text(str(exc), max_text_chars=None),
         }
+
+        if isinstance(exc, ExceptionGroup):
+            sub_details: list[dict[str, Any]] = []
+            for index, sub_exc in enumerate(exc.exceptions[:ERROR_LOG_MAX_LIST_ITEMS]):
+                sub_detail = self._build_exception_error_detail(sub_exc, depth=depth + 1)
+                sub_detail["index"] = index
+                sub_details.append(sub_detail)
+                if "status_code" not in detail and "status_code" in sub_detail:
+                    detail["status_code"] = sub_detail["status_code"]
+                    detail["status_code_source"] = f"sub_exceptions[{index}]"
+                if "response_body" not in detail and "response_body" in sub_detail:
+                    detail["response_body"] = sub_detail["response_body"]
+                    detail["response_body_source"] = f"sub_exceptions[{index}]"
+            detail["sub_exceptions"] = sub_details
+            if len(exc.exceptions) > ERROR_LOG_MAX_LIST_ITEMS:
+                detail["sub_exceptions_truncated"] = len(exc.exceptions) - ERROR_LOG_MAX_LIST_ITEMS
 
         if isinstance(exc, McpError):
             detail["mcp_error_code"] = exc.error.code
@@ -768,6 +1305,235 @@ class MCPClient:
                 detail["response_body"] = self._truncate_log_text(str(body), max_text_chars=None)
 
         return detail
+
+    def _is_retryable_server_exception(self, exc: BaseException) -> bool:
+        """判断服务级异常是否值得重试，避免确定性错误反复重放。"""
+
+        if isinstance(exc, ExceptionGroup):
+            if not exc.exceptions:
+                return True
+            return any(self._is_retryable_server_exception(item) for item in exc.exceptions)
+
+        # 参数校验类错误通常是确定性失败，重试无收益。
+        if isinstance(exc, (ValueError, TypeError)):
+            return False
+
+        status_code = self._coerce_status_code(self._find_attr_in_exception_tree(exc, "status_code"))
+        if status_code is None:
+            response = self._find_attr_in_exception_tree(exc, "response")
+            if response is not None:
+                status_code = self._coerce_status_code(getattr(response, "status_code", None))
+        response_text = self._find_response_text_in_exception_tree(exc)
+        if self._is_deterministic_error_message(response_text):
+            return False
+
+        if status_code is not None:
+            # 4xx 代表请求参数/语义错误，重试无意义；429 保留重试。
+            if 400 <= status_code < 500 and status_code != 429:
+                return False
+            return status_code in {429, 500, 502, 503, 504}
+
+        # MCP 标准错误码：-3260x 多为请求参数错误。
+        if isinstance(exc, McpError) and exc.error.code in {-32600, -32601, -32602}:
+            return False
+
+        return True
+
+    def _build_call_signature(self, *, tool_name: str, arguments: dict[str, Any]) -> str:
+        """构建工具调用签名，避免同轮重复执行同参数调用。"""
+
+        try:
+            args_text = json.dumps(arguments, ensure_ascii=False, sort_keys=True, default=str)
+        except Exception:
+            args_text = str(arguments)
+        return f"{tool_name}|args={args_text}"
+
+    def _build_failure_signature(self, item: dict[str, Any]) -> str:
+        """构建失败签名，用于识别重复失败模式。"""
+
+        server = str(item.get("server", "")).strip()
+        tool_name = str(item.get("tool_name", "")).strip()
+        arguments = item.get("arguments", {})
+        error_detail = item.get("error_detail", {})
+        status_code = self._coerce_status_code(error_detail.get("status_code")) if isinstance(error_detail, dict) else None
+        return f"{server}|{self._build_call_signature(tool_name=tool_name, arguments=arguments if isinstance(arguments, dict) else {})}|status={status_code or 'unknown'}"
+
+    def _is_failure_status_5xx(self, detail: dict[str, Any]) -> bool:
+        """判断失败是否属于 5xx 上游错误。"""
+
+        status_code = self._coerce_status_code(detail.get("status_code"))
+        if status_code is not None:
+            return 500 <= status_code < 600
+
+        body_text = ""
+        for key in ("error_message", "message", "response_body"):
+            value = detail.get(key)
+            if value is None:
+                continue
+            body_text += f" {value}"
+        lowered = body_text.lower()
+        return "status=500" in lowered or "status=502" in lowered or "status=503" in lowered or "status=504" in lowered
+
+    def _should_replan_on_failure(self, *, item: dict[str, Any]) -> bool:
+        """判断失败是否可直接回灌给下一轮 planner。"""
+
+        if bool(item.get("deterministic")):
+            return True
+        error_detail = item.get("error_detail", {})
+        if not isinstance(error_detail, dict):
+            return False
+        status_code = self._coerce_status_code(error_detail.get("status_code"))
+        if status_code is not None and status_code in SERVER_RETRYABLE_STATUS_CODES:
+            return True
+        return False
+
+    def _build_replan_feedback(
+        self,
+        *,
+        previous_failures: list[dict[str, Any]],
+        current_failures: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """从失败集中挑选可用于重规划的反馈。"""
+
+        if not current_failures:
+            return []
+
+        signature_counts: dict[str, int] = {}
+        for item in [*previous_failures, *current_failures]:
+            if not isinstance(item, dict):
+                continue
+            signature = self._build_failure_signature(item)
+            signature_counts[signature] = signature_counts.get(signature, 0) + 1
+
+        selected: list[dict[str, Any]] = []
+        for item in current_failures:
+            if not isinstance(item, dict):
+                continue
+            if bool(item.get("deterministic")):
+                selected.append(item)
+                continue
+            error_detail = item.get("error_detail", {})
+            if not isinstance(error_detail, dict):
+                continue
+            if not self._is_failure_status_5xx(error_detail):
+                continue
+            signature = self._build_failure_signature(item)
+            if signature_counts.get(signature, 0) >= REPLAN_REPEAT_5XX_THRESHOLD:
+                selected.append(item)
+
+        return self._merge_feedback_items(existing=[], incoming=selected)
+
+    def _merge_feedback_items(
+        self,
+        *,
+        existing: list[dict[str, Any]],
+        incoming: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """合并反馈并按失败签名去重，控制提示词体积。"""
+
+        merged: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for item in [*existing, *incoming]:
+            if not isinstance(item, dict):
+                continue
+            signature = self._build_failure_signature(item)
+            if signature in seen:
+                continue
+            seen.add(signature)
+            merged.append(item)
+            if len(merged) >= PLANNER_MAX_FEEDBACK_ITEMS:
+                break
+        return merged
+
+    def _find_attr_in_exception_tree(self, exc: BaseException, attr_name: str, *, depth: int = 0) -> Any | None:
+        """从异常树（含 ExceptionGroup）中查找属性。"""
+
+        if depth > 8:
+            return None
+        value = getattr(exc, attr_name, None)
+        if value is not None:
+            return value
+        if isinstance(exc, ExceptionGroup):
+            for sub_exc in exc.exceptions:
+                found = self._find_attr_in_exception_tree(sub_exc, attr_name, depth=depth + 1)
+                if found is not None:
+                    return found
+        return None
+
+    def _find_response_text_in_exception_tree(self, exc: BaseException, *, depth: int = 0) -> str:
+        """从异常树中提取响应文本（若存在）。"""
+
+        if depth > 8:
+            return ""
+        response = getattr(exc, "response", None)
+        if response is not None:
+            try:
+                text = response.text
+                if text:
+                    return str(text)
+            except Exception:
+                pass
+        body = getattr(exc, "body", None)
+        if body:
+            return str(body)
+        if isinstance(exc, ExceptionGroup):
+            for sub_exc in exc.exceptions:
+                text = self._find_response_text_in_exception_tree(sub_exc, depth=depth + 1)
+                if text:
+                    return text
+        return ""
+
+    def _is_deterministic_error_message(self, message: str) -> bool:
+        """基于错误文本判定是否为确定性错误。"""
+
+        if not message:
+            return False
+        lowered = message.lower()
+        deterministic_tokens = (
+            "invalid parameter",
+            "invalid params",
+            "validation error",
+            "pydantic",
+            "input should be",
+            "list_type",
+            "missing required",
+            "required parameter",
+            "unknown argument",
+            "not in enum",
+            "protocol not found",
+            "coin not found",
+            "symbol not found",
+            "bad request",
+        )
+        return any(token in lowered for token in deterministic_tokens)
+
+    def _is_deterministic_error_detail(self, detail: dict[str, Any]) -> bool:
+        """根据错误详情判断是否为确定性参数/语义错误。"""
+
+        status_code = self._coerce_status_code(detail.get("status_code"))
+        if status_code is not None and 400 <= status_code < 500 and status_code != 429:
+            return True
+
+        message_parts: list[str] = []
+        for key in ("error_message", "message", "response_body"):
+            value = detail.get(key)
+            if value is None:
+                continue
+            message_parts.append(str(value))
+        message = " | ".join(message_parts)
+        return self._is_deterministic_error_message(message)
+
+    def _build_error_signature(self, detail: dict[str, Any]) -> str:
+        """构建可复用的错误签名，便于 LLM 下轮避坑。"""
+
+        status_code = self._coerce_status_code(detail.get("status_code"))
+        body = detail.get("response_body")
+        message = detail.get("error_message") or detail.get("message") or ""
+        body_text = ""
+        if body is not None:
+            body_text = str(body)
+        core = f"status={status_code or 'unknown'} message={message} body={body_text}"
+        return self._truncate_log_text(core, max_text_chars=220)
 
     def _merge_status_body_from_payload(
         self,

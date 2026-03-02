@@ -29,6 +29,7 @@ class MemoryType(str, Enum):
     WATCHLIST = "watchlist"
     HABIT = "habit"
     CONTEXT = "context"
+    TOOL_CORRECTION = "tool_correction"
 
 
 class QueryRequest(BaseModel):

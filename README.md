@@ -4,12 +4,12 @@
 
 ## 核心能力
 
-- 通过 **MCP 数据源**采集市场信号（V1 仅 MCP）
+- 通过 **MCP 数据源**采集市场信号（V1 仅 MCP，工具选择与参数由 LLM 规划）
 - 对信号做统一标准化并入库 Milvus
 - 基于用户长期/短期记忆生成个性化研报
 - 使用 LangGraph 编排完整研究流程
 - LLM 客户端可配置替换，当前默认接入 MiniMax M2.5
-- 使用 tenacity 对关键节点提供重试与降级
+- 使用 tenacity 对关键节点提供重试
 
 ## 工程结构
 
@@ -210,5 +210,6 @@ uv run python -m unittest tests/test_api.py
 
 - V1 严格只处理 MCP 可获取的数据源。
 - 报告默认附带风险免责声明：仅供研究，不构成投资建议。
-- 当 Milvus 或 LLM 不可用时，系统会按配置自动降级，确保主流程不中断。
+- 当 Milvus 不可用时，系统可按配置降级到内存存储。
+- 当 LLM 不可用时，`/v1/research/query` 会直接返回 500（硬失败）。
 - 使用智谱 embedding 时，请确保 `VECTOR_DIM` 与模型输出维度一致。

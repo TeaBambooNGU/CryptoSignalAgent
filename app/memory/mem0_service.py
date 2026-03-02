@@ -207,6 +207,43 @@ class MemoryService:
             },
         )
 
+    def save_tool_correction(self, user_id: str, correction: dict[str, Any], confidence: float = 0.8) -> None:
+        """保存 MCP 工具纠错经验到长期记忆。"""
+
+        if not correction:
+            return
+        payload = {"kind": "mcp_tool_correction", **correction}
+        content = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+        embedding = text_to_embedding(content, self.settings)
+        updated_at = int(datetime.now(timezone.utc).timestamp())
+        record = {
+            "id": self._build_memory_id(user_id, MemoryType.TOOL_CORRECTION, content),
+            "user_id": user_id,
+            "memory_type": MemoryType.TOOL_CORRECTION.value,
+            "content": content,
+            "confidence": confidence,
+            "updated_at": updated_at,
+            "embedding": embedding,
+        }
+        self.milvus_store.upsert_user_memory([record])
+        self._append_session_memory(
+            user_id,
+            {
+                "memory_type": MemoryType.TOOL_CORRECTION.value,
+                "content": payload,
+                "confidence": confidence,
+                "updated_at": updated_at,
+            },
+        )
+        self._mem0_add(
+            user_id=user_id,
+            content=content,
+            metadata={
+                "memory_type": MemoryType.TOOL_CORRECTION.value,
+                "server": str(payload.get("server", "")),
+            },
+        )
+
     def load_memory_profile(self, user_id: str) -> dict[str, Any]:
         """聚合用户长期记忆与短期记忆。"""
 
@@ -219,6 +256,7 @@ class MemoryService:
             "session_memory": session,
             "watchlist": self._extract_watchlist(long_term, session),
             "risk_preference": self._extract_risk_preference(long_term),
+            "tool_corrections": self._extract_tool_corrections(long_term),
         }
 
         # Mem0 可用时补充最近记忆片段，提高上下文完整度。
@@ -307,6 +345,25 @@ class MemoryService:
             if isinstance(parsed, dict) and parsed.get("risk_preference"):
                 return str(parsed["risk_preference"])
         return None
+
+    def _extract_tool_corrections(self, long_term: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """提取长期纠错经验，供 MCP planner 作为 few-shot 上下文。"""
+
+        corrections: list[tuple[int, dict[str, Any]]] = []
+        for row in long_term:
+            if str(row.get("memory_type", "")) != MemoryType.TOOL_CORRECTION.value:
+                continue
+            content = row.get("content")
+            parsed = content
+            if isinstance(content, str):
+                try:
+                    parsed = json.loads(content)
+                except Exception:
+                    parsed = {}
+            if isinstance(parsed, dict):
+                corrections.append((int(row.get("updated_at", 0) or 0), parsed))
+        corrections.sort(key=lambda item: item[0], reverse=True)
+        return [item for _, item in corrections[:12]]
 
     def _infer_preferences_from_text(self, query: str, report: str) -> dict[str, Any]:
         """基于查询和报告粗粒度抽取可复用偏好。"""
