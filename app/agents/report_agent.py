@@ -104,10 +104,8 @@ class ReportAgent:
             return "暂无可引用历史证据。"
 
         lines = []
-        for index, doc in enumerate(docs[:8], start=1):
+        for index, doc in enumerate(docs, start=1):
             snippet = doc.text.replace("\n", " ").strip()
-            if len(snippet) > 180:
-                snippet = snippet[:180] + "..."
             lines.append(f"{index}. [{doc.source}/{doc.symbol}] score={doc.score:.3f} {snippet}")
         return "\n".join(lines)
 

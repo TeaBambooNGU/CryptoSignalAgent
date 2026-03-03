@@ -7,7 +7,8 @@ from __future__ import annotations
 
 import json
 import os
-from dataclasses import dataclass
+import re
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -69,7 +70,7 @@ class Settings:
     mem0_org_id: str = ""
     mem0_project_id: str = ""
 
-    mcp_servers: tuple[dict[str, Any], ...] = ()
+    mcp_servers: dict[str, dict[str, Any]] = field(default_factory=dict)
     mcp_max_rounds: int = 4
 
     report_disclaimer: str = "免责声明：本报告仅用于研究与信息交流，不构成任何投资建议。"
@@ -107,21 +108,55 @@ class Settings:
             except ValueError:
                 return default
 
-        def _as_dict_tuple(name: str) -> tuple[dict[str, Any], ...]:
-            raw = os.getenv(name, "")
-            if not raw:
-                return ()
+        env_pattern = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
+
+        def _resolve_env_placeholders(value: Any) -> Any:
+            if isinstance(value, str):
+                return env_pattern.sub(lambda match: os.getenv(match.group(1), ""), value)
+            if isinstance(value, list):
+                return [_resolve_env_placeholders(item) for item in value]
+            if isinstance(value, dict):
+                return {
+                    str(key): _resolve_env_placeholders(item)
+                    for key, item in value.items()
+                }
+            return value
+
+        def _as_mcp_servers(default_config_path: str = ".mcp.json") -> dict[str, dict[str, Any]]:
+            config_path_raw = os.getenv("MCP_CONFIG_PATH", default_config_path).strip()
+            if not config_path_raw:
+                return {}
+
+            config_path = Path(config_path_raw).expanduser()
+            if not config_path.is_absolute():
+                config_path = (env_path.parent / config_path).resolve()
+
+            if not config_path.exists():
+                return {}
+
             try:
-                parsed: Any = json.loads(raw)
-            except json.JSONDecodeError:
-                return ()
-            if not isinstance(parsed, list):
-                return ()
-            result: list[dict[str, Any]] = []
-            for item in parsed:
-                if isinstance(item, dict):
-                    result.append(item)
-            return tuple(result)
+                parsed: Any = json.loads(config_path.read_text(encoding="utf-8"))
+            except Exception:
+                return {}
+
+            servers_block: Any = parsed
+            if isinstance(parsed, dict) and isinstance(parsed.get("mcpServers"), dict):
+                servers_block = parsed["mcpServers"]
+
+            if not isinstance(servers_block, dict):
+                return {}
+
+            resolved = _resolve_env_placeholders(servers_block)
+            if not isinstance(resolved, dict):
+                return {}
+
+            servers: dict[str, dict[str, Any]] = {}
+            for raw_name, raw_spec in resolved.items():
+                name = str(raw_name).strip()
+                if not name or not isinstance(raw_spec, dict):
+                    continue
+                servers[name] = {str(key): value for key, value in raw_spec.items()}
+            return servers
 
         def _normalize_minimax_host(default: str) -> str:
             raw_host = os.getenv("MINIMAX_API_HOST", "").strip()
@@ -179,7 +214,7 @@ class Settings:
             mem0_api_key=os.getenv("MEM0_API_KEY", ""),
             mem0_org_id=os.getenv("MEM0_ORG_ID", ""),
             mem0_project_id=os.getenv("MEM0_PROJECT_ID", ""),
-            mcp_servers=_as_dict_tuple("MCP_SERVERS"),
+            mcp_servers=_as_mcp_servers(),
             mcp_max_rounds=_as_int("MCP_MAX_ROUNDS", defaults.mcp_max_rounds),
             report_disclaimer=os.getenv("REPORT_DISCLAIMER", defaults.report_disclaimer),
         )

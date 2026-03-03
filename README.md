@@ -5,7 +5,7 @@
 ## 核心能力
 
 - 通过 **MCP 数据源**采集市场信号（基于官方 `langchain-mcp-adapters`）
-- MCP 采用“LangGraph 子图 + LLM 规划 + 规则过滤 + 判停收敛”机制
+- MCP 采用 `create_agent` 自主工具调用机制（async-only）
 - 对信号做统一标准化并入库 Milvus
 - 基于用户长期/短期记忆生成个性化研报
 - 使用 LangGraph 编排完整研究流程
@@ -15,10 +15,8 @@
 ## MCP 架构（当前实现）
 
 - 主流程节点 `collect_signals_via_mcp` 调用 `MCPSignalSubgraphRunner`
-- 子图固定 9 节点：`prepare -> plan -> apply_rules -> tool_call -> collect_round -> classify_failures -> reflect_rules -> should_continue -> finalize`
-- `plan` 阶段由 LLM 输出严格 JSON `calls`（server/tool_name/arguments/reason）
-- `apply_rules` 阶段执行规则层约束（`tool_ban`、`call_signature_ban`、`field_patch`、required 校验、默认值注入）
-- `should_continue` 按 `MCP_MAX_ROUNDS` 与执行进展判停，避免盲重试与规划振荡
+- 通过 `MultiServerMCPClient` 发现工具，`create_agent(...).ainvoke(...)` 执行工具调用
+- 最终统一回收 `raw_signals / errors / mcp_tools_count / mcp_termination_reason`
 
 ## 工程结构
 
@@ -103,9 +101,11 @@ MEM0_API_KEY=
 MEM0_ORG_ID=
 MEM0_PROJECT_ID=
 
-# MCP（标准 JSON 数组）
-# 每个 server 支持 streamable_http / stdio / sse
-MCP_SERVERS=
+# MCP（Claude Code 风格配置）
+# 默认读取项目根目录 .mcp.json
+MCP_CONFIG_PATH=.mcp.json
+# 可选：供 .mcp.json 中 ${CRYPTOPANIC_AUTH_TOKEN} 占位符使用
+CRYPTOPANIC_AUTH_TOKEN=
 MCP_MAX_ROUNDS=4
 ```
 
@@ -173,12 +173,33 @@ npm run ui:debug:live
 - 页面运行错误（`[browser-pageerror]`）
 - 失败请求/4xx/5xx（`[browser-requestfailed]` / `[browser-http-*]`）
 
-## 标准 MCP 配置示例（当前字段）
+## 标准 MCP 配置示例（Claude Code 风格）
 
-```env
-MCP_SERVERS=[{"name":"coingecko","transport":"streamable_http","url":"https://mcp.api.coingecko.com/mcp"},{"name":"defillama","transport":"streamable_http","url":"https://mcpllama.com/mcp"},{"name":"cryptonews","transport":"stdio","command":"uv","args":["run","crypto-news-mcp"],"cwd":"/Users/teabamboo/Documents/AIplusLLM/cryptorNewsMCP","env":{"CRYPTOPANIC_AUTH_TOKEN":"<YOUR_CRYPTOPANIC_TOKEN>"}}]
-MCP_MAX_ROUNDS=4
+```json
+{
+  "mcpServers": {
+    "coingecko": {
+      "type": "http",
+      "url": "https://mcp.api.coingecko.com/mcp"
+    },
+    "defillama": {
+      "type": "http",
+      "url": "https://mcpllama.com/mcp"
+    },
+    "cryptonews": {
+      "type": "stdio",
+      "command": "uv",
+      "args": ["run", "crypto-news-mcp"],
+      "cwd": "/Users/teabamboo/Documents/AIplusLLM/cryptorNewsMCP",
+      "env": {
+        "CRYPTOPANIC_AUTH_TOKEN": "${CRYPTOPANIC_AUTH_TOKEN}"
+      }
+    }
+  }
+}
 ```
+
+`MCP_CONFIG_PATH` 默认是 `.mcp.json`，你可以从 `.mcp.json.example` 复制一份开始配置。
 
 - `coingecko`：行情/币种/趋势数据
 - `defillama`：链上 TVL/协议维度数据

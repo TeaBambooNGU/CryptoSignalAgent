@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 import unittest
 from typing import Any
 
@@ -29,11 +30,13 @@ class _FakeMCPClient:
         self.connections = connections
         self.tool_name_prefix = tool_name_prefix
 
-    async def get_tools(self):
-        prefix = "srv_" if self.tool_name_prefix else ""
+    async def get_tools(self, *, server_name: str | None = None):
+        name_prefix = ""
+        if self.tool_name_prefix:
+            name_prefix = f"{server_name}_" if server_name else "srv_"
         return [
             _FakeTool(
-                name=f"{prefix}get_news",
+                name=f"{name_prefix}get_news",
                 description="fetch news",
                 schema={
                     "type": "object",
@@ -62,22 +65,20 @@ class _FakeAgent:
 
 class MCPAgentRunnerTestCase(unittest.TestCase):
     def test_build_connections_from_settings(self) -> None:
-        settings_servers = (
-            {
-                "name": "s1",
-                "transport": "streamable_http",
+        settings_servers = {
+            "s1": {
+                "type": "http",
                 "url": "http://localhost:3000/mcp",
                 "headers": {"Authorization": "Bearer x"},
             },
-            {
-                "name": "s2",
-                "transport": "stdio",
+            "s2": {
+                "type": "stdio",
                 "command": "python",
                 "args": ["server.py"],
                 "env": {"A": "B"},
                 "cwd": "/tmp",
             },
-        )
+        }
         connections = MCPSignalSubgraphRunner.build_connections_from_settings(settings_servers)
         self.assertEqual(connections["s1"]["transport"], "streamable_http")
         self.assertEqual(connections["s1"]["url"], "http://localhost:3000/mcp")
@@ -163,7 +164,7 @@ class MCPAgentRunnerTestCase(unittest.TestCase):
         self.assertEqual(result["raw_signals"], [])
         self.assertEqual(result["mcp_tools_count"], 0)
         self.assertEqual(result["mcp_termination_reason"], "no_tools")
-        self.assertTrue(any("未配置 MCP_SERVERS" in item for item in result["errors"]))
+        self.assertTrue(any("未配置 MCP Servers" in item for item in result["errors"]))
 
     def test_run_uses_async_agent_when_sync_not_supported(self) -> None:
         messages = [
@@ -189,6 +190,189 @@ class MCPAgentRunnerTestCase(unittest.TestCase):
 
         self.assertEqual(result["mcp_termination_reason"], "agent_completed")
         self.assertGreaterEqual(len(result["raw_signals"]), 1)
+
+    def test_discover_tools_tolerates_single_server_failure(self) -> None:
+        class _PartialFailMCPClient(_FakeMCPClient):
+            async def get_tools(self, *, server_name: str | None = None):
+                if server_name == "bad":
+                    raise RuntimeError("server down")
+                return await super().get_tools(server_name=server_name)
+
+        messages = [
+            ToolMessage(name="ok_get_news", content='{"symbol":"BTC","title":"ETF"}', tool_call_id="call-1"),
+            AIMessage(content='{"raw_signals":[],"errors":[]}'),
+        ]
+        runner = MCPSignalSubgraphRunner(
+            llm=_DummyLLM(),
+            mcp_connections={
+                "ok": {"transport": "streamable_http", "url": "http://localhost:3001/mcp"},
+                "bad": {"transport": "streamable_http", "url": "http://localhost:3002/mcp"},
+            },
+            mcp_client_factory=_PartialFailMCPClient,
+            agent_factory=lambda **kwargs: _FakeAgent(messages),
+        )
+
+        result = asyncio.run(
+            runner.arun(
+                user_id="u1",
+                query="分析 BTC",
+                task_id="task-5",
+                symbols=["BTC"],
+                errors=[],
+            )
+        )
+
+        self.assertEqual(result["mcp_termination_reason"], "agent_completed")
+        self.assertEqual(result["mcp_tools_count"], 1)
+        self.assertTrue(any("MCP 工具发现失败(server=bad)" in item for item in result["errors"]))
+        self.assertGreaterEqual(len(result["raw_signals"]), 1)
+
+    def test_run_parallel_agents_across_servers(self) -> None:
+        class _ParallelClient:
+            def __init__(self, connections: dict[str, dict[str, Any]], tool_name_prefix: bool = False) -> None:
+                self.tool_name_prefix = tool_name_prefix
+                self.connections = connections
+
+            async def get_tools(self, *, server_name: str | None = None):
+                prefix = f"{server_name}_" if self.tool_name_prefix and server_name else ""
+                return [_FakeTool(name=f"{prefix}get_news", description="fetch", schema={"type": "object"})]
+
+        class _DelayedAgent:
+            def __init__(self, messages: list[Any], delay_sec: float) -> None:
+                self._messages = messages
+                self._delay_sec = delay_sec
+
+            async def ainvoke(self, payload: dict[str, Any]):
+                del payload
+                await asyncio.sleep(self._delay_sec)
+                return {"messages": self._messages}
+
+        def _agent_factory(**kwargs):
+            tool = kwargs["tools"][0]
+            messages = [
+                ToolMessage(name=tool.name, content='{"symbol":"BTC","title":"parallel"}', tool_call_id=f"call-{tool.name}"),
+                AIMessage(content='{"raw_signals":[],"errors":[]}'),
+            ]
+            return _DelayedAgent(messages=messages, delay_sec=0.2)
+
+        runner = MCPSignalSubgraphRunner(
+            llm=_DummyLLM(),
+            mcp_connections={
+                "s1": {"transport": "streamable_http", "url": "http://localhost:3011/mcp"},
+                "s2": {"transport": "streamable_http", "url": "http://localhost:3012/mcp"},
+                "s3": {"transport": "streamable_http", "url": "http://localhost:3013/mcp"},
+            },
+            mcp_client_factory=_ParallelClient,
+            agent_factory=_agent_factory,
+        )
+
+        started = time.perf_counter()
+        result = asyncio.run(
+            runner.arun(
+                user_id="u1",
+                query="并行采集",
+                task_id="task-parallel",
+                symbols=["BTC"],
+                errors=[],
+            )
+        )
+        elapsed = time.perf_counter() - started
+
+        self.assertLess(elapsed, 0.45)
+        self.assertEqual(result["mcp_tools_count"], 3)
+        self.assertEqual(result["mcp_termination_reason"], "agent_completed")
+        self.assertGreaterEqual(len(result["raw_signals"]), 3)
+
+    def test_run_allows_llm_to_call_subset_of_tools(self) -> None:
+        class _CustomClient:
+            def __init__(self, connections: dict[str, dict[str, Any]], tool_name_prefix: bool = False) -> None:
+                del connections
+                self.tool_name_prefix = tool_name_prefix
+
+            async def get_tools(self, *, server_name: str | None = None):
+                prefix = f"{server_name}_" if self.tool_name_prefix and server_name else "srv_"
+                return [
+                    _FakeTool(name=f"{prefix}get_news", description="news", schema={"type": "object"}),
+                    _FakeTool(name=f"{prefix}get_price", description="price", schema={"type": "object"}),
+                ]
+
+        messages = [
+            ToolMessage(name="srv_get_news", content='{"symbol":"BTC","title":"agent"}', tool_call_id="call-1"),
+            AIMessage(content='{"raw_signals":[],"errors":[]}'),
+        ]
+        runner = MCPSignalSubgraphRunner(
+            llm=_DummyLLM(),
+            mcp_connections={"srv": {"transport": "streamable_http", "url": "http://localhost:3000/mcp"}},
+            mcp_client_factory=_CustomClient,
+            agent_factory=lambda **kwargs: _FakeAgent(messages),
+        )
+
+        result = asyncio.run(
+            runner.arun(
+                user_id="u1",
+                query="只看新闻",
+                task_id="task-subset",
+                symbols=["BTC"],
+                errors=[],
+            )
+        )
+
+        self.assertEqual(result["mcp_tools_count"], 2)
+        self.assertEqual(result["mcp_termination_reason"], "agent_completed")
+        self.assertGreaterEqual(len(result["raw_signals"]), 1)
+        self.assertFalse(any("MCP 工具未完成调用" in item for item in result["errors"]))
+
+    def test_run_uses_unknown_symbol_when_tool_output_has_no_symbol(self) -> None:
+        messages = [
+            ToolMessage(name="srv_get_news", content='{"title":"macro update"}', tool_call_id="call-1"),
+            AIMessage(content='{"raw_signals":[],"errors":[]}'),
+        ]
+        runner = MCPSignalSubgraphRunner(
+            llm=_DummyLLM(),
+            mcp_connections={"srv": {"transport": "streamable_http", "url": "http://localhost:3000/mcp"}},
+            mcp_client_factory=_FakeMCPClient,
+            agent_factory=lambda **kwargs: _FakeAgent(messages),
+        )
+
+        result = asyncio.run(
+            runner.arun(
+                user_id="u1",
+                query="宏观风险",
+                task_id="task-unknown-1",
+                symbols=[],
+                errors=[],
+            )
+        )
+
+        self.assertGreaterEqual(len(result["raw_signals"]), 1)
+        self.assertEqual(result["raw_signals"][0]["symbol"], "UNKNOWN")
+
+    def test_run_uses_unknown_symbol_when_payload_missing_symbol(self) -> None:
+        messages = [
+            AIMessage(
+                content='{"raw_signals":[{"source":"mcp:srv","signal_type":"news","value":{"headline":"macro"},'
+                '"raw_ref":"https://example.com/macro"}],"errors":[]}'
+            )
+        ]
+        runner = MCPSignalSubgraphRunner(
+            llm=_DummyLLM(),
+            mcp_connections={"srv": {"transport": "streamable_http", "url": "http://localhost:3000/mcp"}},
+            mcp_client_factory=_FakeMCPClient,
+            agent_factory=lambda **kwargs: _FakeAgent(messages),
+        )
+
+        result = asyncio.run(
+            runner.arun(
+                user_id="u1",
+                query="宏观风险",
+                task_id="task-unknown-2",
+                symbols=[],
+                errors=[],
+            )
+        )
+
+        self.assertGreaterEqual(len(result["raw_signals"]), 1)
+        self.assertEqual(result["raw_signals"][0]["symbol"], "UNKNOWN")
 
 
 if __name__ == "__main__":

@@ -25,7 +25,22 @@ from app.retrieval.research_service import ResearchService
 
 logger = get_logger(__name__)
 
-SYMBOL_PATTERN = re.compile(r"\b[A-Z]{2,10}\b")
+PAIR_SYMBOL_PATTERN = re.compile(r"\b([A-Za-z]{2,10})/(?:USDT|USD|BTC|ETH|BUSD)\b")
+TOKEN_SYMBOL_PATTERN = re.compile(r"(?<![A-Za-z0-9])\$?([A-Za-z]{2,10})(?![A-Za-z0-9])")
+SYMBOL_STOPWORDS = {
+    "ETF",
+    "SEC",
+    "CPI",
+    "PPI",
+    "FOMC",
+    "FED",
+    "NFP",
+    "GDP",
+    "PMI",
+    "USD",
+    "US",
+    "AI",
+}
 
 
 class ResearchGraphRunner:
@@ -50,7 +65,7 @@ class ResearchGraphRunner:
         builder = StateGraph(ResearchState)
 
         builder.add_node("load_user_memory", self.load_user_memory)
-        builder.add_node("parse_intent_scope", self.parse_intent_scope)
+        builder.add_node("resolve_symbols", self.resolve_symbols)
         builder.add_node("collect_signals_via_mcp", self.collect_signals_via_mcp)
         builder.add_node("normalize_and_index", self.normalize_and_index)
         builder.add_node("retrieve_context", self.retrieve_context)
@@ -60,8 +75,8 @@ class ResearchGraphRunner:
         builder.add_node("finalize_response", self.finalize_response)
 
         builder.add_edge(START, "load_user_memory")
-        builder.add_edge("load_user_memory", "parse_intent_scope")
-        builder.add_edge("parse_intent_scope", "collect_signals_via_mcp")
+        builder.add_edge("load_user_memory", "resolve_symbols")
+        builder.add_edge("resolve_symbols", "collect_signals_via_mcp")
         builder.add_edge("collect_signals_via_mcp", "normalize_and_index")
         builder.add_edge("normalize_and_index", "retrieve_context")
         builder.add_edge("retrieve_context", "analyze_signals")
@@ -157,50 +172,55 @@ class ResearchGraphRunner:
 
         return self._run_tracked_node(state, node_id="load_user_memory", handler=_node_logic)
 
-    def parse_intent_scope(self, state: ResearchState) -> ResearchState:
-        """节点目标：解析查询范围与关注标的。
+    def resolve_symbols(self, state: ResearchState) -> ResearchState:
+        """节点目标：确定本次任务 symbols 路由参数。
 
         前置条件：state 已包含 `query` 与 `memory_profile`。
-        状态产出：`symbols`。
+        状态产出：`hard_symbols`、`soft_symbols`。
         """
 
         def _node_logic() -> ResearchState:
             query = state["query"]
-            with log_context(component="graph.parse_intent_scope"):
-                symbols = {token.upper() for token in SYMBOL_PATTERN.findall(query)}
-
-                profile_watchlist = state.get("memory_profile", {}).get("watchlist", [])
-                if isinstance(profile_watchlist, list):
-                    symbols.update(str(item).upper() for item in profile_watchlist)
-
+            with log_context(component="graph.resolve_symbols"):
                 task_context = state.get("task_context") or {}
-                ctx_symbols = task_context.get("symbols") if isinstance(task_context, dict) else None
-                if isinstance(ctx_symbols, list):
-                    symbols.update(str(item).upper() for item in ctx_symbols)
+                context_symbols = self._extract_symbols_from_task_context(task_context)
+                query_symbols = self._extract_symbols_from_query(query)
+                watchlist = self._normalize_symbols(state.get("memory_profile", {}).get("watchlist", []))
 
-                if not symbols:
-                    symbols = {"BTC", "ETH"}
+                # 优先级：task_context > query；watchlist 仅用于 MCP 软提示，不扩张检索边界。
+                if context_symbols:
+                    hard_symbols = context_symbols
+                elif query_symbols:
+                    hard_symbols = query_symbols
+                else:
+                    hard_symbols = []
 
-                sorted_symbols = sorted(symbols)
-                logger.info("节点完成 symbols=%s", sorted_symbols)
-                return {"symbols": sorted_symbols}
+                soft_symbols = self._merge_symbols(hard_symbols, watchlist)
+                logger.info("节点完成 hard_symbols=%s soft_symbols=%s", hard_symbols, soft_symbols)
+                return {
+                    "hard_symbols": hard_symbols,
+                    "soft_symbols": soft_symbols,
+                    "symbols": hard_symbols,
+                }
 
-        return self._run_tracked_node(state, node_id="parse_intent_scope", handler=_node_logic)
+        return self._run_tracked_node(state, node_id="resolve_symbols", handler=_node_logic)
 
     async def collect_signals_via_mcp(self, state: ResearchState) -> ResearchState:
         """节点目标：通过 MCP 拉取信号。
 
-        前置条件：state 已包含 `task_id`、`query`、`symbols`。
+        前置条件：state 已包含 `task_id`、`query`。
         状态产出：`raw_signals`、`errors`。
         """
 
         async def _node_logic() -> ResearchState:
             with log_context(component="graph.collect_signals"):
+                soft_symbols = state.get("soft_symbols")
+                request_symbols = soft_symbols if isinstance(soft_symbols, list) else state.get("symbols", [])
                 result = await self.mcp_subgraph.arun(
                     user_id=state["user_id"],
                     query=state["query"],
                     task_id=state["task_id"],
-                    symbols=state.get("symbols", []),
+                    symbols=request_symbols,
                     errors=state.get("errors", []),
                 )
                 logger.info(
@@ -254,13 +274,14 @@ class ResearchGraphRunner:
     def retrieve_context(self, state: ResearchState) -> ResearchState:
         """节点目标：检索历史证据与最新上下文。
 
-        前置条件：state 已包含 `query` 与 `symbols`。
+        前置条件：state 已包含 `query` 与 `hard_symbols`。
         状态产出：`retrieved_docs`。
         """
 
         def _node_logic() -> ResearchState:
             query = state["query"]
-            symbols = state.get("symbols", [])
+            hard_symbols = state.get("hard_symbols")
+            symbols = hard_symbols if isinstance(hard_symbols, list) else state.get("symbols", [])
 
             with log_context(component="graph.retrieve_context"):
                 docs = self._retrieve_with_retry(query=query, symbols=symbols)
@@ -439,6 +460,46 @@ class ResearchGraphRunner:
         duration_ms = max(int((perf_counter() - start) * 1000), 0)
         step = {"node_id": node_id, "status": status, "duration_ms": duration_ms}
         return [*state.get("workflow_steps", []), step]
+
+    def _extract_symbols_from_query(self, query: str) -> list[str]:
+        pair_symbols = [match.upper() for match in PAIR_SYMBOL_PATTERN.findall(query or "")]
+        token_symbols = [match.upper() for match in TOKEN_SYMBOL_PATTERN.findall(query or "")]
+        merged = self._merge_symbols(pair_symbols, token_symbols)
+        return [symbol for symbol in merged if symbol not in SYMBOL_STOPWORDS]
+
+    def _extract_symbols_from_task_context(self, task_context: Any) -> list[str]:
+        if not isinstance(task_context, dict):
+            return []
+        return self._normalize_symbols(task_context.get("symbols", []))
+
+    def _normalize_symbols(self, symbols: Any) -> list[str]:
+        if not isinstance(symbols, list):
+            return []
+        normalized: list[str] = []
+        for item in symbols:
+            text = str(item).strip().upper()
+            if not text or not (2 <= len(text) <= 10):
+                continue
+            if not re.fullmatch(r"[A-Z0-9]{2,10}", text):
+                continue
+            normalized.append(text)
+        return self._dedupe_keep_order(normalized)
+
+    def _merge_symbols(self, *symbol_groups: list[str]) -> list[str]:
+        merged: list[str] = []
+        for group in symbol_groups:
+            merged.extend(group)
+        return self._dedupe_keep_order(merged)
+
+    def _dedupe_keep_order(self, items: list[str]) -> list[str]:
+        seen: set[str] = set()
+        result: list[str] = []
+        for item in items:
+            if item in seen:
+                continue
+            seen.add(item)
+            result.append(item)
+        return result
 
     def _raw_signal_from_dict(self, item: dict[str, Any]):
         """将字典恢复为 RawSignal。"""

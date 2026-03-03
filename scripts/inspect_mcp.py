@@ -230,7 +230,7 @@ async def main() -> None:
     settings = Settings.from_env()
     connections = MCPSignalSubgraphRunner.build_connections_from_settings(settings.mcp_servers)
     if not connections:
-        raise SystemExit("未配置 MCP_SERVERS，无法巡检。")
+        raise SystemExit("未配置 MCP Servers（请检查 .mcp.json），无法巡检。")
 
     from langchain_mcp_adapters.client import MultiServerMCPClient
 

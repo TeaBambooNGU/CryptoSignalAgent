@@ -232,7 +232,11 @@ class ResearchService:
             "x": 0.55,
             "reddit": 0.5,
         }
-        base = source_score.get(signal.source.lower(), 0.65)
+        canonical_source = self._canonical_source(
+            source=signal.source,
+            metadata=signal.metadata if isinstance(signal.metadata, dict) else {},
+        )
+        base = source_score.get(canonical_source, 0.65)
         if signal.signal_type.value in {"price", "onchain"}:
             base += 0.08
         return max(0.1, min(0.99, base))
@@ -266,7 +270,8 @@ class ResearchService:
                 age_hours = 72.0
             time_decay = math.exp(-age_hours / 72.0)
 
-            source = str(row.get("source", "unknown")).lower()
+            metadata = row.get("metadata") if isinstance(row.get("metadata"), dict) else {}
+            source = self._canonical_source(source=str(row.get("source", "unknown")), metadata=metadata)
             credibility = source_weight.get(source, 0.75)
 
             final_score = semantic * 0.55 + time_decay * 0.25 + credibility * 0.20
@@ -275,3 +280,37 @@ class ResearchService:
 
         rescored.sort(key=lambda item: item.get("final_score", 0.0), reverse=True)
         return rescored[:top_k]
+
+    def _canonical_source(self, source: str, metadata: dict[str, Any] | None = None) -> str:
+        alias_map = {
+            "binance": "binance",
+            "coindesk": "coindesk",
+            "glassnode": "glassnode",
+            "cointelegraph": "cointelegraph",
+            "reddit": "reddit",
+            "x": "x",
+            "twitter": "x",
+            "x.com": "x",
+        }
+        candidates = [source.strip().lower()]
+        if ":" in candidates[0]:
+            candidates.append(candidates[0].split(":", 1)[1])
+
+        if isinstance(metadata, dict):
+            for key in ("provider", "source", "tool"):
+                value = metadata.get(key)
+                if isinstance(value, str) and value.strip():
+                    candidates.append(value.strip().lower())
+
+        for candidate in candidates:
+            if not candidate:
+                continue
+            wrapped = f" {candidate} "
+            for alias, canonical in alias_map.items():
+                if alias in candidate or alias in wrapped:
+                    return canonical
+
+        for candidate in candidates:
+            if candidate:
+                return candidate
+        return "unknown"

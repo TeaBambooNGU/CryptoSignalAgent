@@ -27,7 +27,7 @@ interface ConsoleState {
 
 export const BASE_WORKFLOW: WorkflowNode[] = [
   { id: "load_user_memory", label: "加载记忆", status: "idle" },
-  { id: "parse_intent_scope", label: "解析意图", status: "idle" },
+  { id: "resolve_symbols", label: "解析标的", status: "idle" },
   { id: "collect_signals_via_mcp", label: "采集信号", status: "idle" },
   { id: "normalize_and_index", label: "标准化入库", status: "idle" },
   { id: "retrieve_context", label: "检索上下文", status: "idle" },

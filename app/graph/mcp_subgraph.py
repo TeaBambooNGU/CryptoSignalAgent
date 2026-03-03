@@ -36,6 +36,13 @@ class MCPSubgraphState(TypedDict, total=False):
     mcp_termination_reason: str
 
 
+class _ServerAgentResult(TypedDict):
+    tool_rows: list[dict[str, Any]]
+    payload_rows: list[Any]
+    errors: list[str]
+    completed: bool
+
+
 class MCPSignalSubgraphRunner:
     """基于 `create_agent` 的 MCP 采集执行器。"""
 
@@ -59,13 +66,29 @@ class MCPSignalSubgraphRunner:
         self.agent_factory = agent_factory or create_agent
 
     @staticmethod
-    def build_connections_from_settings(mcp_servers: tuple[dict[str, Any], ...]) -> dict[str, dict[str, Any]]:
-        """将 settings 的 MCP 配置转换为 MultiServerMCPClient 入参。"""
+    def build_connections_from_settings(mcp_servers: dict[str, dict[str, Any]]) -> dict[str, dict[str, Any]]:
+        """将 `.mcp.json` 风格配置转换为 MultiServerMCPClient 入参。"""
+
+        def _normalize_transport(spec: dict[str, Any]) -> str:
+            raw_transport = str(spec.get("transport", "")).strip().lower()
+            if raw_transport:
+                if raw_transport == "http":
+                    return "streamable_http"
+                return raw_transport
+            raw_type = str(spec.get("type", "")).strip().lower()
+            if raw_type in {"http", "https"}:
+                return "streamable_http"
+            if raw_type in {"stdio", "sse", "streamable_http"}:
+                return raw_type
+            return "streamable_http"
 
         connections: dict[str, dict[str, Any]] = {}
-        for index, item in enumerate(mcp_servers, start=1):
-            name = str(item.get("name", f"server-{index}")).strip() or f"server-{index}"
-            transport = str(item.get("transport", "streamable_http")).strip().lower() or "streamable_http"
+        for raw_name, item in mcp_servers.items():
+            name = str(raw_name).strip()
+            if not name or not isinstance(item, dict):
+                continue
+
+            transport = _normalize_transport(item)
             connection: dict[str, Any] = {"transport": transport}
             if transport == "stdio":
                 connection["command"] = str(item.get("command", ""))
@@ -94,10 +117,11 @@ class MCPSignalSubgraphRunner:
         """执行 MCP 采集并返回原始信号。"""
 
         merged_errors = list(errors or [])
-        catalog, tools, discovery_errors = await self._discover_tools_with_official_client()
+        catalog, tools_by_server, discovery_errors = await self._discover_tools_with_official_client()
         merged_errors.extend(discovery_errors)
 
-        if not tools:
+        total_tools = sum(len(items) for items in tools_by_server.values())
+        if total_tools <= 0:
             return {
                 "raw_signals": [],
                 "errors": self._dedupe_strings(merged_errors),
@@ -105,59 +129,46 @@ class MCPSignalSubgraphRunner:
                 "mcp_termination_reason": "no_tools",
             }
 
-        try:
-            agent = self._build_agent(tools=tools)
-            agent_input = {
-                "messages": [
-                    {
-                        "role": "user",
-                        "content": self._build_agent_user_prompt(
-                            user_id=user_id,
-                            query=query,
-                            symbols=symbols,
-                            task_id=task_id,
-                            tool_catalog=catalog,
-                        ),
-                    }
-                ]
-            }
-            if not callable(getattr(agent, "ainvoke", None)):
-                raise RuntimeError("MCP agent 不支持 ainvoke，无法保证 async-only 工具调用链路")
-            # MCP adapter tools通常只支持异步调用，强制走 ainvoke 避免 sync tool path。
-            result = await agent.ainvoke(agent_input)
-        except Exception as exc:
-            merged_errors.append(f"MCP Agent 执行失败: {self._safe_json(self._build_exception_error_detail(exc))}")
-            return {
-                "raw_signals": [],
-                "errors": self._dedupe_strings(merged_errors),
-                "mcp_tools_count": len(tools),
-                "mcp_termination_reason": "agent_failed",
-            }
+        server_tasks: list[Any] = []
+        for server_name, server_tools in tools_by_server.items():
+            if not server_tools:
+                continue
+            server_tasks.append(
+                self._run_single_server_agent(
+                    server_name=server_name,
+                    tools=server_tools,
+                    user_id=user_id,
+                    query=query,
+                    symbols=symbols,
+                    task_id=task_id,
+                    catalog_entries=catalog.get(server_name, []),
+                )
+            )
 
-        messages = result.get("messages", []) if isinstance(result, dict) else []
+        server_results = await asyncio.gather(*server_tasks)
         with log_context(component="mcp.agent", task_id=task_id, user_id=user_id):
-            tool_rows = self._extract_rows_from_messages(messages=messages, symbols=symbols, task_id=task_id)
-            payload, payload_error = self._parse_agent_payload(messages)
-            payload_rows = payload.get("raw_signals", []) if isinstance(payload, dict) else []
-            payload_errors = payload.get("errors", []) if isinstance(payload, dict) else []
-
+            tool_rows: list[dict[str, Any]] = []
+            payload_rows: list[Any] = []
+            completed_count = 0
+            for item in server_results:
+                tool_rows.extend(item.get("tool_rows", []))
+                payload_rows.extend(item.get("payload_rows", []))
+                merged_errors.extend(item.get("errors", []))
+                if bool(item.get("completed")):
+                    completed_count += 1
             rows = self._merge_rows(
                 tool_rows=tool_rows,
                 payload_rows=payload_rows,
                 symbols=symbols,
                 task_id=task_id,
             )
-
-            if payload_error and not rows:
-                merged_errors.append(f"Agent 结论解析失败: {payload_error}")
-            merged_errors.extend(payload_errors)
-
-            logger.info("MCP Agent 采集完成 tools=%s raw_signals=%s", len(tools), len(rows))
+            termination_reason = "agent_completed" if completed_count > 0 else "agent_failed"
+            logger.info("MCP Agent 采集完成 servers=%s tools=%s raw_signals=%s", len(server_results), total_tools, len(rows))
             return {
                 "raw_signals": rows,
                 "errors": self._dedupe_strings(merged_errors),
-                "mcp_tools_count": len(tools),
-                "mcp_termination_reason": "agent_completed",
+                "mcp_tools_count": total_tools,
+                "mcp_termination_reason": termination_reason,
             }
 
     def run(
@@ -183,52 +194,58 @@ class MCPSignalSubgraphRunner:
 
     async def _discover_tools_with_official_client(
         self,
-    ) -> tuple[dict[str, list[dict[str, Any]]], list[Any], list[str]]:
+    ) -> tuple[dict[str, list[dict[str, Any]]], dict[str, list[Any]], list[str]]:
         if not self.mcp_connections:
-            return {}, [], ["未配置 MCP_SERVERS，跳过实时采集"]
+            return {}, {}, ["未配置 MCP Servers（.mcp.json），跳过实时采集"]
 
         errors: list[str] = []
         tool_catalog: dict[str, list[dict[str, Any]]] = {server: [] for server in self.mcp_connections.keys()}
-        runtime_tools: list[Any] = []
+        runtime_tools: dict[str, list[Any]] = {server: [] for server in self.mcp_connections.keys()}
 
-        try:
-            client = self.mcp_client_factory(self.mcp_connections, tool_name_prefix=True)
-            tools = await client.get_tools()
-        except Exception as exc:
-            detail = self._build_exception_error_detail(exc)
-            errors.append(f"MCP 工具发现失败: {self._safe_json(detail)}")
-            return tool_catalog, runtime_tools, errors
-
-        for tool in tools:
-            full_name = str(getattr(tool, "name", "")).strip()
-            server, tool_name = self._split_prefixed_tool_name(full_name)
-            if not server or not tool_name:
-                errors.append(f"MCP 工具名无法解析 server/tool: {full_name}")
+        client = self.mcp_client_factory(self.mcp_connections, tool_name_prefix=True)
+        for server_name in self.mcp_connections.keys():
+            try:
+                tools = await client.get_tools(server_name=server_name)
+            except Exception as exc:
+                detail = self._build_exception_error_detail(exc)
+                errors.append(f"MCP 工具发现失败(server={server_name}): {self._safe_json(detail)}")
                 continue
-            schema = self._extract_tool_schema(tool)
-            tool_catalog.setdefault(server, []).append(
-                {
-                    "name": tool_name,
-                    "description": str(getattr(tool, "description", ""))[:220],
-                    "schema": schema,
-                }
-            )
-            runtime_tools.append(tool)
+
+            for tool in tools:
+                full_name = str(getattr(tool, "name", "")).strip()
+                tool_name = full_name
+                prefix = f"{server_name}_"
+                if full_name.startswith(prefix):
+                    tool_name = full_name[len(prefix) :]
+                if not tool_name:
+                    errors.append(f"MCP 工具名为空 server={server_name}")
+                    continue
+
+                schema = self._extract_tool_schema(tool)
+                tool_catalog.setdefault(server_name, []).append(
+                    {
+                        "name": tool_name,
+                        "description": str(getattr(tool, "description", ""))[:220],
+                        "schema": schema,
+                    }
+                )
+                runtime_tools.setdefault(server_name, []).append(tool)
 
         return tool_catalog, runtime_tools, errors
 
-    def _build_agent(self, *, tools: list[Any]):
+    def _build_agent(self, *, tools: list[Any], agent_name: str, system_prompt: str):
         return self.agent_factory(
             model=self.llm,
             tools=tools,
-            system_prompt=self._build_agent_system_prompt(),
-            name="mcp_signal_agent",
+            system_prompt=system_prompt,
+            name=agent_name,
         )
 
     def _build_agent_system_prompt(self) -> str:
         return (
             "你是加密市场信号采集 Agent。"
             "你可以自行选择和调用 MCP 工具。"
+            "请根据 query 与 symbols 选择最相关的工具调用。"
             "优先返回结构化数据，并尽量覆盖用户关注 symbols。"
             "最后一条回复必须是 JSON 对象，不要使用 markdown 代码块。"
             "JSON 格式为 {\"raw_signals\": [...], \"errors\": [...]}。"
@@ -243,20 +260,84 @@ class MCPSignalSubgraphRunner:
         query: str,
         symbols: list[str],
         task_id: str,
-        tool_catalog: dict[str, list[dict[str, Any]]],
+        server_name: str,
+        tool_catalog: list[dict[str, Any]],
     ) -> str:
-        symbols_text = ",".join(symbols) if symbols else "BTC,ETH"
+        symbols_text = ",".join(symbols) if symbols else "AUTO"
         return (
             f"user_id={user_id}\n"
             f"task_id={task_id}\n"
             f"query={query}\n"
+            f"server={server_name}\n"
             f"target_symbols={symbols_text}\n"
             f"tool_call_budget_hint={self.max_rounds}\n\n"
-            "请先按需调用工具，再输出最终 JSON。"
+            "请根据 query 与 symbols 自主选择合适工具，再输出最终 JSON。"
             "如果某个工具失败，把错误摘要写入 errors。"
             "不要输出解释性文本，只输出最终 JSON。\n\n"
             f"可用工具目录：{self._safe_json(tool_catalog)}"
         )
+
+    async def _run_single_server_agent(
+        self,
+        *,
+        server_name: str,
+        tools: list[Any],
+        user_id: str,
+        query: str,
+        symbols: list[str],
+        task_id: str,
+        catalog_entries: list[dict[str, Any]],
+    ) -> _ServerAgentResult:
+        tool_rows: list[dict[str, Any]] = []
+        payload_rows: list[Any] = []
+        errors: list[str] = []
+        completed = False
+
+        try:
+            agent = self._build_agent(
+                tools=tools,
+                agent_name=f"mcp_signal_agent_{server_name}",
+                system_prompt=self._build_agent_system_prompt(),
+            )
+            if not callable(getattr(agent, "ainvoke", None)):
+                raise RuntimeError("MCP agent 不支持 ainvoke，无法保证 async-only 工具调用链路")
+            result = await agent.ainvoke(
+                {
+                    "messages": [
+                        {
+                            "role": "user",
+                            "content": self._build_agent_user_prompt(
+                                user_id=user_id,
+                                query=query,
+                                symbols=symbols,
+                                task_id=task_id,
+                                server_name=server_name,
+                                tool_catalog=catalog_entries,
+                            ),
+                        }
+                    ]
+                }
+            )
+            messages = result.get("messages", []) if isinstance(result, dict) else []
+            tool_rows.extend(self._extract_rows_from_messages(messages=messages, symbols=symbols, task_id=task_id))
+            payload, payload_error = self._parse_agent_payload(messages)
+            payload_rows.extend(payload.get("raw_signals", []) if isinstance(payload, dict) else [])
+            if isinstance(payload, dict):
+                errors.extend(payload.get("errors", []))
+            if payload_error and not tool_rows and not payload_rows:
+                errors.append(f"Agent 结论解析失败(server={server_name}): {payload_error}")
+            completed = True
+        except Exception as exc:
+            errors.append(
+                f"MCP Agent 执行失败(server={server_name}): {self._safe_json(self._build_exception_error_detail(exc))}"
+            )
+
+        return {
+            "tool_rows": tool_rows,
+            "payload_rows": payload_rows,
+            "errors": errors,
+            "completed": completed,
+        }
 
     def _split_prefixed_tool_name(self, full_name: str) -> tuple[str, str]:
         for server in sorted(self.mcp_connections.keys(), key=len, reverse=True):
@@ -355,7 +436,9 @@ class MCPSignalSubgraphRunner:
         if not isinstance(item, dict):
             return None
 
-        symbol = str(item.get("symbol") or (symbols[0] if symbols else "BTC")).upper()
+        symbol = str(item.get("symbol") or "UNKNOWN").upper()
+        if not symbol:
+            symbol = "UNKNOWN"
         source = str(item.get("source") or "mcp:agent")
         signal_type = str(item.get("signal_type") or "price").lower()
         if signal_type not in VALID_SIGNAL_TYPES:
@@ -473,7 +556,7 @@ class MCPSignalSubgraphRunner:
         symbols: list[str],
         task_id: str,
     ) -> dict[str, Any]:
-        symbol = symbols[0].upper() if symbols else "BTC"
+        symbol = "UNKNOWN"
         raw_ref = ""
         published_at = datetime.now(timezone.utc).isoformat()
 
@@ -541,7 +624,8 @@ class MCPSignalSubgraphRunner:
                 return candidate
         if candidates:
             return candidates[0]
-        return fallback.upper()
+        fallback_text = (fallback or "UNKNOWN").upper()
+        return fallback_text if fallback_text else "UNKNOWN"
 
     def _extract_published_at(self, item: dict[str, Any]) -> str | None:
         for key in ("published_at", "created_at", "updated_at", "timestamp", "time"):

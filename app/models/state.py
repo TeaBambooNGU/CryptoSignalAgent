@@ -22,6 +22,8 @@ class ResearchState(TypedDict, total=False):
 
     memory_profile: dict[str, Any]
     symbols: list[str]
+    hard_symbols: list[str]
+    soft_symbols: list[str]
 
     raw_signals: list[dict[str, Any]]
     signals: list[NormalizedSignal]

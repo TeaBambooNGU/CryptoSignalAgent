@@ -1,13 +1,14 @@
 # 工程架构梳理
 
-- 当前梳理时间: 2026-03-03 13:07:58
+- 当前梳理时间: 2026-03-03 16:30:35
 
 ## 项目概览
 - 项目定位: 面向加密市场研究场景的研报 Agent，聚焦“信号采集 -> 标准化 -> 检索增强 -> 个性化报告生成”。
 - 主要能力:
   - 基于标准 MCP 协议采集多源市场信号（`streamable_http` / `stdio` / `sse`），由官方 `langchain-mcp-adapters` 驱动。
+  - MCP 采集按 server 拆分为并行 Agent 执行：多 MCP 配置会并发拉取信号并在节点内合并。
   - 基于 LangGraph 编排主流程 9 节点，并输出节点级真实耗时 `workflow_steps`。
-  - MCP 采集链路改为 `create_agent`：由 Agent 自主选择并调用工具，统一回收 `raw_signals/errors`。
+  - MCP 采集链路基于 `create_agent`：由 LLM 根据 query/symbols 自主选择工具，统一回收 `raw_signals/errors`。
   - 基于 Milvus 存储研究语料与用户记忆，支持向量检索与重排。
   - 基于 Mem0（可选，platform/oss 两种模式）+ 本地会话记忆形成长期/短期记忆画像。
   - LLM 客户端可配置替换（当前默认 MiniMax，走 OpenAI-compatible 协议）。
@@ -33,7 +34,7 @@
   3. 构建 `AppRuntime`（`app/runtime.py`）统一装配依赖。
   4. `AppRuntime` 依次初始化：LangSmith、MilvusStore、LLM Client、MemoryService、MCPSignalSubgraphRunner、ResearchService、ReportAgent、ResearchGraphRunner。
   5. 请求进入后由 `trace_logging_middleware` 生成或透传 `X-Trace-Id`，记录请求开始/结束日志。
-  6. `collect_signals_via_mcp` 节点调用 `MCPSignalSubgraphRunner`，内部通过 `create_agent` 完成 MCP 工具调用与结果收敛。
+  6. `collect_signals_via_mcp` 节点调用 `MCPSignalSubgraphRunner`，内部按 server 并行运行 `create_agent`，聚合每个 server 的工具调用结果。
   7. 应用关闭时执行 `runtime.close()`，释放 Milvus 连接。
 
 ### 核心模块
@@ -52,8 +53,8 @@
   - `app/main.py`: 应用创建、生命周期管理、请求级 trace middleware。
   - `app/runtime.py`: 统一装配运行时依赖，包含 MCP Agent Runner。
   - `app/api/routes.py`: 暴露 4 个核心接口并触发运行时服务。
-  - `app/graph/workflow.py`: 主流程 9 节点编排（load memory / parse intent / collect via MCP / normalize & index / retrieve / analyze / generate / persist memory / finalize），并记录 `workflow_steps`。
-  - `app/graph/mcp_subgraph.py`: MCP 采集执行器，负责工具发现、`create_agent` 调用、ToolMessage 提取与最终 JSON 结果合并。
+  - `app/graph/workflow.py`: 主流程 9 节点编排（load memory / resolve symbols / collect via MCP / normalize & index / retrieve / analyze / generate / persist memory / finalize），并记录 `workflow_steps`。
+  - `app/graph/mcp_subgraph.py`: MCP 采集执行器，负责按 server 发现工具、并行 `create_agent` 调用、ToolMessage 提取与最终 JSON 结果合并。
   - `app/retrieval/research_service.py`: 信号标准化、切块、嵌入、写库、召回重排。
   - `app/memory/mem0_service.py`: 偏好写回、画像聚合、长期/短期记忆边界控制、Mem0 platform/oss 兼容。
   - `app/agents/report_agent.py`: Prompt 组织、报告生成、引用抽取、免责声明附加。
@@ -68,11 +69,11 @@
   - Embedding: 智谱 `embedding-3`（`ZhipuAIEmbeddings`，自动分批上限 64）。
   - 向量库: Milvus（不可用时按配置降级内存模式）。
   - 记忆增强: Mem0（可选；失败不阻断主流程，支持 `platform/oss`）。
-  - MCP Servers: 由 `MCP_SERVERS` JSON 配置提供，支持 `streamable_http` / `stdio` / `sse`。
+  - MCP Servers: 由 `.mcp.json` 的 `mcpServers` 提供，支持 `http/stdio/sse`（内部映射为 `streamable_http/stdio/sse`）。
 - 内部依赖:
   - API 层仅依赖 `AppRuntime`。
   - `ResearchGraphRunner` 聚合 `MemoryService`、`MCPSignalSubgraphRunner`、`ResearchService`、`ReportAgent`。
-  - `MCPSignalSubgraphRunner` 依赖 LangChain 原生 `BaseChatModel` + `MultiServerMCPClient` + `create_agent` 执行工具发现、Agent 调用与结果归并。
+  - `MCPSignalSubgraphRunner` 依赖 LangChain 原生 `BaseChatModel` + `MultiServerMCPClient` + `create_agent`；按 server 隔离工具集并并行执行 Agent 后统一归并结果。
   - `ResearchService` 与 `MemoryService` 共同依赖 `MilvusStore` 与 embedding 工具。
   - 前端通过 `frontend/src/api/client.ts` 调用 `/v1/*`，默认由 Vite 代理到后端。
 
@@ -85,12 +86,12 @@
   1. `POST /v1/research/query` 进入 middleware，注入/透传 `trace_id`。
   2. API 路由进入 `ResearchGraphRunner.arun`，初始化 `task_id` 与状态。
   3. `load_user_memory` 聚合长期/短期记忆并补充可选 Mem0 搜索结果。
-  4. `parse_intent_scope` 从 query + 画像 + task_context 推断 symbols。
+  4. `resolve_symbols` 按优先级解析 symbols（`task_context` > `query`），并将 watchlist 仅作为 MCP 软提示。
   5. `collect_signals_via_mcp` 调用 MCP Agent 执行器，执行以下阶段：
-     - `discover_tools`: 通过 `MultiServerMCPClient.get_tools()` 拉取可用工具并构建工具目录。
-     - `run_agent`: 使用 `create_agent(model=self.llm, tools=...)`，并通过 `await agent.ainvoke(...)` 触发 async-only 工具调用链路。
-     - `extract_rows`: 从 `ToolMessage` 的 `content/artifact.structured_content` 抽取原始项，标准化为统一 `raw_signals` 行结构。
-     - `merge_payload`: 解析 Agent 最后一条 AI JSON（`raw_signals/errors`）并与工具提取结果去重合并。
+     - `discover_tools_by_server`: 通过 `MultiServerMCPClient.get_tools(server_name=...)` 分 server 拉取可用工具并构建目录。
+     - `run_agents_in_parallel`: 对每个 server 使用 `create_agent(model=self.llm, tools=server_tools)` 并通过 `await agent.ainvoke(...)` 并行执行。
+     - `extract_rows`: 从各 server Agent 的 `ToolMessage`（`content/artifact.structured_content`）抽取原始项并标准化。
+     - `merge_payload`: 解析各 server Agent 最后一条 AI JSON（`raw_signals/errors`），与工具提取结果去重合并。
      - `finalize`: 返回 `raw_signals/errors/mcp_tools_count/mcp_termination_reason` 给主流程。
   6. `normalize_and_index` 标准化为 `NormalizedSignal`，切块并写入 Milvus。
   7. `retrieve_context` 做向量召回 + 重排（时间衰减/来源可信度/语义分）。
@@ -100,7 +101,8 @@
   11. `finalize_response` 汇总报告、引用、错误及 `workflow_steps` 并返回 API。
 - 控制/调度流程:
   - 主调度引擎为 LangGraph `StateGraph`（线性 9 节点）。
-  - MCP 采集由 `MCPSignalSubgraphRunner.arun` 一次执行完成；`MCP_MAX_ROUNDS` 当前作为 Agent 的工具调用预算提示注入 prompt。
+  - MCP 采集由 `MCPSignalSubgraphRunner.arun` 一次执行完成；内部使用 `asyncio.gather` 并行调度各 server Agent。
+  - `MCP_MAX_ROUNDS` 当前作为 Agent 的工具调用预算提示注入 prompt；工具是否调用由 LLM 按 query/symbols 自主决策，不强制全量工具调用。
   - 主流程关键调用通过 tenacity 重试：检索（最多 2 次）、报告生成（最多 3 次）。
   - 每个主节点通过 `_run_tracked_node` 记录 `status/duration_ms`，返回前端脉冲轨道。
   - MCP 终止语义简化为：`agent_completed`、`no_tools`、`agent_failed`。
@@ -127,9 +129,9 @@ sequenceDiagram
     G->>MEM: load_user_memory
     MEM->>MIL: query_user_memory
     G->>MCP: collect_signals_via_mcp
-    MCP->>ADP: discover tools
+    MCP->>ADP: discover tools by server
     ADP-->>MCP: tools
-    MCP->>AG: create_agent + ainvoke
+    MCP->>AG: create_agent + ainvoke (parallel per server)
     AG-->>MCP: AI/Tool messages
     MCP-->>G: raw_signals + errors
     G->>RET: normalize_signals + ingest_signals
@@ -163,7 +165,7 @@ sequenceDiagram
   - Embedding：`EMBEDDING_PROVIDER=zhipu`、`ZHIPU_EMBEDDING_MODEL`、`ZHIPU_EMBEDDING_BATCH_SIZE`、`ZHIPUAI_API_KEY`。
   - 向量库：`MILVUS_*`、`VECTOR_DIM`。
   - 记忆：`MEM0_ENABLED`、`MEM0_MODE`、`MEM0_OSS_COLLECTION`、`MEM0_API_KEY`、`MEM0_ORG_ID`、`MEM0_PROJECT_ID`、`ZHIPU_OPENAI_BASE_URL`。
-  - MCP: `MCP_SERVERS`（JSON 数组，标准配置入口）、`MCP_MAX_ROUNDS`（Agent 工具调用预算提示）。
+  - MCP: `MCP_CONFIG_PATH`（默认 `.mcp.json`，Claude Code 风格 `mcpServers`）、`MCP_MAX_ROUNDS`（Agent 工具调用预算提示）。
   - 报告合规：`REPORT_DISCLAIMER`（报告结尾免责声明文案）。
 - 运行环境约束:
   - `VECTOR_DIM` 必须与 embedding 输出维度一致，否则写库前报错。
@@ -193,6 +195,26 @@ sequenceDiagram
   - LangSmith 通过 `configure_langsmith` 以环境变量控制开启。
 
 ## 改动概要/变更记录
+### 2026-03-03 16:30:35
+- 本次新增/更新要点:
+  - MCP 子图执行模型更新为“按 server 并行 Agent”：多 MCP 配置会拆分为多条并发 `create_agent(...).ainvoke(...)` 任务后统一归并。
+  - 工具调用策略调整为“LLM 自主选择”：根据 query/symbols 选择相关工具，不再强制“每个 tool 至少调用一次”。
+  - 数据流/时序说明同步更新：`discover_tools` 改为 `get_tools(server_name=...)`，并明确 server 级工具隔离与并行执行语义。
+- 变更动机/需求来源:
+  - 来源于当前会话需求：用户要求“3 个 MCP 在 mcp_subgraph 环节并行调用”，并进一步要求“取消每 tool 必调，改为 LLM 按 query 自行决定”。
+- 当前更新时间: 2026-03-03 16:30:35
+
+
+### 2026-03-03 14:02:56
+- 本次新增/更新要点:
+  - MCP 配置入口从 `MCP_SERVERS` JSON 数组切换为 Claude Code 风格 `.mcp.json`（`mcpServers`）。
+  - 新增 `MCP_CONFIG_PATH`，用于指定 MCP 配置文件路径；默认读取项目根目录 `.mcp.json`。
+  - 文档同步更新 MCP 配置语义：`http/stdio/sse` 对应内部 `streamable_http/stdio/sse`。
+- 变更动机/需求来源:
+  - 来源于当前会话需求：用户要求“重构 settings 与连接构建格式，不再使用 MCP_SERVERS 数组，采用更原生最佳实践”。
+- 当前更新时间: 2026-03-03 14:02:56
+
+
 ### 2026-03-03 13:07:58
 - 本次新增/更新要点:
   - 同步为 async-only MCP 调用链路描述：`MultiServerMCPClient.get_tools()` 与 `create_agent(...).ainvoke(...)`。

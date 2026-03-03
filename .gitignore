@@ -31,6 +31,8 @@ frontend/artifacts/
 .env
 .env.*
 !.env.example
+.mcp.json
+!.mcp.json.example
 .envrc
 
 # =========================

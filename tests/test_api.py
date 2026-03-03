@@ -27,7 +27,7 @@ class APITestCase(unittest.TestCase):
         # 测试环境关闭外部依赖，保证本地可重复执行。
         os.environ["MILVUS_ENABLED"] = "false"
         os.environ["MEM0_ENABLED"] = "false"
-        os.environ["MCP_SERVERS"] = ""
+        os.environ["MCP_CONFIG_PATH"] = "/tmp/crypto_signal_agent_test_no_mcp.json"
         os.environ["LLM_PROVIDER"] = "minimax"
         os.environ["MINIMAX_API_KEY"] = "test-minimax-key"
         os.environ["ZHIPUAI_API_KEY"] = ""
