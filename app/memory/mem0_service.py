@@ -14,9 +14,11 @@ import logging
 import os
 from datetime import datetime, timezone
 from typing import Any
+from uuid import uuid4
 
 from app.config.settings import Settings
 from app.models.schemas import MemoryType
+from app.memory.session_store import SessionMemoryStore
 from app.retrieval.embedding import text_to_embedding
 from app.retrieval.milvus_store import MilvusStore
 
@@ -26,10 +28,19 @@ logger = logging.getLogger(__name__)
 class MemoryService:
     """统一记忆服务。"""
 
-    def __init__(self, settings: Settings, milvus_store: MilvusStore) -> None:
+    def __init__(
+        self,
+        settings: Settings,
+        milvus_store: MilvusStore,
+        session_store: SessionMemoryStore,
+        outbox_store: Any | None = None,
+        conversation_store: Any | None = None,
+    ) -> None:
         self.settings = settings
         self.milvus_store = milvus_store
-        self._session_memory: dict[str, list[dict[str, Any]]] = {}
+        self.session_store = session_store
+        self.outbox_store = outbox_store
+        self.conversation_store = conversation_store
         self._mem0_client: Any | None = self._init_mem0_client()
 
     def _init_mem0_client(self) -> Any | None:
@@ -156,15 +167,33 @@ class MemoryService:
         digest = hashlib.sha1(f"{user_id}:{memory_type.value}:{content}".encode("utf-8")).hexdigest()
         return digest[:40]
 
-    def _append_session_memory(self, user_id: str, item: dict[str, Any]) -> None:
+    def _event_ids(
+        self,
+        *,
+        user_id: str,
+        conversation_id: str | None,
+        turn_id: str | None,
+        request_id: str | None,
+    ) -> tuple[str, str, str]:
+        final_conversation_id = (conversation_id or "").strip() or f"default:{user_id}"
+        final_request_id = (request_id or "").strip() or str(uuid4())
+        final_turn_id = (turn_id or "").strip() or f"turn-{final_request_id[:8]}"
+        return final_conversation_id, final_turn_id, final_request_id
+
+    def _append_session_memory(self, conversation_id: str, item: dict[str, Any]) -> None:
         """写入短期记忆，保留最近 50 条。"""
 
-        bucket = self._session_memory.setdefault(user_id, [])
-        bucket.append(item)
-        if len(bucket) > 50:
-            del bucket[:-50]
+        self.session_store.append(conversation_id=conversation_id, item=item)
 
-    def save_preference(self, user_id: str, preference: dict[str, Any], confidence: float = 0.8) -> None:
+    def save_preference(
+        self,
+        user_id: str,
+        preference: dict[str, Any],
+        confidence: float = 0.8,
+        conversation_id: str | None = None,
+        turn_id: str | None = None,
+        request_id: str | None = None,
+    ) -> None:
         """保存长期偏好。
 
         长期记忆判定规则：
@@ -172,38 +201,59 @@ class MemoryService:
         - 采用“时间戳 + 置信度”覆盖策略。
         """
 
-        content = json.dumps(preference, ensure_ascii=False, sort_keys=True)
-        embedding = text_to_embedding(content, self.settings)
-        record = {
-            "id": self._build_memory_id(user_id, MemoryType.PREFERENCE, content),
-            "user_id": user_id,
-            "memory_type": MemoryType.PREFERENCE.value,
-            "content": content,
-            "confidence": confidence,
-            "updated_at": int(datetime.now(timezone.utc).timestamp()),
-            "embedding": embedding,
-        }
-        self.milvus_store.upsert_user_memory([record])
+        updated_at = int(datetime.now(timezone.utc).timestamp())
+        final_conversation_id, final_turn_id, final_request_id = self._event_ids(
+            user_id=user_id,
+            conversation_id=conversation_id,
+            turn_id=turn_id,
+            request_id=request_id,
+        )
+
+        if self.outbox_store is not None:
+            self.outbox_store.enqueue_outbox_event(
+                conversation_id=final_conversation_id,
+                turn_id=final_turn_id,
+                request_id=final_request_id,
+                event_type="memory.save_preference",
+                payload={
+                    "user_id": user_id,
+                    "preference": preference,
+                    "confidence": confidence,
+                    "updated_at": updated_at,
+                    "request_id": final_request_id,
+                },
+            )
+        else:
+            self.apply_preference_write(
+                user_id=user_id,
+                preference=preference,
+                confidence=confidence,
+                updated_at=updated_at,
+            )
+
         self._append_session_memory(
-            user_id,
+            final_conversation_id,
             {
                 "memory_type": MemoryType.PREFERENCE.value,
                 "content": preference,
                 "confidence": confidence,
-                "updated_at": record["updated_at"],
+                "updated_at": updated_at,
             },
         )
 
-        # Mem0 写回为增强能力，失败不阻断主流程。
-        self._mem0_add(user_id=user_id, content=content, metadata={"memory_type": MemoryType.PREFERENCE.value})
-
-    def save_task_context(self, user_id: str, task_context: dict[str, Any] | None) -> None:
+    def save_task_context(
+        self,
+        user_id: str,
+        conversation_id: str,
+        task_context: dict[str, Any] | None,
+    ) -> None:
         """保存短期任务上下文。"""
 
+        del user_id
         if not task_context:
             return
         self._append_session_memory(
-            user_id,
+            conversation_id,
             {
                 "memory_type": MemoryType.CONTEXT.value,
                 "content": task_context,
@@ -212,27 +262,52 @@ class MemoryService:
             },
         )
 
-    def save_tool_correction(self, user_id: str, correction: dict[str, Any], confidence: float = 0.8) -> None:
+    def save_tool_correction(
+        self,
+        user_id: str,
+        correction: dict[str, Any],
+        confidence: float = 0.8,
+        conversation_id: str | None = None,
+        turn_id: str | None = None,
+        request_id: str | None = None,
+    ) -> None:
         """保存 MCP 工具纠错经验到长期记忆。"""
 
         if not correction:
             return
+        final_conversation_id, final_turn_id, final_request_id = self._event_ids(
+            user_id=user_id,
+            conversation_id=conversation_id,
+            turn_id=turn_id,
+            request_id=request_id,
+        )
         payload = {"kind": "mcp_tool_correction", **correction}
-        content = json.dumps(payload, ensure_ascii=False, sort_keys=True)
-        embedding = text_to_embedding(content, self.settings)
         updated_at = int(datetime.now(timezone.utc).timestamp())
-        record = {
-            "id": self._build_memory_id(user_id, MemoryType.TOOL_CORRECTION, content),
-            "user_id": user_id,
-            "memory_type": MemoryType.TOOL_CORRECTION.value,
-            "content": content,
-            "confidence": confidence,
-            "updated_at": updated_at,
-            "embedding": embedding,
-        }
-        self.milvus_store.upsert_user_memory([record])
+
+        if self.outbox_store is not None:
+            self.outbox_store.enqueue_outbox_event(
+                conversation_id=final_conversation_id,
+                turn_id=final_turn_id,
+                request_id=final_request_id,
+                event_type="memory.save_tool_correction",
+                payload={
+                    "user_id": user_id,
+                    "correction": correction,
+                    "confidence": confidence,
+                    "updated_at": updated_at,
+                    "request_id": final_request_id,
+                },
+            )
+        else:
+            self.apply_tool_correction_write(
+                user_id=user_id,
+                correction=correction,
+                confidence=confidence,
+                updated_at=updated_at,
+            )
+
         self._append_session_memory(
-            user_id,
+            final_conversation_id,
             {
                 "memory_type": MemoryType.TOOL_CORRECTION.value,
                 "content": payload,
@@ -240,25 +315,21 @@ class MemoryService:
                 "updated_at": updated_at,
             },
         )
-        self._mem0_add(
-            user_id=user_id,
-            content=content,
-            metadata={
-                "memory_type": MemoryType.TOOL_CORRECTION.value,
-                "server": str(payload.get("server", "")),
-            },
-        )
 
-    def load_memory_profile(self, user_id: str) -> dict[str, Any]:
+    def load_memory_profile(self, user_id: str, conversation_id: str | None = None) -> dict[str, Any]:
         """聚合用户长期记忆与短期记忆。"""
 
         long_term = self.milvus_store.query_user_memory(user_id=user_id, limit=100)
-        session = self._session_memory.get(user_id, [])
+        session = self.session_store.get(conversation_id=conversation_id or user_id, limit=50)
+        recent_turn_context = self.load_recent_turn_context(conversation_id=conversation_id, limit=8)
+        conversation_summary = self.load_conversation_summary(conversation_id=conversation_id)
 
         profile = {
             "user_id": user_id,
             "long_term_memory": [self._decode_memory_row(row) for row in long_term],
             "session_memory": session,
+            "recent_turn_context": recent_turn_context,
+            "conversation_summary": conversation_summary,
             "watchlist": self._extract_watchlist(long_term, session),
             "risk_preference": self._extract_risk_preference(long_term),
             "tool_corrections": self._extract_tool_corrections(long_term),
@@ -270,12 +341,62 @@ class MemoryService:
             profile["mem0_recent"] = mem0_recent
         return profile
 
+    def load_recent_turn_context(self, conversation_id: str | None, limit: int = 8) -> list[dict[str, Any]]:
+        """从会话真相库读取最近轮次上下文。"""
+
+        if not conversation_id or self.conversation_store is None:
+            return []
+        try:
+            rows = self.conversation_store.list_turns(
+                conversation_id=conversation_id,
+                limit=max(1, min(limit, 20)),
+            )
+        except Exception:
+            logger.exception("读取会话 turn 上下文失败，已降级为空")
+            return []
+
+        result: list[dict[str, Any]] = []
+        for row in rows:
+            result.append(
+                {
+                    "turn_id": str(row.get("turn_id", "")),
+                    "version": int(row.get("version", 0) or 0),
+                    "query": str(row.get("query", "")),
+                    "report": str(row.get("report", "")),
+                    "status": str(row.get("status", "")),
+                    "trace_id": str(row.get("trace_id", "")),
+                    "updated_at": int(row.get("updated_at", 0) or 0),
+                }
+            )
+        return result
+
+    def load_conversation_summary(self, conversation_id: str | None) -> dict[str, Any] | None:
+        """读取会话摘要压缩结果。"""
+
+        if not conversation_id or self.conversation_store is None:
+            return None
+        try:
+            row = self.conversation_store.get_context_summary(conversation_id=conversation_id)
+            if not row:
+                return None
+            return {
+                "through_version": int(row.get("through_version", 0) or 0),
+                "summary_text": str(row.get("summary_text", "")),
+                "updated_at": int(row.get("updated_at", 0) or 0),
+            }
+        except Exception:
+            logger.exception("读取会话摘要失败，已降级为空")
+            return None
+
     def persist_report_memory(
         self,
         user_id: str,
         query: str,
         report: str,
         inferred_preferences: dict[str, Any] | None = None,
+        conversation_id: str | None = None,
+        turn_id: str | None = None,
+        request_id: str | None = None,
     ) -> None:
         """从研报结果提取可复用偏好并写回长期记忆。
 
@@ -288,12 +409,77 @@ class MemoryService:
         if not extracted:
             return
 
-        self.save_preference(user_id=user_id, preference=extracted, confidence=0.7)
+        self.save_preference(
+            user_id=user_id,
+            preference=extracted,
+            confidence=0.7,
+            conversation_id=conversation_id,
+            turn_id=turn_id,
+            request_id=request_id,
+        )
+
+    def apply_preference_write(
+        self,
+        *,
+        user_id: str,
+        preference: dict[str, Any],
+        confidence: float,
+        updated_at: int,
+    ) -> None:
+        """将偏好写入长期存储（Milvus + Mem0）。"""
+
+        content = json.dumps(preference, ensure_ascii=False, sort_keys=True)
+        embedding = text_to_embedding(content, self.settings)
+        record = {
+            "id": self._build_memory_id(user_id, MemoryType.PREFERENCE, content),
+            "user_id": user_id,
+            "memory_type": MemoryType.PREFERENCE.value,
+            "content": content,
+            "confidence": confidence,
+            "updated_at": int(updated_at or datetime.now(timezone.utc).timestamp()),
+            "embedding": embedding,
+        }
+        self.milvus_store.upsert_user_memory([record])
+        self._mem0_add(user_id=user_id, content=content, metadata={"memory_type": MemoryType.PREFERENCE.value})
+
+    def apply_tool_correction_write(
+        self,
+        *,
+        user_id: str,
+        correction: dict[str, Any],
+        confidence: float,
+        updated_at: int,
+    ) -> None:
+        """将工具纠错经验写入长期存储（Milvus + Mem0）。"""
+
+        if not correction:
+            return
+        payload = {"kind": "mcp_tool_correction", **correction}
+        content = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+        embedding = text_to_embedding(content, self.settings)
+        record = {
+            "id": self._build_memory_id(user_id, MemoryType.TOOL_CORRECTION, content),
+            "user_id": user_id,
+            "memory_type": MemoryType.TOOL_CORRECTION.value,
+            "content": content,
+            "confidence": confidence,
+            "updated_at": int(updated_at or datetime.now(timezone.utc).timestamp()),
+            "embedding": embedding,
+        }
+        self.milvus_store.upsert_user_memory([record])
+        self._mem0_add(
+            user_id=user_id,
+            content=content,
+            metadata={
+                "memory_type": MemoryType.TOOL_CORRECTION.value,
+                "server": str(payload.get("server", "")),
+            },
+        )
 
     def get_user_profile(self, user_id: str) -> dict[str, Any]:
         """返回 API 需要的用户画像结构。"""
 
-        profile = self.load_memory_profile(user_id=user_id)
+        profile = self.load_memory_profile(user_id=user_id, conversation_id=user_id)
         return {
             "user_id": user_id,
             "long_term_memory": profile.get("long_term_memory", []),

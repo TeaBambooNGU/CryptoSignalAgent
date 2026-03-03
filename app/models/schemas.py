@@ -38,6 +38,30 @@ class QueryRequest(BaseModel):
     user_id: str = Field(..., description="用户唯一标识")
     query: str = Field(..., description="研究问题")
     task_context: dict[str, Any] | None = Field(default=None, description="可选任务上下文")
+    conversation_id: str | None = Field(default=None, description="会话 ID（可选，默认 user 级会话）")
+    turn_id: str | None = Field(default=None, description="会话轮次 ID（可选）")
+    request_id: str | None = Field(default=None, description="请求幂等键（可选）")
+    expected_version: int | None = Field(default=None, ge=0, description="会话 CAS 版本（可选）")
+
+
+class ResumeConversationRequest(BaseModel):
+    """会话恢复并继续请求。"""
+
+    user_id: str = Field(..., description="用户唯一标识")
+    query: str = Field(..., description="研究问题")
+    task_context: dict[str, Any] | None = Field(default=None, description="可选任务上下文")
+    from_turn_id: str | None = Field(default=None, description="恢复起点 turn_id（可选，默认最新）")
+    request_id: str | None = Field(default=None, description="请求幂等键（可选）")
+    expected_version: int | None = Field(default=None, ge=0, description="会话 CAS 版本（可选）")
+
+
+class ConversationAction(str, Enum):
+    """会话动作类型。"""
+
+    AUTO = "auto"
+    CHAT = "chat"
+    REWRITE_REPORT = "rewrite_report"
+    REGENERATE_REPORT = "regenerate_report"
 
 
 class Citation(BaseModel):
@@ -63,8 +87,112 @@ class QueryResponse(BaseModel):
     report: str = Field(..., description="最终研报正文")
     citations: list[Citation] = Field(default_factory=list, description="引用列表")
     trace_id: str = Field(..., description="链路追踪 ID")
+    conversation_id: str = Field(..., description="会话 ID")
+    turn_id: str = Field(..., description="会话轮次 ID")
+    request_id: str = Field(..., description="请求幂等键")
+    conversation_version: int = Field(..., ge=1, description="会话版本号")
     errors: list[str] = Field(default_factory=list, description="非致命错误信息")
     workflow_steps: list[WorkflowStep] = Field(default_factory=list, description="真实工作流执行轨迹")
+
+
+class ConversationMetaResponse(BaseModel):
+    """会话元信息。"""
+
+    conversation_id: str = Field(..., description="会话 ID")
+    latest_version: int = Field(..., ge=0, description="最新会话版本")
+    latest_turn_id: str = Field(..., description="最新 turn ID")
+    turn_count: int = Field(..., ge=0, description="turn 总数")
+    updated_at: int = Field(..., ge=0, description="更新时间（Unix 秒）")
+
+
+class ConversationTurnSummary(BaseModel):
+    """会话 turn 摘要。"""
+
+    conversation_id: str = Field(..., description="会话 ID")
+    turn_id: str = Field(..., description="轮次 ID")
+    version: int = Field(..., ge=1, description="会话版本")
+    request_id: str = Field(..., description="请求幂等键")
+    user_id: str = Field(..., description="用户 ID")
+    query: str = Field(..., description="用户问题")
+    report: str = Field(..., description="研报正文")
+    assistant_message: str = Field(default="", description="助手回复")
+    trace_id: str = Field(..., description="链路追踪 ID")
+    status: str = Field(..., description="turn 状态")
+    intent: str = Field(default="", description="意图类型")
+    turn_type: str = Field(default="", description="turn 类型")
+    report_id: str | None = Field(default=None, description="关联报告 ID")
+    created_at: int = Field(..., ge=0, description="创建时间（Unix 秒）")
+    updated_at: int = Field(..., ge=0, description="更新时间（Unix 秒）")
+
+
+class ConversationTurnDetail(BaseModel):
+    """会话 turn 完整详情。"""
+
+    conversation_id: str = Field(..., description="会话 ID")
+    turn_id: str = Field(..., description="轮次 ID")
+    version: int = Field(..., ge=1, description="会话版本")
+    request_id: str = Field(..., description="请求幂等键")
+    user_id: str = Field(..., description="用户 ID")
+    query: str = Field(..., description="用户问题")
+    task_context: dict[str, Any] = Field(default_factory=dict, description="任务上下文")
+    report: str = Field(..., description="研报正文")
+    assistant_message: str = Field(default="", description="助手回复")
+    citations: list[Citation] = Field(default_factory=list, description="引用列表")
+    errors: list[str] = Field(default_factory=list, description="错误列表")
+    workflow_steps: list[WorkflowStep] = Field(default_factory=list, description="工作流轨迹")
+    trace_id: str = Field(..., description="链路追踪 ID")
+    status: str = Field(..., description="turn 状态")
+    intent: str = Field(default="", description="意图类型")
+    turn_type: str = Field(default="", description="turn 类型")
+    parent_turn_id: str | None = Field(default=None, description="父轮次 ID")
+    report_id: str | None = Field(default=None, description="关联报告 ID")
+    created_at: int = Field(..., ge=0, description="创建时间（Unix 秒）")
+    updated_at: int = Field(..., ge=0, description="更新时间（Unix 秒）")
+
+
+class ConversationReport(BaseModel):
+    """会话报告版本。"""
+
+    report_id: str = Field(..., description="报告 ID")
+    conversation_id: str = Field(..., description="会话 ID")
+    report_version: int = Field(..., ge=1, description="报告版本")
+    created_by_turn_id: str = Field(..., description="产出该报告的 turn ID")
+    based_on_report_id: str | None = Field(default=None, description="重写源报告 ID")
+    mode: str = Field(..., description="报告生成模式")
+    report: str = Field(..., description="报告正文")
+    citations: list[Citation] = Field(default_factory=list, description="引用列表")
+    workflow_steps: list[WorkflowStep] = Field(default_factory=list, description="工作流轨迹")
+    status: str = Field(..., description="状态")
+    created_at: int = Field(..., ge=0, description="创建时间（Unix 秒）")
+    updated_at: int = Field(..., ge=0, description="更新时间（Unix 秒）")
+
+
+class ConversationMessageRequest(BaseModel):
+    """会话消息请求。"""
+
+    user_id: str = Field(..., description="用户唯一标识")
+    message: str = Field(..., description="用户消息")
+    task_context: dict[str, Any] | None = Field(default=None, description="可选任务上下文")
+    action: ConversationAction = Field(default=ConversationAction.AUTO, description="会话动作")
+    target_report_id: str | None = Field(default=None, description="目标报告 ID（重写时可选）")
+    from_turn_id: str | None = Field(default=None, description="关联起点 turn_id（可选）")
+    request_id: str | None = Field(default=None, description="请求幂等键（可选）")
+    expected_version: int | None = Field(default=None, ge=0, description="会话 CAS 版本（可选）")
+
+
+class ConversationMessageResponse(BaseModel):
+    """会话消息响应。"""
+
+    conversation_id: str = Field(..., description="会话 ID")
+    turn_id: str = Field(..., description="轮次 ID")
+    request_id: str = Field(..., description="请求幂等键")
+    conversation_version: int = Field(..., ge=1, description="会话版本")
+    action_taken: ConversationAction = Field(..., description="实际执行动作")
+    assistant_message: str = Field(..., description="助手回复")
+    trace_id: str = Field(..., description="链路追踪 ID")
+    errors: list[str] = Field(default_factory=list, description="错误列表")
+    workflow_steps: list[WorkflowStep] = Field(default_factory=list, description="工作流轨迹")
+    report: ConversationReport | None = Field(default=None, description="本轮产出的报告（若有）")
 
 
 class UserPreferencesRequest(BaseModel):

@@ -7,7 +7,7 @@
 - 通过 **MCP 数据源**采集市场信号（基于官方 `langchain-mcp-adapters`）
 - MCP 采用 `create_agent` 自主工具调用机制（async-only）
 - 对信号做统一标准化并入库 Milvus
-- 基于用户长期/短期记忆生成个性化研报
+- 基于用户长期/短期记忆生成个性化研报，并支持围绕报告持续对话
 - 使用 LangGraph 编排完整研究流程
 - LLM 客户端可配置替换，当前默认接入 MiniMax M2.5
 - 使用 tenacity 对关键节点提供重试
@@ -101,6 +101,16 @@ MEM0_API_KEY=
 MEM0_ORG_ID=
 MEM0_PROJECT_ID=
 
+# 会话一致性与短期记忆存储
+CONVERSATION_STORE_PATH=data/conversation_state.db
+# 可选: memory / redis
+SESSION_STORE_BACKEND=memory
+# 示例（带密码）：redis://:your_redis_password@127.0.0.1:6379/0
+# 若启用 ACL 用户名，可用：redis://your_username:your_redis_password@127.0.0.1:6379/0
+REDIS_URL=redis://:your_redis_password@127.0.0.1:6379/0
+SESSION_MEMORY_TTL_SECONDS=86400
+SESSION_MEMORY_MAX_ITEMS=50
+
 # MCP（Claude Code 风格配置）
 # 默认读取项目根目录 .mcp.json
 MCP_CONFIG_PATH=.mcp.json
@@ -129,10 +139,21 @@ uv run python main.py
 
 ## API 列表
 
-- `POST /v1/research/query`
-- `POST /v1/user/preferences`
-- `GET /v1/user/profile/{user_id}`
-- `POST /v1/research/ingest`
+- 会话主入口（推荐）
+  - `POST /v1/conversation/{conversation_id}/message`
+- 会话查询与回放
+  - `GET /v1/conversation/{conversation_id}`
+  - `GET /v1/conversation/{conversation_id}/turns`
+  - `GET /v1/conversation/{conversation_id}/turns/{turn_id}`
+  - `GET /v1/conversation/{conversation_id}/reports`
+  - `GET /v1/conversation/{conversation_id}/reports/{report_id}`
+  - `POST /v1/conversation/{conversation_id}/resume`
+- 兼容入口
+  - `POST /v1/research/query`（语义等价于 `action=regenerate_report`）
+- 其他接口
+  - `POST /v1/user/preferences`
+  - `GET /v1/user/profile/{user_id}`
+  - `POST /v1/research/ingest`
 
 ## 前端控制台（极简科技风）
 
@@ -218,20 +239,60 @@ uv sync
 uv run python scripts/verify_mcp_servers.py
 ```
 
-## 用户如何拿到研报
+## 用户如何拿到研报（会话模式）
 
-1. 可选：先写入用户偏好
-2. 调用 `POST /v1/research/query` 获取 `report + citations + trace_id`
+推荐直接使用会话入口：`POST /v1/conversation/{conversation_id}/message`。
+
+1. 先生成首版研报（`regenerate_report`）
 
 ```bash
-curl -X POST http://127.0.0.1:8000/v1/research/query \
+curl -X POST http://127.0.0.1:8000/v1/conversation/conv-u001-1/message \
   -H "Content-Type: application/json" \
   -d '{
     "user_id":"u001",
-    "query":"请给我 BTC 和 ETH 的 24 小时风险信号研报",
-    "task_context":{"symbols":["BTC","ETH"]}
+    "message":"请给我 BTC 和 ETH 的 24 小时风险信号研报",
+    "action":"regenerate_report",
+    "task_context":{"symbols":["BTC","ETH"]},
+    "request_id":"req-u001-turn1"
   }'
 ```
+
+2. 基于该研报继续对话（`chat`）
+
+```bash
+curl -X POST http://127.0.0.1:8000/v1/conversation/conv-u001-1/message \
+  -H "Content-Type: application/json" \
+  -d '{
+    "user_id":"u001",
+    "message":"请解释这版报告里最关键的下行风险",
+    "action":"chat",
+    "expected_version":1,
+    "request_id":"req-u001-turn2"
+  }'
+```
+
+3. 在对话中重写报告（`rewrite_report`）
+
+```bash
+curl -X POST http://127.0.0.1:8000/v1/conversation/conv-u001-1/message \
+  -H "Content-Type: application/json" \
+  -d '{
+    "user_id":"u001",
+    "message":"改写成更保守、面向低风险投资者的版本",
+    "action":"rewrite_report",
+    "target_report_id":"rpt-xxxxxx",
+    "expected_version":2,
+    "request_id":"req-u001-turn3"
+  }'
+```
+
+4. 查看报告版本历史
+
+```bash
+curl "http://127.0.0.1:8000/v1/conversation/conv-u001-1/reports?limit=20"
+```
+
+> 若你仍在使用 `POST /v1/research/query`，它会走兼容路径，行为等价于 `regenerate_report`。
 
 ## 测试
 
@@ -244,5 +305,7 @@ uv run python -m unittest tests/test_api.py
 - V1 严格只处理 MCP 可获取的数据源。
 - 报告默认附带风险免责声明：仅供研究，不构成投资建议。
 - 当 Milvus 不可用时，系统可按配置降级到内存存储。
-- 当 LLM 不可用时，`/v1/research/query` 会直接返回 500（硬失败）。
+- 当 LLM 不可用时，`/v1/research/query` 与 `/v1/conversation/{conversation_id}/message` 都会返回 500（硬失败）。
 - 使用智谱 embedding 时，请确保 `VECTOR_DIM` 与模型输出维度一致。
+- 记忆写入采用 outbox projector 异步投影（Milvus/Mem0 最终一致）；会话真相状态先落地本地 SQLite。
+- 若要启用 `SESSION_STORE_BACKEND=redis`，请先安装 Python Redis 客户端（例如 `uv add redis`）。

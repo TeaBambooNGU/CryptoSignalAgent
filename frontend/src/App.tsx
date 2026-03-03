@@ -11,7 +11,7 @@ function App() {
       <SideNav />
       <main className="app-main">
         <header className="top-strip" aria-label="页面头部">
-          <p>Agent-native interface for research pipeline visibility</p>
+          <p>Conversation-first interface for report chat, rewrite, and regenerate</p>
         </header>
         <Routes>
           <Route path="/" element={<DashboardPage />} />

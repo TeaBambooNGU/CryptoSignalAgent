@@ -9,9 +9,13 @@ from app.agents.llm import create_llm_client
 from app.agents.report_agent import ReportAgent
 from app.config.logging import get_logger, log_context
 from app.config.settings import Settings
+from app.conversation.projector import OutboxProjector
+from app.conversation.service import ConversationService
+from app.conversation.store import SQLiteConversationTruthStore
 from app.graph.mcp_subgraph import MCPSignalSubgraphRunner
 from app.graph.workflow import ResearchGraphRunner
 from app.memory.mem0_service import MemoryService
+from app.memory.session_store import build_session_memory_store
 from app.observability.langsmith import configure_langsmith
 from app.retrieval.milvus_store import MilvusStore
 from app.retrieval.research_service import ResearchService
@@ -33,8 +37,21 @@ class AppRuntime:
             self.milvus_store.connect()
             logger.info("MilvusStore 初始化完成")
 
+            self.conversation_store = SQLiteConversationTruthStore(settings.conversation_store_path)
             self.llm = create_llm_client(settings)
-            self.memory_service = MemoryService(settings=settings, milvus_store=self.milvus_store)
+            self.session_store = build_session_memory_store(
+                backend=settings.session_store_backend,
+                redis_url=settings.redis_url,
+                ttl_seconds=settings.session_memory_ttl_seconds,
+                max_items=settings.session_memory_max_items,
+            )
+            self.memory_service = MemoryService(
+                settings=settings,
+                milvus_store=self.milvus_store,
+                session_store=self.session_store,
+                outbox_store=self.conversation_store,
+                conversation_store=self.conversation_store,
+            )
             self.mcp_subgraph = MCPSignalSubgraphRunner(
                 llm=self.llm,
                 mcp_connections=MCPSignalSubgraphRunner.build_connections_from_settings(settings.mcp_servers),
@@ -51,11 +68,22 @@ class AppRuntime:
                 research_service=self.research_service,
                 report_agent=self.report_agent,
             )
+            self.conversation_service = ConversationService(
+                graph_runner=self.graph_runner,
+                truth_store=self.conversation_store,
+            )
+            self.outbox_projector = OutboxProjector(
+                truth_store=self.conversation_store,
+                memory_service=self.memory_service,
+            )
+            self.outbox_projector.start()
             logger.info("运行时初始化完成")
 
     def close(self) -> None:
         """释放运行时资源。"""
 
         with log_context(component="runtime.shutdown"):
+            self.outbox_projector.stop()
+            self.session_store.close()
             self.milvus_store.close()
             logger.info("运行时资源已释放")

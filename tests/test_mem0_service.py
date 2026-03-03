@@ -9,6 +9,7 @@ from unittest.mock import patch
 
 from app.config.settings import Settings
 from app.memory.mem0_service import MemoryService
+from app.memory.session_store import InMemorySessionMemoryStore
 
 
 class _DummyMilvusStore:
@@ -57,7 +58,11 @@ class Mem0ServiceCompatibilityTestCase(unittest.TestCase):
                 minimax_api_host="https://api.minimax.chat",
                 zhipu_embedding_model="embedding-3",
             )
-            service = MemoryService(settings=settings, milvus_store=_DummyMilvusStore())
+            service = MemoryService(
+                settings=settings,
+                milvus_store=_DummyMilvusStore(),
+                session_store=InMemorySessionMemoryStore(),
+            )
 
             config = service._build_mem0_oss_config()
 
@@ -79,7 +84,11 @@ class Mem0ServiceCompatibilityTestCase(unittest.TestCase):
 
     def test_search_uses_platform_filters_for_memory_client(self) -> None:
         settings = Settings(mem0_enabled=False, mem0_mode="platform")
-        service = MemoryService(settings=settings, milvus_store=_DummyMilvusStore())
+        service = MemoryService(
+            settings=settings,
+            milvus_store=_DummyMilvusStore(),
+            session_store=InMemorySessionMemoryStore(),
+        )
         client = _SearchClient()
         service._mem0_client = client
 
@@ -94,7 +103,11 @@ class Mem0ServiceCompatibilityTestCase(unittest.TestCase):
 
     def test_search_uses_legacy_kwargs_for_oss_memory(self) -> None:
         settings = Settings(mem0_enabled=False, mem0_mode="oss")
-        service = MemoryService(settings=settings, milvus_store=_DummyMilvusStore())
+        service = MemoryService(
+            settings=settings,
+            milvus_store=_DummyMilvusStore(),
+            session_store=InMemorySessionMemoryStore(),
+        )
         client = _SearchClient()
         service._mem0_client = client
 
@@ -111,7 +124,11 @@ class Mem0ServiceCompatibilityTestCase(unittest.TestCase):
         with patch.dict(os.environ, {"ZHIPUAI_API_KEY": ""}, clear=False):
             settings = Settings(mem0_enabled=False)
             milvus = _DummyMilvusStore()
-            service = MemoryService(settings=settings, milvus_store=milvus)
+            service = MemoryService(
+                settings=settings,
+                milvus_store=milvus,
+                session_store=InMemorySessionMemoryStore(),
+            )
 
             service.save_tool_correction(
                 user_id="u-3",
@@ -129,6 +146,25 @@ class Mem0ServiceCompatibilityTestCase(unittest.TestCase):
             self.assertEqual(len(corrections), 1)
             self.assertEqual(corrections[0]["server"], "defillama")
             self.assertEqual(corrections[0]["fixed_arguments"]["protocol"], "bitcoin")
+
+    def test_session_memory_isolation_by_conversation_id(self) -> None:
+        settings = Settings(mem0_enabled=False)
+        service = MemoryService(
+            settings=settings,
+            milvus_store=_DummyMilvusStore(),
+            session_store=InMemorySessionMemoryStore(),
+        )
+
+        service.save_task_context(user_id="u-4", conversation_id="conv-a", task_context={"symbols": ["BTC"]})
+        service.save_task_context(user_id="u-4", conversation_id="conv-b", task_context={"symbols": ["ETH"]})
+
+        profile_a = service.load_memory_profile(user_id="u-4", conversation_id="conv-a")
+        profile_b = service.load_memory_profile(user_id="u-4", conversation_id="conv-b")
+
+        self.assertEqual(len(profile_a["session_memory"]), 1)
+        self.assertEqual(len(profile_b["session_memory"]), 1)
+        self.assertEqual(profile_a["session_memory"][0]["content"]["symbols"], ["BTC"])
+        self.assertEqual(profile_b["session_memory"][0]["content"]["symbols"], ["ETH"])
 
 
 if __name__ == "__main__":

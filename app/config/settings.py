@@ -70,6 +70,12 @@ class Settings:
     mem0_org_id: str = ""
     mem0_project_id: str = ""
 
+    conversation_store_path: str = "data/conversation_state.db"
+    session_store_backend: str = "memory"
+    redis_url: str = ""
+    session_memory_ttl_seconds: int = 86400
+    session_memory_max_items: int = 50
+
     mcp_servers: dict[str, dict[str, Any]] = field(default_factory=dict)
     mcp_max_rounds: int = 4
 
@@ -214,6 +220,17 @@ class Settings:
             mem0_api_key=os.getenv("MEM0_API_KEY", ""),
             mem0_org_id=os.getenv("MEM0_ORG_ID", ""),
             mem0_project_id=os.getenv("MEM0_PROJECT_ID", ""),
+            conversation_store_path=os.getenv("CONVERSATION_STORE_PATH", defaults.conversation_store_path),
+            session_store_backend=os.getenv("SESSION_STORE_BACKEND", defaults.session_store_backend),
+            redis_url=os.getenv("REDIS_URL", defaults.redis_url),
+            session_memory_ttl_seconds=_as_int(
+                "SESSION_MEMORY_TTL_SECONDS",
+                defaults.session_memory_ttl_seconds,
+            ),
+            session_memory_max_items=_as_int(
+                "SESSION_MEMORY_MAX_ITEMS",
+                defaults.session_memory_max_items,
+            ),
             mcp_servers=_as_mcp_servers(),
             mcp_max_rounds=_as_int("MCP_MAX_ROUNDS", defaults.mcp_max_rounds),
             report_disclaimer=os.getenv("REPORT_DISCLAIMER", defaults.report_disclaimer),

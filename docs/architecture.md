@@ -1,22 +1,23 @@
 # 工程架构梳理
 
-- 当前梳理时间: 2026-03-03 16:30:35
+- 当前梳理时间: 2026-03-04 00:11:08
 
 ## 项目概览
-- 项目定位: 面向加密市场研究场景的研报 Agent，聚焦“信号采集 -> 标准化 -> 检索增强 -> 个性化报告生成”。
+- 项目定位: 面向加密市场研究场景的“对话优先”研报 Agent，支持“持续会话 -> 报告版本化 -> 可恢复回放”。
 - 主要能力:
   - 基于标准 MCP 协议采集多源市场信号（`streamable_http` / `stdio` / `sse`），由官方 `langchain-mcp-adapters` 驱动。
   - MCP 采集按 server 拆分为并行 Agent 执行：多 MCP 配置会并发拉取信号并在节点内合并。
   - 基于 LangGraph 编排主流程 9 节点，并输出节点级真实耗时 `workflow_steps`。
-  - MCP 采集链路基于 `create_agent`：由 LLM 根据 query/symbols 自主选择工具，统一回收 `raw_signals/errors`。
-  - 基于 Milvus 存储研究语料与用户记忆，支持向量检索与重排。
-  - 基于 Mem0（可选，platform/oss 两种模式）+ 本地会话记忆形成长期/短期记忆画像。
-  - LLM 客户端可配置替换（当前默认 MiniMax，走 OpenAI-compatible 协议）。
-  - 提供 React 控制台前端，支持研报执行、记忆管理、手动入库、运行时状态查看。
+  - 会话统一入口支持 `auto/chat/rewrite_report/regenerate_report` 四种动作路由。
+  - 报告版本资产化（`conversation_report`）+ 会话轮次真相库（`conversation_turn`）+ 长会话摘要压缩（`conversation_context_summary`）。
+  - 会话一致性采用“同会话单写者锁 + CAS version + request_id 幂等”保障并发安全与重试稳定。
+  - Milvus/Mem0 写入通过 outbox 异步投影，保证会话真相库强一致、外部记忆最终一致。
+  - 提供 React 控制台前端，支持持续对话、回溯 turn、选择报告版本并继续改写/重跑。
 - 关键输出:
-  - `POST /v1/research/query` 返回 `report`、`citations`、`trace_id`、`errors`、`workflow_steps`。
-  - `POST /v1/research/ingest` 支持外部文档回填为检索语料。
-  - `POST /v1/user/preferences` / `GET /v1/user/profile/{user_id}` 支持偏好写入与画像读取。
+  - `POST /v1/conversation/{conversation_id}/message`：统一对话入口，返回 `action_taken/assistant_message/report?/workflow_steps`。
+  - `GET /v1/conversation/{conversation_id}/turns`、`GET /v1/conversation/{conversation_id}/turns/{turn_id}`：会话轮次回放。
+  - `GET /v1/conversation/{conversation_id}/reports`、`GET /v1/conversation/{conversation_id}/reports/{report_id}`：报告版本回放。
+  - `POST /v1/research/query`：兼容入口，语义等价于 `regenerate_report`。
   - 所有请求通过中间件注入/透传 `X-Trace-Id` 响应头，便于端到端排障。
 
 ## 工程逻辑梳理
@@ -32,17 +33,18 @@
   1. `main.py` 加载全局配置 `settings` 并启动 Uvicorn。
   2. FastAPI `lifespan` 中执行日志初始化 `setup_logging`。
   3. 构建 `AppRuntime`（`app/runtime.py`）统一装配依赖。
-  4. `AppRuntime` 依次初始化：LangSmith、MilvusStore、LLM Client、MemoryService、MCPSignalSubgraphRunner、ResearchService、ReportAgent、ResearchGraphRunner。
+  4. `AppRuntime` 依次初始化：LangSmith、MilvusStore、SQLiteConversationTruthStore、LLM、SessionStore、MemoryService、MCPSignalSubgraphRunner、ResearchService、ReportAgent、ResearchGraphRunner、ConversationService、OutboxProjector。
   5. 请求进入后由 `trace_logging_middleware` 生成或透传 `X-Trace-Id`，记录请求开始/结束日志。
-  6. `collect_signals_via_mcp` 节点调用 `MCPSignalSubgraphRunner`，内部按 server 并行运行 `create_agent`，聚合每个 server 的工具调用结果。
-  7. 应用关闭时执行 `runtime.close()`，释放 Milvus 连接。
+  6. 会话写路径先进入 `ConversationService`（CAS + 幂等 + 单会话串行），再按 action 分流到 chat/rewrite/regenerate。
+  7. 应用关闭时执行 `runtime.close()`，依次停止 outbox 线程并释放 SessionStore/Milvus 连接。
 
 ### 核心模块
 - 模块划分:
   - `app/api`: HTTP 路由与依赖注入。
+  - `app/conversation`: 会话真相库、锁与幂等控制、对话路由、outbox 投影器。
   - `app/graph`: LangGraph 主流程（`workflow.py`）与 MCP Agent 执行器（`mcp_subgraph.py`）。
   - `app/retrieval`: Embedding、Milvus 存储封装、信号入库与检索服务。
-  - `app/memory`: 记忆服务（Mem0 优先，Milvus + Session 降级）。
+  - `app/memory`: 记忆服务（Mem0 优先，Milvus + Session 降级）与 SessionStore 抽象（memory/redis）。
   - `app/agents`: LLM 抽象、客户端工厂、研报生成代理。
   - `app/config`: 环境变量配置与日志配置（trace 上下文注入、按天+按大小轮转）。
   - `app/observability`: LangSmith 跟踪配置。
@@ -51,16 +53,16 @@
   - `scripts`: 运维初始化、MCP 可用性验证与 MCP 原始响应巡检脚本。
 - 关键职责:
   - `app/main.py`: 应用创建、生命周期管理、请求级 trace middleware。
-  - `app/runtime.py`: 统一装配运行时依赖，包含 MCP Agent Runner。
-  - `app/api/routes.py`: 暴露 4 个核心接口并触发运行时服务。
-  - `app/graph/workflow.py`: 主流程 9 节点编排（load memory / resolve symbols / collect via MCP / normalize & index / retrieve / analyze / generate / persist memory / finalize），并记录 `workflow_steps`。
-  - `app/graph/mcp_subgraph.py`: MCP 采集执行器，负责按 server 发现工具、并行 `create_agent` 调用、ToolMessage 提取与最终 JSON 结果合并。
-  - `app/retrieval/research_service.py`: 信号标准化、切块、嵌入、写库、召回重排。
-  - `app/memory/mem0_service.py`: 偏好写回、画像聚合、长期/短期记忆边界控制、Mem0 platform/oss 兼容。
-  - `app/agents/report_agent.py`: Prompt 组织、报告生成、引用抽取、免责声明附加。
-  - `frontend/src/pages/DashboardPage.tsx`: 查询执行、工作流可视化、报告渲染与引用展示。
+  - `app/runtime.py`: 统一装配运行时依赖，并启动 `OutboxProjector`。
+  - `app/api/routes.py`: 暴露研究、会话消息、turn/report 查询、resume、记忆与入库接口。
+  - `app/conversation/service.py`: 会话动作路由（auto/chat/rewrite/regenerate）、上下文拼装、摘要刷新。
+  - `app/conversation/store.py`: snapshot/turn/report/summary/idempotency/event/outbox 的事务化读写。
+  - `app/conversation/projector.py`: 消费 outbox 并异步投影到长期记忆写接口。
+  - `app/graph/workflow.py`: 主流程 9 节点编排（load memory / resolve symbols / collect via MCP / normalize & index / retrieve / analyze / generate / persist memory / finalize）。
+  - `app/memory/mem0_service.py`: 偏好写回、画像聚合、recent turns + summary 注入、Mem0 platform/oss 兼容。
+  - `frontend/src/pages/DashboardPage.tsx`: Message Composer、Dialogue 流、Turn Timeline、Report Version Tape。
 - 主要依赖:
-  - 后端: FastAPI/Uvicorn、LangGraph、LangChain、langchain-openai、langchain-mcp-adapters、tenacity、mcp、pymilvus、langchain-community（Zhipu embedding）、llama-index、mem0（可选）。
+  - 后端: FastAPI/Uvicorn、LangGraph、LangChain、langchain-openai、langchain-mcp-adapters、tenacity、mcp、pymilvus、langchain-community（Zhipu embedding）、llama-index、mem0（可选）、redis（可选）。
   - 前端: React、Vite、TypeScript、TanStack Query、Zustand、React Router。
 
 ### 依赖关系
@@ -69,91 +71,97 @@
   - Embedding: 智谱 `embedding-3`（`ZhipuAIEmbeddings`，自动分批上限 64）。
   - 向量库: Milvus（不可用时按配置降级内存模式）。
   - 记忆增强: Mem0（可选；失败不阻断主流程，支持 `platform/oss`）。
+  - Session Cache: Redis（可选；短期会话记忆缓存，失效不影响恢复真相库）。
   - MCP Servers: 由 `.mcp.json` 的 `mcpServers` 提供，支持 `http/stdio/sse`（内部映射为 `streamable_http/stdio/sse`）。
 - 内部依赖:
   - API 层仅依赖 `AppRuntime`。
+  - `ConversationService` 聚合 `ResearchGraphRunner + SQLiteConversationTruthStore + ConversationLockManager`。
   - `ResearchGraphRunner` 聚合 `MemoryService`、`MCPSignalSubgraphRunner`、`ResearchService`、`ReportAgent`。
-  - `MCPSignalSubgraphRunner` 依赖 LangChain 原生 `BaseChatModel` + `MultiServerMCPClient` + `create_agent`；按 server 隔离工具集并并行执行 Agent 后统一归并结果。
-  - `ResearchService` 与 `MemoryService` 共同依赖 `MilvusStore` 与 embedding 工具。
+  - `MemoryService` 同时依赖 `MilvusStore + SessionStore + ConversationTruthStore`。
+  - `OutboxProjector` 轮询 `outbox_event` 并调用 `MemoryService.apply_*` 落地异步写。
   - 前端通过 `frontend/src/api/client.ts` 调用 `/v1/*`，默认由 Vite 代理到后端。
+
+### 会话真相库与一致性
+- 主要表结构:
+  - `conversation_snapshot`：会话最新 `version/last_turn_id`。
+  - `idempotency_request`：`request_id` 状态机（`pending/completed/failed`）。
+  - `conversation_turn`：每轮完整记录（query/assistant_message/report/citations/errors/workflow/intent/turn_type/parent_turn_id/report_id）。
+  - `conversation_report`：报告版本资产（`report_version` 会话内递增，支持 `based_on_report_id` 重写链）。
+  - `conversation_context_summary`：长会话压缩摘要（`through_version` 指示覆盖边界）。
+  - `conversation_event` + `outbox_event`：事件日志与异步投影队列。
+  - `conversation_state_checkpoint`：节点级 checkpoint 预留。
+- 并发与幂等规则:
+  - 同 `conversation_id` 在进程内由 `ConversationLockManager` 串行写入。
+  - `prepare_turn` 使用 `expected_version` 做 CAS；冲突返回 409。
+  - `request_id` 重试命中 `idempotency_request` 缓存直接返回同结果。
+  - turn 与幂等状态在同事务提交，避免“有版本无结果”或“重复写入”。
+- 最终一致策略:
+  - 会话结果（turn/report）以 SQLite truth store 为真相源。
+  - Milvus/Mem0 写入走 outbox 后台线程重试，失败不会破坏会话历史可恢复性。
 
 ### 数据流/控制流
 - 数据来源:
-  - 用户请求（query/task_context/user_id）。
+  - 用户消息（`message/action/task_context/expected_version/from_turn_id`）。
   - MCP tools 返回的结构化或文本内容。
-  - 历史研究语料（`research_chunks`）与用户记忆（`user_memory`）。
-- 数据处理链路:
-  1. `POST /v1/research/query` 进入 middleware，注入/透传 `trace_id`。
-  2. API 路由进入 `ResearchGraphRunner.arun`，初始化 `task_id` 与状态。
-  3. `load_user_memory` 聚合长期/短期记忆并补充可选 Mem0 搜索结果。
-  4. `resolve_symbols` 按优先级解析 symbols（`task_context` > `query`），并将 watchlist 仅作为 MCP 软提示。
-  5. `collect_signals_via_mcp` 调用 MCP Agent 执行器，执行以下阶段：
-     - `discover_tools_by_server`: 通过 `MultiServerMCPClient.get_tools(server_name=...)` 分 server 拉取可用工具并构建目录。
-     - `run_agents_in_parallel`: 对每个 server 使用 `create_agent(model=self.llm, tools=server_tools)` 并通过 `await agent.ainvoke(...)` 并行执行。
-     - `extract_rows`: 从各 server Agent 的 `ToolMessage`（`content/artifact.structured_content`）抽取原始项并标准化。
-     - `merge_payload`: 解析各 server Agent 最后一条 AI JSON（`raw_signals/errors`），与工具提取结果去重合并。
-     - `finalize`: 返回 `raw_signals/errors/mcp_tools_count/mcp_termination_reason` 给主流程。
-  6. `normalize_and_index` 标准化为 `NormalizedSignal`，切块并写入 Milvus。
-  7. `retrieve_context` 做向量召回 + 重排（时间衰减/来源可信度/语义分）。
-  8. `analyze_signals` 汇总信号覆盖、类型分布、平均置信度。
-  9. `generate_report` 组织 Prompt 调用可替换 LLM，生成研报与 citations。
-  10. `persist_memory` 抽取可复用偏好写回长期记忆。
-  11. `finalize_response` 汇总报告、引用、错误及 `workflow_steps` 并返回 API。
+  - 历史研究语料（`research_chunks`）与用户记忆（`user_memory`）以及会话真相库 turn/report/summary。
+- 主链路（`POST /v1/conversation/{conversation_id}/message`）:
+  1. API 路由接收消息并注入/透传 `trace_id`。
+  2. `ConversationService.send_message` 执行 `prepare_turn`（CAS + 幂等 + version 分配）。
+  3. `action=auto` 时根据历史报告存在性与关键词路由到 `chat/rewrite/regenerate`。
+  4. `chat`：基于“摘要 + 最近 turns + 最新报告”构造 prompt，直接调用 LLM 生成对话回复。
+  5. `rewrite_report`：读取目标报告（或最新报告）并按用户要求改写，生成新报告版本。
+  6. `regenerate_report`：调用 `ResearchGraphRunner.arun` 执行完整 9 节点流程并产出新报告版本。
+  7. 事务写入 `conversation_turn`，必要时写入 `conversation_report`，并更新 `idempotency_request=completed`。
+  8. 刷新 `conversation_context_summary`（超过窗口后增量压缩历史轮次）。
+- 兼容链路（`POST /v1/research/query`）:
+  - 直接调用 `ConversationService.run_research_turn`，内部固定走 `regenerate_report` 路径并复用同一套一致性语义。
 - 控制/调度流程:
   - 主调度引擎为 LangGraph `StateGraph`（线性 9 节点）。
   - MCP 采集由 `MCPSignalSubgraphRunner.arun` 一次执行完成；内部使用 `asyncio.gather` 并行调度各 server Agent。
-  - `MCP_MAX_ROUNDS` 当前作为 Agent 的工具调用预算提示注入 prompt；工具是否调用由 LLM 按 query/symbols 自主决策，不强制全量工具调用。
-  - 主流程关键调用通过 tenacity 重试：检索（最多 2 次）、报告生成（最多 3 次）。
-  - 每个主节点通过 `_run_tracked_node` 记录 `status/duration_ms`，返回前端脉冲轨道。
-  - MCP 终止语义简化为：`agent_completed`、`no_tools`、`agent_failed`。
+  - `MCP_MAX_ROUNDS` 作为 Agent 的工具调用预算提示注入 prompt；工具是否调用由 LLM 按 query/symbols 自主决策。
+  - 检索/报告生成通过 tenacity 重试；节点执行由 `_run_tracked_node` 统一记录耗时。
 
-### 请求时序（`/v1/research/query`）
+### 请求时序（`/v1/conversation/{conversation_id}/message`）
 ```mermaid
 sequenceDiagram
     participant U as User
-    participant API as FastAPI /v1/research/query
+    participant API as FastAPI /v1/conversation/{id}/message
     participant MW as trace middleware
+    participant CS as ConversationService
+    participant TS as SQLiteTruthStore
     participant G as ResearchGraphRunner
-    participant MEM as MemoryService
-    participant MCP as MCPSignalAgentRunner
-    participant ADP as MultiServerMCPClient
-    participant AG as create_agent
-    participant RET as ResearchService
-    participant MIL as MilvusStore
     participant LLM as ReportAgent+LLM
 
-    U->>API: QueryRequest(user_id, query, task_context)
+    U->>API: ConversationMessageRequest(message, action, expected_version)
     API->>MW: 进入请求
     MW->>MW: 生成/透传 trace_id
-    MW->>G: graph_runner.arun(..., trace_id)
-    G->>MEM: load_user_memory
-    MEM->>MIL: query_user_memory
-    G->>MCP: collect_signals_via_mcp
-    MCP->>ADP: discover tools by server
-    ADP-->>MCP: tools
-    MCP->>AG: create_agent + ainvoke (parallel per server)
-    AG-->>MCP: AI/Tool messages
-    MCP-->>G: raw_signals + errors
-    G->>RET: normalize_signals + ingest_signals
-    RET->>MIL: upsert_research_chunks
-    G->>RET: retrieve(query, symbols)
-    RET->>MIL: search_research_chunks
-    RET-->>G: RetrievedChunk[]
-    G->>G: analyze_signals
-    G->>LLM: generate_report(payload)
-    LLM-->>G: report + citations
-    G->>MEM: persist_report_memory
-    MEM->>MIL: upsert_user_memory
-    G-->>MW: QueryResponse(workflow_steps)
+    MW->>CS: send_message(...)
+    CS->>TS: prepare_turn(CAS + idempotency)
+    alt action=chat
+        CS->>LLM: invoke(summary + recent turns + latest report)
+        LLM-->>CS: assistant_message
+    else action=rewrite_report
+        CS->>TS: get_report(target/latest)
+        CS->>LLM: invoke(rewrite prompt)
+        LLM-->>CS: rewritten report
+    else action=regenerate_report
+        CS->>G: arun(...)
+        G-->>CS: report + citations + workflow_steps
+    end
+    CS->>TS: save_turn_result(+optional report version)
+    CS->>TS: update_idempotency_response
+    CS->>TS: upsert_context_summary(optional)
+    CS-->>MW: ConversationMessageResponse
     MW-->>API: 附加 X-Trace-Id
-    API-->>U: report/citations/trace_id/errors/workflow_steps
+    API-->>U: action_taken/assistant_message/report?/workflow_steps
 ```
 
 ### 前端交互链路（`Dashboard`）
-- `DashboardPage` 将用户输入组装为 `QueryRequest` 并调用 `queryResearch`。
-- 返回后把 `workflow_steps` 映射到 `BASE_WORKFLOW`，展示 9 节点状态与耗时。
-- 报告渲染支持基础 Markdown（标题、列表、代码块、表格、引用块）。
-- 若报告包含 `<think>...</think>`，前端会拆分显示“推理草稿”和“正式报告”。
+- `DashboardPage` 默认通过 `sendConversationMessage` 调用会话统一入口，不再局限单次 `query`。
+- 页面采用四块主视图：`Message Composer`、`Dialogue`、`Timeline`、`Version Tape`。
+- 支持 `action` 选择（auto/chat/rewrite/regenerate）、`expected_version` 回填、`from_turn_id` 分支续写。
+- 会话冲突（409）会解析 `conversation_version_conflict/request_in_flight` 并提示“按最新版本重试”。
+- 报告区支持版本选择与回放，chat 场景下可只展示助手回复；报告仍支持 `<think>` 分离渲染。
 
 ### 关键配置
 - 配置文件:
@@ -164,37 +172,55 @@ sequenceDiagram
   - LLM 可替换配置：`LLM_PROVIDER`、`LLM_MODEL`、`LLM_TEMPERATURE`、`LLM_TIMEOUT_SECONDS`、`MINIMAX_*`、`OPENAI_*`。
   - Embedding：`EMBEDDING_PROVIDER=zhipu`、`ZHIPU_EMBEDDING_MODEL`、`ZHIPU_EMBEDDING_BATCH_SIZE`、`ZHIPUAI_API_KEY`。
   - 向量库：`MILVUS_*`、`VECTOR_DIM`。
-  - 记忆：`MEM0_ENABLED`、`MEM0_MODE`、`MEM0_OSS_COLLECTION`、`MEM0_API_KEY`、`MEM0_ORG_ID`、`MEM0_PROJECT_ID`、`ZHIPU_OPENAI_BASE_URL`。
+  - 记忆：`MEM0_ENABLED`、`MEM0_MODE`、`MEM0_OSS_COLLECTION`、`MEM0_API_KEY`、`MEM0_ORG_ID`、`MEM0_PROJECT_ID`。
+  - 会话持久化：`CONVERSATION_STORE_PATH`（SQLite 真相库路径）。
+  - 短期会话缓存：`SESSION_STORE_BACKEND`（`memory|redis`）、`REDIS_URL`、`SESSION_MEMORY_TTL_SECONDS`、`SESSION_MEMORY_MAX_ITEMS`。
   - MCP: `MCP_CONFIG_PATH`（默认 `.mcp.json`，Claude Code 风格 `mcpServers`）、`MCP_MAX_ROUNDS`（Agent 工具调用预算提示）。
   - 报告合规：`REPORT_DISCLAIMER`（报告结尾免责声明文案）。
 - 运行环境约束:
   - `VECTOR_DIM` 必须与 embedding 输出维度一致，否则写库前报错。
   - 智谱接口单次最多 64 条 input，已在 `BatchedZhipuAIEmbeddings` 中强制分批。
   - MCP 服务可达性受网络与工具参数影响，建议先执行验证脚本。
+  - 若开启 Redis 会话缓存但依赖不可用，会自动回退内存缓存。
   - 若开启文件日志，运行账户需具备 `LOG_FILE_PATH` 父目录写权限。
 
 ### 运行流程
 - 运行步骤:
-  1. 配置 `.env`（至少填充 MiniMax、MCP、可选 Zhipu/Mem0 凭据）。
+  1. 配置 `.env`（至少填充 MiniMax、MCP、会话存储路径，可选 Zhipu/Mem0/Redis）。
   2. 执行 `uv run python scripts/init_milvus.py` 初始化集合。
   3. 可选执行 `uv run python scripts/verify_mcp_servers.py` 验证 MCP 可用性。
   4. 可选执行 `uv run python scripts/inspect_mcp.py` 生成 MCP 全量巡检报告（逐工具入参 + 原始响应）。
   5. 执行 `uv run python main.py` 启动后端并通过 `/docs` 调试。
   6. 执行 `npm --prefix frontend install && npm --prefix frontend run dev` 启动前端控制台。
 - 异常/边界处理:
+  - CAS 版本冲突返回 `409 conversation_version_conflict`，前端可刷新版本后重试。
+  - 同一 `request_id` 处理中返回 `409 request_in_flight`；完成后重试会命中幂等缓存。
+  - `rewrite_report` 在无可用报告版本时返回 404；`from_turn_id` 不存在时 resume/message 返回 404。
   - MCP 未配置或无工具可用时返回 `no_tools`，主流程走历史检索降级生成报告。
   - Agent 执行异常返回 `agent_failed`；若最终 JSON 解析失败但有 ToolMessage 提取结果，仍会继续使用可提取信号。
   - Milvus 不可用时可降级内存存储（受 `MILVUS_ALLOW_FALLBACK` 控制）。
-  - 未配置 LLM 密钥或 LLM 调用失败时，`/v1/research/query` 直接返回 500（硬失败）；未配置智谱密钥时降级哈希向量。
+  - 未配置 LLM 密钥或 LLM 调用失败时，请求返回 500（硬失败）；未配置智谱密钥时降级哈希向量。
   - Mem0 初始化或调用失败仅告警，不阻断主流程。
 - 观测与日志:
   - 日志由 `app/config/logging.py` 统一初始化，注入 `trace_id/task_id/user_id/component/round`。
   - API 层通过 `X-Trace-Id` 实现请求链路关联。
-  - MCP 采集在 `mcp.agent` 组件记录工具数与信号数，便于定位 Agent 工具调用质量。
+  - 会话层会记录 `turn.accepted/turn.completed/turn.failed` 事件，可用于恢复与排障。
+  - outbox 投影器记录失败重试次数并在超阈值后标记 `failed`。
   - 文件日志支持“按天轮转 + 单文件超限切分 + 超期清理”。
   - LangSmith 通过 `configure_langsmith` 以环境变量控制开启。
 
 ## 改动概要/变更记录
+### 2026-03-04 00:11:08
+- 本次新增/更新要点:
+  - 架构主入口从“单次 query”扩展为“会话消息驱动”：新增 `POST /v1/conversation/{conversation_id}/message`，支持 `auto/chat/rewrite_report/regenerate_report`。
+  - 会话真相库新增报告版本与摘要压缩能力：`conversation_report`、`conversation_context_summary`，并补齐 turn 结构字段（`assistant_message/intent/turn_type/parent_turn_id/report_id`）。
+  - 新增会话读取 API：`GET /v1/conversation/{id}`、`GET /v1/conversation/{id}/turns`、`GET /v1/conversation/{id}/turns/{turn_id}`、`GET /v1/conversation/{id}/reports`、`GET /v1/conversation/{id}/reports/{report_id}`，支持冷重启恢复与历史回放。
+  - 运行时链路补充 `ConversationService + OutboxProjector + SessionStore`，明确“会话真相强一致、Milvus/Mem0 最终一致”的双写策略。
+  - 前端 Dashboard 交互链路同步为持续对话模式：Message Composer + Dialogue + Timeline + Version Tape。
+- 变更动机/需求来源:
+  - 来源于当前会话需求：用户要求将“单次 query”重构为可持续对话，支持围绕首版研报继续交流，并在对话中触发改写/重跑报告。
+- 当前更新时间: 2026-03-04 00:11:08
+
 ### 2026-03-03 16:30:35
 - 本次新增/更新要点:
   - MCP 子图执行模型更新为“按 server 并行 Agent”：多 MCP 配置会拆分为多条并发 `create_agent(...).ainvoke(...)` 任务后统一归并。

@@ -93,15 +93,27 @@ class ResearchGraphRunner:
         query: str,
         task_context: dict[str, Any] | None = None,
         trace_id: str | None = None,
+        conversation_id: str | None = None,
+        turn_id: str | None = None,
+        request_id: str | None = None,
+        conversation_version: int | None = None,
     ) -> QueryResponse:
         """执行研报流程并返回 API 响应。"""
 
         task_id = str(uuid4())
         final_trace_id = trace_id or str(uuid4())
+        final_conversation_id = conversation_id or f"default:{user_id}"
+        final_turn_id = turn_id or "turn-1"
+        final_request_id = request_id or str(uuid4())
+        final_conversation_version = conversation_version or 1
         initial_state: ResearchState = {
             "user_id": user_id,
             "query": query,
             "task_context": task_context,
+            "conversation_id": final_conversation_id,
+            "turn_id": final_turn_id,
+            "request_id": final_request_id,
+            "conversation_version": final_conversation_version,
             "task_id": task_id,
             "trace_id": final_trace_id,
             "errors": [],
@@ -127,6 +139,10 @@ class ResearchGraphRunner:
             report=output.get("final_report", "未能生成报告，请稍后重试。"),
             citations=output.get("citations", []),
             trace_id=final_trace_id,
+            conversation_id=final_conversation_id,
+            turn_id=final_turn_id,
+            request_id=final_request_id,
+            conversation_version=final_conversation_version,
             errors=output.get("errors", []),
             workflow_steps=output.get("workflow_steps", []),
         )
@@ -137,6 +153,10 @@ class ResearchGraphRunner:
         query: str,
         task_context: dict[str, Any] | None = None,
         trace_id: str | None = None,
+        conversation_id: str | None = None,
+        turn_id: str | None = None,
+        request_id: str | None = None,
+        conversation_version: int | None = None,
     ) -> QueryResponse:
         """同步包装器（兼容旧调用方）。"""
 
@@ -146,6 +166,10 @@ class ResearchGraphRunner:
                 query=query,
                 task_context=task_context,
                 trace_id=trace_id,
+                conversation_id=conversation_id,
+                turn_id=turn_id,
+                request_id=request_id,
+                conversation_version=conversation_version,
             )
         )
 
@@ -159,10 +183,18 @@ class ResearchGraphRunner:
 
         def _node_logic() -> ResearchState:
             user_id = state["user_id"]
+            conversation_id = state.get("conversation_id") or f"default:{user_id}"
             with log_context(component="graph.load_user_memory"):
                 logger.info("节点开始")
-                self.memory_service.save_task_context(user_id=user_id, task_context=state.get("task_context"))
-                profile = self.memory_service.load_memory_profile(user_id=user_id)
+                self.memory_service.save_task_context(
+                    user_id=user_id,
+                    conversation_id=conversation_id,
+                    task_context=state.get("task_context"),
+                )
+                profile = self.memory_service.load_memory_profile(
+                    user_id=user_id,
+                    conversation_id=conversation_id,
+                )
                 logger.info(
                     "节点完成 long_term=%s session=%s",
                     len(profile.get("long_term_memory", [])),
@@ -397,6 +429,9 @@ class ResearchGraphRunner:
                     user_id=state["user_id"],
                     query=state["query"],
                     report=state.get("final_report", ""),
+                    conversation_id=state.get("conversation_id"),
+                    turn_id=state.get("turn_id"),
+                    request_id=state.get("request_id"),
                 )
                 logger.info("节点完成")
             return {}

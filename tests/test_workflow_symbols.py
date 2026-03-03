@@ -8,15 +8,23 @@ from app.graph.workflow import ResearchGraphRunner
 
 
 class _DummyMemoryService:
-    def save_task_context(self, user_id: str, task_context):  # pragma: no cover - not used in this suite
-        del user_id, task_context
+    def save_task_context(self, user_id: str, conversation_id: str, task_context):  # pragma: no cover - not used
+        del user_id, conversation_id, task_context
 
-    def load_memory_profile(self, user_id: str):  # pragma: no cover - not used in this suite
-        del user_id
+    def load_memory_profile(self, user_id: str, conversation_id: str | None = None):  # pragma: no cover
+        del user_id, conversation_id
         return {}
 
-    def persist_report_memory(self, user_id: str, query: str, report: str):  # pragma: no cover - not used in this suite
-        del user_id, query, report
+    def persist_report_memory(  # pragma: no cover - not used in this suite
+        self,
+        user_id: str,
+        query: str,
+        report: str,
+        conversation_id: str | None = None,
+        turn_id: str | None = None,
+        request_id: str | None = None,
+    ):
+        del user_id, query, report, conversation_id, turn_id, request_id
 
 
 class _DummyMCPSubgraph:
