@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import re
 from collections import Counter
 from time import perf_counter
@@ -71,7 +72,7 @@ class ResearchGraphRunner:
 
         return builder.compile()
 
-    def run(
+    async def arun(
         self,
         user_id: str,
         query: str,
@@ -100,7 +101,7 @@ class ResearchGraphRunner:
             component="graph.runner",
         ):
             logger.info("工作流开始 query_len=%s", len(query))
-            output = self.graph.invoke(initial_state)
+            output = await self.graph.ainvoke(initial_state)
             logger.info(
                 "工作流结束 citations=%s errors=%s",
                 len(output.get("citations", [])),
@@ -113,6 +114,24 @@ class ResearchGraphRunner:
             trace_id=final_trace_id,
             errors=output.get("errors", []),
             workflow_steps=output.get("workflow_steps", []),
+        )
+
+    def run(
+        self,
+        user_id: str,
+        query: str,
+        task_context: dict[str, Any] | None = None,
+        trace_id: str | None = None,
+    ) -> QueryResponse:
+        """同步包装器（兼容旧调用方）。"""
+
+        return asyncio.run(
+            self.arun(
+                user_id=user_id,
+                query=query,
+                task_context=task_context,
+                trace_id=trace_id,
+            )
         )
 
     # ===== 节点定义 =====
@@ -168,16 +187,16 @@ class ResearchGraphRunner:
 
         return self._run_tracked_node(state, node_id="parse_intent_scope", handler=_node_logic)
 
-    def collect_signals_via_mcp(self, state: ResearchState) -> ResearchState:
+    async def collect_signals_via_mcp(self, state: ResearchState) -> ResearchState:
         """节点目标：通过 MCP 拉取信号。
 
         前置条件：state 已包含 `task_id`、`query`、`symbols`。
         状态产出：`raw_signals`、`errors`。
         """
 
-        def _node_logic() -> ResearchState:
+        async def _node_logic() -> ResearchState:
             with log_context(component="graph.collect_signals"):
-                result = self.mcp_subgraph.run(
+                result = await self.mcp_subgraph.arun(
                     user_id=state["user_id"],
                     query=state["query"],
                     task_id=state["task_id"],
@@ -185,39 +204,24 @@ class ResearchGraphRunner:
                     errors=state.get("errors", []),
                 )
                 logger.info(
-                    "节点完成 raw_signals=%s errors=%s termination=%s round=%s",
+                    "节点完成 raw_signals=%s errors=%s tools=%s termination=%s",
                     len(result.get("raw_signals", [])),
                     len(result.get("errors", [])),
+                    int(result.get("mcp_tools_count", 0)),
                     result.get("mcp_termination_reason", ""),
-                    result.get("mcp_round", 0),
                 )
             return {
                 "raw_signals": result.get("raw_signals", []),
                 "errors": result.get("errors", []),
-                "mcp_round": result.get("mcp_round", 0),
-                "mcp_max_rounds": result.get("mcp_max_rounds", 0),
-                "transient_grace_used": result.get("transient_grace_used", False),
-                "mcp_raw_plan_calls": result.get("mcp_raw_plan_calls", []),
-                "mcp_filtered_plan_calls": result.get("mcp_filtered_plan_calls", []),
-                "mcp_admissible_calls_count": result.get("mcp_admissible_calls_count", 0),
-                "mcp_filtered_out_calls": result.get("mcp_filtered_out_calls", []),
-                "mcp_ban_reasons": result.get("mcp_ban_reasons", []),
-                "mcp_active_constraints_summary": result.get("mcp_active_constraints_summary", []),
-                "mcp_round_rows": result.get("mcp_round_rows", []),
-                "mcp_round_successes": result.get("mcp_round_successes", []),
-                "mcp_round_failures": result.get("mcp_round_failures", []),
-                "mcp_failure_classes": result.get("mcp_failure_classes", {}),
-                "mcp_rules": result.get("mcp_rules", []),
-                "mcp_new_rules_added": result.get("mcp_new_rules_added", False),
-                "mcp_new_unique_signal_count": result.get("mcp_new_unique_signal_count", 0),
-                "mcp_signal_hash_set": result.get("mcp_signal_hash_set", []),
-                "mcp_raw_plan_hash_history": result.get("mcp_raw_plan_hash_history", []),
-                "mcp_no_progress_streak": result.get("mcp_no_progress_streak", 0),
-                "mcp_should_continue": result.get("mcp_should_continue", False),
+                "mcp_tools_count": int(result.get("mcp_tools_count", 0)),
                 "mcp_termination_reason": result.get("mcp_termination_reason", ""),
             }
 
-        return self._run_tracked_node(state, node_id="collect_signals_via_mcp", handler=_node_logic)
+        return await self._run_tracked_node_async(
+            state,
+            node_id="collect_signals_via_mcp",
+            handler=_node_logic,
+        )
 
     def normalize_and_index(self, state: ResearchState) -> ResearchState:
         """节点目标：标准化信号并入库。
@@ -401,6 +405,20 @@ class ResearchGraphRunner:
         start = perf_counter()
         try:
             update = handler() or {}
+        except Exception:
+            state["workflow_steps"] = self._append_workflow_step(state, node_id=node_id, status="error", start=start)
+            raise
+        return {
+            **update,
+            "workflow_steps": self._append_workflow_step(state, node_id=node_id, status="success", start=start),
+        }
+
+    async def _run_tracked_node_async(self, state: ResearchState, node_id: str, handler) -> ResearchState:
+        """异步执行节点并记录真实耗时与状态。"""
+
+        start = perf_counter()
+        try:
+            update = await handler() or {}
         except Exception:
             state["workflow_steps"] = self._append_workflow_step(state, node_id=node_id, status="error", start=start)
             raise

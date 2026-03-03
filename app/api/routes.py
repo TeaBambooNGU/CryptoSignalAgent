@@ -24,7 +24,7 @@ logger = get_logger(__name__)
 
 
 @router.post("/research/query", response_model=QueryResponse)
-def research_query(
+async def research_query(
     payload: QueryRequest,
     request: Request,
     runtime: AppRuntime = Depends(get_runtime),
@@ -37,7 +37,7 @@ def research_query(
     try:
         with log_context(trace_id=trace_id, user_id=payload.user_id, component="api.research_query"):
             logger.info("接收研报请求")
-            return runtime.graph_runner.run(
+            return await runtime.graph_runner.arun(
                 user_id=payload.user_id,
                 query=payload.query,
                 task_context=payload.task_context,

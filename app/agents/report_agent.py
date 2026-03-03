@@ -9,7 +9,9 @@ from __future__ import annotations
 from collections import Counter
 from typing import Any
 
-from app.agents.llm.base import BaseLLMClient
+from langchain_core.language_models.chat_models import BaseChatModel
+from langchain_core.messages import HumanMessage, SystemMessage
+
 from app.config.settings import Settings
 from app.models.schemas import Citation, NormalizedSignal, ReportGenerationInput, ReportGenerationOutput, RetrievedChunk
 
@@ -17,9 +19,9 @@ from app.models.schemas import Citation, NormalizedSignal, ReportGenerationInput
 class ReportAgent:
     """报告生成服务。"""
 
-    def __init__(self, settings: Settings, llm_client: BaseLLMClient) -> None:
+    def __init__(self, settings: Settings, llm: BaseChatModel) -> None:
         self.settings = settings
-        self.llm_client = llm_client
+        self.llm = llm
 
     def generate(self, payload: ReportGenerationInput) -> ReportGenerationOutput:
         """生成结构化研报。"""
@@ -27,7 +29,13 @@ class ReportAgent:
         system_prompt = self._build_system_prompt()
         user_prompt = self._build_user_prompt(payload)
 
-        report_text = self.llm_client.generate(system_prompt=system_prompt, user_prompt=user_prompt)
+        response = self.llm.invoke(
+            [
+                SystemMessage(content=system_prompt),
+                HumanMessage(content=user_prompt),
+            ]
+        )
+        report_text = self._extract_text(getattr(response, "content", response))
         citations = self._build_citations(payload.retrieved_docs)
         final_report = self._append_disclaimer(report_text)
 
@@ -128,3 +136,19 @@ class ReportAgent:
         if not cleaned:
             cleaned = "当前证据不足，建议补充数据后再执行结论判断。"
         return f"{cleaned}\n\n{self.settings.report_disclaimer}"
+
+    @staticmethod
+    def _extract_text(content: Any) -> str:
+        if isinstance(content, str):
+            return content.strip()
+        if isinstance(content, list):
+            chunks: list[str] = []
+            for item in content:
+                if isinstance(item, dict):
+                    text = item.get("text")
+                    if isinstance(text, str):
+                        chunks.append(text)
+                        continue
+                chunks.append(str(item))
+            return "".join(chunks).strip()
+        return str(content).strip()

@@ -1,17 +1,20 @@
-"""MCP 子图规则与判停测试。"""
+"""MCP Agent 执行器测试。"""
 
 from __future__ import annotations
 
+import asyncio
 import unittest
 from typing import Any
 
-from app.agents.llm.base import BaseLLMClient
+from langchain_core.messages import AIMessage, ToolMessage
+
 from app.graph.mcp_subgraph import MCPSignalSubgraphRunner
 
 
-class _DummyLLM(BaseLLMClient):
-    def generate(self, system_prompt: str, user_prompt: str, metadata=None) -> str:
-        return '{"calls":[]}'
+class _DummyLLM:
+    def invoke(self, messages):
+        del messages
+        return AIMessage(content="{}")
 
 
 class _FakeTool:
@@ -19,9 +22,6 @@ class _FakeTool:
         self.name = name
         self.description = description
         self.args_schema = schema
-
-    async def ainvoke(self, arguments: dict[str, Any]):
-        return ([{"type": "text", "text": '{"symbol":"BTC","value":{"k":"v"}}'}], None)
 
 
 class _FakeMCPClient:
@@ -44,146 +44,23 @@ class _FakeMCPClient:
         ]
 
 
-class MCPSubgraphRuleTestCase(unittest.TestCase):
-    def test_apply_rules_respects_priority_and_injects_defaults(self) -> None:
-        raw_calls = [
-            {"server": "s1", "tool_name": "tool_banned", "arguments": {"market": "spot"}, "reason": "1"},
-            {"server": "s1", "tool_name": "tool_sig", "arguments": {"market": "spot"}, "reason": "2"},
-            {"server": "s1", "tool_name": "tool_ok", "arguments": {"market": "spot"}, "reason": "3"},
-        ]
-        sig_banned = MCPSignalSubgraphRunner.build_call_signature(
-            server="s1",
-            tool_name="tool_sig",
-            arguments={"market": "spot", "page": 1},
-        )
-        rules = [
-            {"type": "tool_ban", "server": "s1", "tool_name": "tool_banned"},
-            {"type": "call_signature_ban", "server": "s1", "tool_name": "tool_sig", "call_signature": sig_banned},
-        ]
-        tool_schemas = {
-            "s1": {
-                "tool_banned": {"type": "object", "properties": {"market": {"type": "string"}}, "required": ["market"]},
-                "tool_sig": {
-                    "type": "object",
-                    "properties": {
-                        "market": {"type": "string"},
-                        "page": {"type": "integer", "default": 1},
-                    },
-                    "required": ["market", "page"],
-                },
-                "tool_ok": {
-                    "type": "object",
-                    "properties": {
-                        "market": {"type": "string"},
-                        "limit": {"type": "integer"},
-                    },
-                    "required": ["market", "limit"],
-                },
-            }
-        }
+class _FakeAgent:
+    def __init__(self, messages: list[Any], *, sync_supported: bool = True) -> None:
+        self._messages = messages
+        self._sync_supported = sync_supported
 
-        result = MCPSignalSubgraphRunner.mcp_apply_rules_pure(
-            raw_plan_calls=raw_calls,
-            rules=rules,
-            tool_schemas=tool_schemas,
-        )
+    def invoke(self, payload: dict[str, Any]):
+        del payload
+        if not self._sync_supported:
+            raise NotImplementedError("StructuredTool does not support sync invocation.")
+        return {"messages": self._messages}
 
-        self.assertEqual(len(result["filtered_plan_calls"]), 1)
-        self.assertEqual(result["filtered_plan_calls"][0]["tool_name"], "tool_ok")
-        self.assertEqual(result["filtered_plan_calls"][0]["arguments"]["limit"], 50)
-        self.assertEqual(len(result["filtered_out_calls"]), 2)
-        reasons = {item["reason"] for item in result["filtered_out_calls"]}
-        self.assertEqual(reasons, {"tool_ban", "call_signature_ban"})
+    async def ainvoke(self, payload: dict[str, Any]):
+        del payload
+        return {"messages": self._messages}
 
-    def test_raw_plan_hash_is_canonical_and_ignores_reason(self) -> None:
-        plan_a = [
-            {
-                "server": "s1",
-                "tool_name": "tool",
-                "arguments": {"b": 2, "a": 1},
-                "reason": "first",
-            }
-        ]
-        plan_b = [
-            {
-                "server": "s1",
-                "tool_name": "tool",
-                "arguments": {"a": 1, "b": 2},
-                "reason": "second",
-            }
-        ]
-        self.assertEqual(
-            MCPSignalSubgraphRunner.build_raw_plan_hash(plan_a),
-            MCPSignalSubgraphRunner.build_raw_plan_hash(plan_b),
-        )
 
-    def test_signal_hash_excludes_ref_and_publish_time(self) -> None:
-        signal_a = {
-            "symbol": "BTC",
-            "source": "mcp:test",
-            "signal_type": "news",
-            "value": {"title": "ETF"},
-            "raw_ref": "https://a.example",
-            "published_at": "2026-03-02T00:00:00Z",
-            "internal_id": "id-a",
-        }
-        signal_b = {
-            "symbol": "BTC",
-            "source": "mcp:test",
-            "signal_type": "news",
-            "value": {"title": "ETF"},
-            "raw_ref": "https://b.example",
-            "published_at": "2026-03-03T00:00:00Z",
-            "internal_id": "id-b",
-        }
-        self.assertEqual(
-            MCPSignalSubgraphRunner.build_signal_hash(signal_a),
-            MCPSignalSubgraphRunner.build_signal_hash(signal_b),
-        )
-
-    def test_should_continue_hits_repeated_blind_plan(self) -> None:
-        runner = MCPSignalSubgraphRunner(
-            llm_client=_DummyLLM(),
-            mcp_connections={},
-            max_rounds=4,
-            mcp_client_factory=_FakeMCPClient,
-        )
-        decision = runner.mcp_should_continue(
-            {
-                "mcp_round": 2,
-                "mcp_max_rounds": 4,
-                "mcp_admissible_calls_count": 0,
-                "mcp_round_successes": [],
-                "mcp_failure_classes": {
-                    "deterministic_failures_exist": False,
-                    "transient_failures_exist": False,
-                },
-                "mcp_new_rules_added": False,
-                "mcp_new_unique_signal_count": 0,
-                "mcp_no_progress_streak": 1,
-                "transient_grace_used": False,
-                "mcp_plan_round_stats": [
-                    {"raw_plan_hash": "same", "filtered_plan_count": 0},
-                    {"raw_plan_hash": "same", "filtered_plan_count": 0},
-                ],
-                "mcp_raw_plan_hash_history": ["same", "same"],
-            }
-        )
-        self.assertFalse(decision["mcp_should_continue"])
-        self.assertEqual(decision["mcp_termination_reason"], "repeated_blind_plan")
-
-    def test_prepare_discovers_tools_catalog(self) -> None:
-        runner = MCPSignalSubgraphRunner(
-            llm_client=_DummyLLM(),
-            mcp_connections={"srv": {"transport": "streamable_http", "url": "http://localhost:3000/mcp"}},
-            max_rounds=4,
-            mcp_client_factory=_FakeMCPClient,
-        )
-        prepared = runner.mcp_prepare({"errors": [], "raw_signals": []})
-        self.assertEqual(prepared["mcp_tool_catalog"]["srv"][0]["name"], "get_news")
-        self.assertIn("limit", prepared["mcp_tool_schemas"]["srv"]["get_news"]["properties"])
-        self.assertIn("srv|get_news", prepared["mcp_runtime_tools"])
-
+class MCPAgentRunnerTestCase(unittest.TestCase):
     def test_build_connections_from_settings(self) -> None:
         settings_servers = (
             {
@@ -206,6 +83,112 @@ class MCPSubgraphRuleTestCase(unittest.TestCase):
         self.assertEqual(connections["s1"]["url"], "http://localhost:3000/mcp")
         self.assertEqual(connections["s2"]["command"], "python")
         self.assertEqual(connections["s2"]["args"], ["server.py"])
+
+    def test_run_collects_rows_from_tool_messages_and_payload(self) -> None:
+        messages = [
+            ToolMessage(name="srv_get_news", content='{"symbol":"BTC","title":"ETF"}', tool_call_id="call-1"),
+            AIMessage(
+                content=(
+                    '{"raw_signals":[{"symbol":"ETH","source":"mcp:srv","signal_type":"price",'
+                    '"value":{"price":3000},"raw_ref":"https://example.com"}],"errors":["agent-warning"]}'
+                )
+            ),
+        ]
+
+        runner = MCPSignalSubgraphRunner(
+            llm=_DummyLLM(),
+            mcp_connections={"srv": {"transport": "streamable_http", "url": "http://localhost:3000/mcp"}},
+            mcp_client_factory=_FakeMCPClient,
+            agent_factory=lambda **kwargs: _FakeAgent(messages),
+        )
+
+        result = asyncio.run(
+            runner.arun(
+                user_id="u1",
+                query="分析 BTC ETH",
+                task_id="task-1",
+                symbols=["BTC", "ETH"],
+                errors=[],
+            )
+        )
+
+        self.assertEqual(result["mcp_tools_count"], 1)
+        self.assertEqual(result["mcp_termination_reason"], "agent_completed")
+        self.assertIn("agent-warning", result["errors"])
+        self.assertGreaterEqual(len(result["raw_signals"]), 2)
+        symbols = {item["symbol"] for item in result["raw_signals"]}
+        self.assertIn("BTC", symbols)
+        self.assertIn("ETH", symbols)
+
+    def test_run_returns_parse_error_when_no_structured_output(self) -> None:
+        messages = [AIMessage(content="采集完成")]
+        runner = MCPSignalSubgraphRunner(
+            llm=_DummyLLM(),
+            mcp_connections={"srv": {"transport": "streamable_http", "url": "http://localhost:3000/mcp"}},
+            mcp_client_factory=_FakeMCPClient,
+            agent_factory=lambda **kwargs: _FakeAgent(messages),
+        )
+
+        result = asyncio.run(
+            runner.arun(
+                user_id="u1",
+                query="分析 BTC",
+                task_id="task-2",
+                symbols=["BTC"],
+                errors=[],
+            )
+        )
+
+        self.assertEqual(result["raw_signals"], [])
+        self.assertTrue(any("Agent 结论解析失败" in item for item in result["errors"]))
+
+    def test_run_handles_missing_servers(self) -> None:
+        runner = MCPSignalSubgraphRunner(
+            llm=_DummyLLM(),
+            mcp_connections={},
+            mcp_client_factory=_FakeMCPClient,
+            agent_factory=lambda **kwargs: _FakeAgent([]),
+        )
+
+        result = asyncio.run(
+            runner.arun(
+                user_id="u1",
+                query="分析 BTC",
+                task_id="task-3",
+                symbols=["BTC"],
+                errors=[],
+            )
+        )
+
+        self.assertEqual(result["raw_signals"], [])
+        self.assertEqual(result["mcp_tools_count"], 0)
+        self.assertEqual(result["mcp_termination_reason"], "no_tools")
+        self.assertTrue(any("未配置 MCP_SERVERS" in item for item in result["errors"]))
+
+    def test_run_uses_async_agent_when_sync_not_supported(self) -> None:
+        messages = [
+            ToolMessage(name="srv_get_news", content='{"symbol":"BTC","title":"ETF"}', tool_call_id="call-1"),
+            AIMessage(content='{"raw_signals":[],"errors":[]}'),
+        ]
+        runner = MCPSignalSubgraphRunner(
+            llm=_DummyLLM(),
+            mcp_connections={"srv": {"transport": "streamable_http", "url": "http://localhost:3000/mcp"}},
+            mcp_client_factory=_FakeMCPClient,
+            agent_factory=lambda **kwargs: _FakeAgent(messages, sync_supported=False),
+        )
+
+        result = asyncio.run(
+            runner.arun(
+                user_id="u1",
+                query="分析 BTC",
+                task_id="task-4",
+                symbols=["BTC"],
+                errors=[],
+            )
+        )
+
+        self.assertEqual(result["mcp_termination_reason"], "agent_completed")
+        self.assertGreaterEqual(len(result["raw_signals"]), 1)
 
 
 if __name__ == "__main__":

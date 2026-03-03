@@ -5,13 +5,22 @@ from __future__ import annotations
 import os
 import unittest
 from importlib import reload
-from types import MethodType
 
 from fastapi.testclient import TestClient
 
 
 class APITestCase(unittest.TestCase):
     """覆盖核心接口的烟雾测试。"""
+
+    class _StubLLM:
+        def invoke(self, messages):
+            del messages
+            return "测试报告正文"
+
+    class _FailingLLM:
+        def invoke(self, messages):
+            del messages
+            raise RuntimeError("llm unavailable")
 
     @classmethod
     def setUpClass(cls) -> None:
@@ -34,16 +43,13 @@ class APITestCase(unittest.TestCase):
         cls.client = cls._client_cm.__enter__()
 
         runtime = cls._app.state.runtime
-        cls._original_llm_generate = runtime.report_agent.llm_client.generate
-        runtime.report_agent.llm_client.generate = MethodType(
-            lambda _self, system_prompt, user_prompt, metadata=None: "测试报告正文",
-            runtime.report_agent.llm_client,
-        )
+        cls._original_llm = runtime.report_agent.llm
+        runtime.report_agent.llm = cls._StubLLM()
 
     @classmethod
     def tearDownClass(cls) -> None:
         runtime = cls._app.state.runtime
-        runtime.report_agent.llm_client.generate = cls._original_llm_generate
+        runtime.report_agent.llm = cls._original_llm
         cls._client_cm.__exit__(None, None, None)
 
     def test_update_preferences_and_get_profile(self) -> None:
@@ -124,13 +130,8 @@ class APITestCase(unittest.TestCase):
 
     def test_research_query_returns_500_when_llm_unavailable(self) -> None:
         runtime = self._app.state.runtime
-        original_generate = runtime.report_agent.llm_client.generate
-        runtime.report_agent.llm_client.generate = MethodType(
-            lambda _self, system_prompt, user_prompt, metadata=None: (_ for _ in ()).throw(
-                RuntimeError("llm unavailable")
-            ),
-            runtime.report_agent.llm_client,
-        )
+        original_llm = runtime.report_agent.llm
+        runtime.report_agent.llm = self._FailingLLM()
         try:
             resp = self.client.post(
                 "/v1/research/query",
@@ -142,7 +143,7 @@ class APITestCase(unittest.TestCase):
             )
             self.assertEqual(resp.status_code, 500)
         finally:
-            runtime.report_agent.llm_client.generate = original_generate
+            runtime.report_agent.llm = original_llm
 
 
 if __name__ == "__main__":

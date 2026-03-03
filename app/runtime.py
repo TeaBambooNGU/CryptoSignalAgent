@@ -33,17 +33,17 @@ class AppRuntime:
             self.milvus_store.connect()
             logger.info("MilvusStore 初始化完成")
 
-            self.llm_client = create_llm_client(settings)
+            self.llm = create_llm_client(settings)
             self.memory_service = MemoryService(settings=settings, milvus_store=self.milvus_store)
             self.mcp_subgraph = MCPSignalSubgraphRunner(
-                llm_client=self.llm_client,
+                llm=self.llm,
                 mcp_connections=MCPSignalSubgraphRunner.build_connections_from_settings(settings.mcp_servers),
                 max_rounds=settings.mcp_max_rounds,
             )
             self.research_service = ResearchService(settings=settings, milvus_store=self.milvus_store)
             logger.info("核心服务初始化完成")
 
-            self.report_agent = ReportAgent(settings=settings, llm_client=self.llm_client)
+            self.report_agent = ReportAgent(settings=settings, llm=self.llm)
 
             self.graph_runner = ResearchGraphRunner(
                 memory_service=self.memory_service,

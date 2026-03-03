@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import unittest
 
+from langchain_openai import ChatOpenAI
+
 from app.agents.llm import create_llm_client
-from app.agents.llm.langchain_client import LangChainLLMClient
 from app.config.settings import Settings
 
 
@@ -16,9 +17,7 @@ class LLMFactoryTestCase(unittest.TestCase):
             minimax_api_key="test-key",
         )
         client = create_llm_client(settings)
-        self.assertIsInstance(client, LangChainLLMClient)
-        self.assertEqual(client.provider_name, "minimax")
-        self.assertEqual(client.llm.__class__.__name__, "ChatOpenAI")
+        self.assertIsInstance(client, ChatOpenAI)
 
     def test_create_minimax_client_requires_credentials(self) -> None:
         settings = Settings(
@@ -35,7 +34,7 @@ class LLMFactoryTestCase(unittest.TestCase):
             openai_base_url="https://api.openai.com/v1",
         )
         client = create_llm_client(settings)
-        self.assertIsInstance(client, LangChainLLMClient)
+        self.assertIsInstance(client, ChatOpenAI)
 
     def test_create_openai_client_requires_api_key(self) -> None:
         settings = Settings(
