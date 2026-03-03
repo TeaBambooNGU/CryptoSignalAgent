@@ -51,18 +51,19 @@ LANGSMITH_PROJECT=crypto-signal-agent
 LANGSMITH_ENDPOINT=https://api.smith.langchain.com
 
 # 可替换 LLM 客户端
+# 可选: minimax / openai
 LLM_PROVIDER=minimax
 LLM_MODEL=MiniMax-M2.5
 LLM_TEMPERATURE=0.2
 LLM_TIMEOUT_SECONDS=60
 
-# MiniMax(OpenAI-compatible)
+# MiniMax（OpenAI-compatible，使用 ChatOpenAI）
 MINIMAX_API_KEY=
-MINIMAX_BASE_URL=https://api.minimax.chat/v1
+MINIMAX_API_HOST=https://api.minimax.chat
 
-# 其他 OpenAI-compatible 供应商（可选）
-OPENAI_COMPATIBLE_API_KEY=
-OPENAI_COMPATIBLE_BASE_URL=
+# OpenAI（可选，当 LLM_PROVIDER=openai 时必填 OPENAI_API_KEY）
+OPENAI_API_KEY=
+OPENAI_BASE_URL=
 
 # Embedding（默认智谱）
 EMBEDDING_PROVIDER=zhipu

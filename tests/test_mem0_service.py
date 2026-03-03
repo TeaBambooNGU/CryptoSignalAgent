@@ -54,7 +54,7 @@ class Mem0ServiceCompatibilityTestCase(unittest.TestCase):
                 vector_dim=384,
                 llm_model="MiniMax-M2.5",
                 minimax_api_key="minimax-key",
-                minimax_base_url="https://api.minimax.chat/v1",
+                minimax_api_host="https://api.minimax.chat",
                 zhipu_embedding_model="embedding-3",
             )
             service = MemoryService(settings=settings, milvus_store=_DummyMilvusStore())

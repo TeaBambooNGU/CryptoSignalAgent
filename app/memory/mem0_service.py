@@ -100,19 +100,24 @@ class MemoryService:
             "embedding_dims": self.settings.vector_dim,
         }
 
-        # LLM 走工程现有 Minimax 配置；Mem0 侧用 openai provider 接入 openai-compatible endpoint。
-        llm_api_key = self.settings.minimax_api_key or self.settings.openai_compatible_api_key or os.getenv("OPENAI_API_KEY", "")
-        llm_base_url = self.settings.minimax_base_url or self.settings.openai_compatible_base_url or os.getenv("OPENAI_BASE_URL", "")
+        # LLM 默认优先复用工程 Minimax 凭据；其次使用 OpenAI 凭据。
+        llm_api_key = self.settings.minimax_api_key or self.settings.openai_api_key or os.getenv("OPENAI_API_KEY", "")
+        minimax_openai_base = (
+            f"{self.settings.minimax_api_host.rstrip('/')}/v1"
+            if self.settings.minimax_api_host
+            else ""
+        )
+        llm_base_url = minimax_openai_base or self.settings.openai_base_url or os.getenv("OPENAI_BASE_URL", "")
         if llm_api_key:
             llm_config["api_key"] = llm_api_key
         if llm_base_url:
             llm_config["openai_base_url"] = llm_base_url
 
         # Embedder 走工程现有智谱配置，默认使用智谱兼容 OpenAI 的 endpoint。
-        embedder_api_key = os.getenv("ZHIPUAI_API_KEY", "") or self.settings.openai_compatible_api_key or os.getenv("OPENAI_API_KEY", "")
+        embedder_api_key = os.getenv("ZHIPUAI_API_KEY", "") or self.settings.openai_api_key or os.getenv("OPENAI_API_KEY", "")
         embedder_base_url = (
             os.getenv("ZHIPU_OPENAI_BASE_URL", "")
-            or self.settings.openai_compatible_base_url
+            or self.settings.openai_base_url
             or "https://open.bigmodel.cn/api/paas/v4"
         )
         if embedder_api_key:

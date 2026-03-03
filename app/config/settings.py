@@ -44,10 +44,10 @@ class Settings:
     llm_timeout_seconds: int = 60
 
     minimax_api_key: str = ""
-    minimax_base_url: str = "https://api.minimax.chat/v1"
+    minimax_api_host: str = "https://api.minimax.chat"
 
-    openai_compatible_api_key: str = ""
-    openai_compatible_base_url: str = ""
+    openai_api_key: str = ""
+    openai_base_url: str = ""
 
     embedding_provider: str = "zhipu"
     zhipu_embedding_model: str = "embedding-3"
@@ -123,6 +123,17 @@ class Settings:
                     result.append(item)
             return tuple(result)
 
+        def _normalize_minimax_host(default: str) -> str:
+            raw_host = os.getenv("MINIMAX_API_HOST", "").strip()
+            if raw_host:
+                return raw_host.rstrip("/")
+            legacy_base = os.getenv("MINIMAX_BASE_URL", "").strip().rstrip("/")
+            if not legacy_base:
+                return default
+            if legacy_base.endswith("/v1"):
+                return legacy_base[: -len("/v1")]
+            return legacy_base
+
         return cls(
             app_name=os.getenv("APP_NAME", defaults.app_name),
             app_host=os.getenv("APP_HOST", defaults.app_host),
@@ -142,9 +153,9 @@ class Settings:
             llm_temperature=_as_float("LLM_TEMPERATURE", defaults.llm_temperature),
             llm_timeout_seconds=_as_int("LLM_TIMEOUT_SECONDS", defaults.llm_timeout_seconds),
             minimax_api_key=os.getenv("MINIMAX_API_KEY", ""),
-            minimax_base_url=os.getenv("MINIMAX_BASE_URL", defaults.minimax_base_url),
-            openai_compatible_api_key=os.getenv("OPENAI_COMPATIBLE_API_KEY", ""),
-            openai_compatible_base_url=os.getenv("OPENAI_COMPATIBLE_BASE_URL", ""),
+            minimax_api_host=_normalize_minimax_host(defaults.minimax_api_host),
+            openai_api_key=os.getenv("OPENAI_API_KEY", ""),
+            openai_base_url=os.getenv("OPENAI_BASE_URL", ""),
             embedding_provider=os.getenv("EMBEDDING_PROVIDER", defaults.embedding_provider),
             zhipu_embedding_model=os.getenv("ZHIPU_EMBEDDING_MODEL", defaults.zhipu_embedding_model),
             zhipu_embedding_batch_size=_as_int(
