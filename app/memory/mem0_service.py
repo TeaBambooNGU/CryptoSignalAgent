@@ -12,9 +12,13 @@ import hashlib
 import json
 import logging
 import os
+import re
 from datetime import datetime, timezone
 from typing import Any
 from uuid import uuid4
+
+from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_openai import ChatOpenAI
 
 from app.config.settings import Settings
 from app.models.schemas import MemoryType
@@ -27,6 +31,8 @@ logger = logging.getLogger(__name__)
 
 class MemoryService:
     """统一记忆服务。"""
+
+    PREFERENCE_PROFILE_CONTENT_SEED = "__profile_v1__"
 
     def __init__(
         self,
@@ -42,6 +48,7 @@ class MemoryService:
         self.outbox_store = outbox_store
         self.conversation_store = conversation_store
         self._mem0_client: Any | None = self._init_mem0_client()
+        self._preference_extractor_client: Any | None = self._init_preference_extractor_client()
 
     def _init_mem0_client(self) -> Any | None:
         """按配置尝试初始化 Mem0 客户端。"""
@@ -161,10 +168,42 @@ class MemoryService:
             "version": "v1.1",
         }
 
+    def _init_preference_extractor_client(self) -> Any | None:
+        """初始化长期偏好抽取小模型（DeepSeek）。"""
+
+        api_key = self.settings.deepseek_api_key.strip()
+        if not api_key:
+            logger.warning("DEEPSEEK_API_KEY 未配置，自动跳过研报偏好抽取")
+            return None
+
+        try:
+            base_url = (self.settings.deepseek_base_url or "https://api.deepseek.com/v1").rstrip("/")
+            client = ChatOpenAI(
+                model_name=self.settings.memory_extractor_model,
+                temperature=0,
+                request_timeout=self.settings.memory_extractor_timeout_seconds,
+                openai_api_key=api_key,
+                openai_api_base=base_url,
+            )
+            logger.info("长期偏好抽取模型初始化成功 model=%s", self.settings.memory_extractor_model)
+            return client
+        except Exception:
+            logger.exception("长期偏好抽取模型初始化失败，将跳过自动抽取")
+            return None
+
     def _build_memory_id(self, user_id: str, memory_type: MemoryType, content: str) -> str:
         """生成幂等记忆 ID。"""
 
         digest = hashlib.sha1(f"{user_id}:{memory_type.value}:{content}".encode("utf-8")).hexdigest()
+        return digest[:40]
+
+    @staticmethod
+    def build_preference_profile_id(user_id: str) -> str:
+        """生成“单条长期偏好画像”固定 ID。"""
+
+        digest = hashlib.sha1(
+            f"{user_id}:{MemoryType.PREFERENCE.value}:{MemoryService.PREFERENCE_PROFILE_CONTENT_SEED}".encode("utf-8")
+        ).hexdigest()
         return digest[:40]
 
     def _event_ids(
@@ -201,6 +240,10 @@ class MemoryService:
         - 采用“时间戳 + 置信度”覆盖策略。
         """
 
+        normalized_preference = self._normalize_preference_payload(preference)
+        if not normalized_preference:
+            return
+
         updated_at = int(datetime.now(timezone.utc).timestamp())
         final_conversation_id, final_turn_id, final_request_id = self._event_ids(
             user_id=user_id,
@@ -217,7 +260,7 @@ class MemoryService:
                 event_type="memory.save_preference",
                 payload={
                     "user_id": user_id,
-                    "preference": preference,
+                    "preference": normalized_preference,
                     "confidence": confidence,
                     "updated_at": updated_at,
                     "request_id": final_request_id,
@@ -226,7 +269,7 @@ class MemoryService:
         else:
             self.apply_preference_write(
                 user_id=user_id,
-                preference=preference,
+                preference=normalized_preference,
                 confidence=confidence,
                 updated_at=updated_at,
             )
@@ -235,7 +278,7 @@ class MemoryService:
             final_conversation_id,
             {
                 "memory_type": MemoryType.PREFERENCE.value,
-                "content": preference,
+                "content": normalized_preference,
                 "confidence": confidence,
                 "updated_at": updated_at,
             },
@@ -338,12 +381,13 @@ class MemoryService:
 
         profile = {
             "user_id": user_id,
-            "long_term_memory": [self._decode_memory_row(row) for row in long_term],
+            "long_term_memory": self._compact_long_term_memory(user_id=user_id, long_term=long_term),
             "session_memory": session,
             "recent_turn_context": recent_turn_context,
             "conversation_summary": conversation_summary,
             "watchlist": self._extract_watchlist(long_term, session),
             "risk_preference": self._extract_risk_preference(long_term),
+            "reading_habit": self._extract_reading_habit(long_term),
             "tool_corrections": self._extract_tool_corrections(long_term),
         }
 
@@ -458,7 +502,12 @@ class MemoryService:
         - 一次性任务上下文不写入长期记忆，转入短期会话缓存。
         """
 
-        extracted = inferred_preferences or self._infer_preferences_from_text(query=query, report=report)
+        extracted = (
+            inferred_preferences
+            if inferred_preferences is not None
+            else self._extract_preferences_with_llm(query=query, report=report)
+        )
+        extracted = self._normalize_preference_payload(extracted)
         if not extracted:
             return
 
@@ -481,10 +530,20 @@ class MemoryService:
     ) -> None:
         """将偏好写入长期存储（Milvus + Mem0）。"""
 
-        content = json.dumps(preference, ensure_ascii=False, sort_keys=True)
+        normalized = self._normalize_preference_payload(preference)
+        if not normalized:
+            return
+
+        historical = self.milvus_store.query_user_memory(user_id=user_id, limit=200)
+        existing_profile = self._extract_preference_profile(historical)
+        merged_profile = self._merge_preference_payload(existing_profile, normalized)
+        if not merged_profile:
+            return
+
+        content = json.dumps(merged_profile, ensure_ascii=False, sort_keys=True)
         embedding = text_to_embedding(content, self.settings)
         record = {
-            "id": self._build_memory_id(user_id, MemoryType.PREFERENCE, content),
+            "id": self.build_preference_profile_id(user_id),
             "user_id": user_id,
             "memory_type": MemoryType.PREFERENCE.value,
             "content": content,
@@ -493,6 +552,20 @@ class MemoryService:
             "embedding": embedding,
         }
         self.milvus_store.upsert_user_memory([record])
+        stale_ids = [
+            str(row.get("id", "")).strip()
+            for row in historical
+            if str(row.get("memory_type", "")) == MemoryType.PREFERENCE.value
+            and str(row.get("id", "")).strip()
+            and str(row.get("id", "")).strip() != record["id"]
+        ]
+        if stale_ids:
+            delete_fn = getattr(self.milvus_store, "delete_user_memory_by_ids", None)
+            if callable(delete_fn):
+                try:
+                    delete_fn(stale_ids)
+                except Exception:
+                    logger.exception("清理历史 preference 冗余记录失败")
         self._mem0_add(user_id=user_id, content=content, metadata={"memory_type": MemoryType.PREFERENCE.value})
 
     def apply_tool_correction_write(
@@ -559,36 +632,35 @@ class MemoryService:
     def _extract_watchlist(self, long_term: list[dict[str, Any]], session: list[dict[str, Any]]) -> list[str]:
         """从记忆中提取关注标的。"""
 
+        profile = self._extract_preference_profile(long_term)
+        watchlist = profile.get("watchlist")
+        if isinstance(watchlist, list):
+            return [str(item).upper() for item in watchlist]
+
+        # 兼容极端降级场景：当长期画像为空时，回退到 session 中的临时偏好。
         candidates: set[str] = set()
-        sources = [*long_term, *session]
-        for row in sources:
-            content = row.get("content")
-            parsed = content
-            if isinstance(content, str):
-                try:
-                    parsed = json.loads(content)
-                except Exception:
-                    parsed = {}
-            if isinstance(parsed, dict):
-                watchlist = parsed.get("watchlist")
-                if isinstance(watchlist, list):
-                    candidates.update(str(item).upper() for item in watchlist)
+        for row in session:
+            parsed = self._coerce_dict(row.get("content"))
+            if not parsed:
+                continue
+            raw_watchlist = parsed.get("watchlist")
+            if isinstance(raw_watchlist, list):
+                candidates.update(str(item).upper() for item in raw_watchlist)
         return sorted(candidates)
 
     def _extract_risk_preference(self, long_term: list[dict[str, Any]]) -> str | None:
         """提取用户风险偏好。"""
 
-        for row in long_term:
-            content = row.get("content")
-            parsed = content
-            if isinstance(content, str):
-                try:
-                    parsed = json.loads(content)
-                except Exception:
-                    parsed = {}
-            if isinstance(parsed, dict) and parsed.get("risk_preference"):
-                return str(parsed["risk_preference"])
-        return None
+        profile = self._extract_preference_profile(long_term)
+        risk = profile.get("risk_preference")
+        return str(risk) if isinstance(risk, str) and risk else None
+
+    def _extract_reading_habit(self, long_term: list[dict[str, Any]]) -> str | None:
+        """提取用户阅读偏好。"""
+
+        profile = self._extract_preference_profile(long_term)
+        reading_habit = profile.get("reading_habit")
+        return str(reading_habit) if isinstance(reading_habit, str) and reading_habit else None
 
     def _extract_tool_corrections(self, long_term: list[dict[str, Any]]) -> list[dict[str, Any]]:
         """提取长期纠错经验，供 MCP planner 作为 few-shot 上下文。"""
@@ -609,28 +681,210 @@ class MemoryService:
         corrections.sort(key=lambda item: item[0], reverse=True)
         return [item for _, item in corrections[:12]]
 
-    def _infer_preferences_from_text(self, query: str, report: str) -> dict[str, Any]:
-        """基于查询和报告粗粒度抽取可复用偏好。"""
+    def _extract_preferences_with_llm(self, query: str, report: str) -> dict[str, Any]:
+        """调用小模型抽取长期可复用偏好。"""
 
-        merged_text = f"{query}\n{report}".upper()
-        watchlist = []
-        for symbol in ["BTC", "ETH", "SOL", "BNB", "XRP", "DOGE", "ADA"]:
-            if symbol in merged_text:
-                watchlist.append(symbol)
+        if self._preference_extractor_client is None:
+            return {}
 
-        result: dict[str, Any] = {}
-        if watchlist:
-            result["watchlist"] = sorted(set(watchlist))
+        system_prompt = (
+            "你是用户长期偏好抽取器。"
+            "请只抽取可跨任务复用的偏好，并输出严格 JSON 对象。"
+            "允许字段：watchlist(字符串数组)、risk_preference(字符串)、reading_habit(字符串)。"
+            "若没有可复用偏好，返回空对象 {}。"
+            "禁止输出 Markdown、解释文字、注释。"
+        )
+        user_prompt = (
+            f"用户问题:\n{query}\n\n"
+            f"研报内容:\n{report}\n\n"
+            "请返回 JSON。"
+        )
 
-        if "风险" in report and "保守" in report:
-            result["risk_preference"] = "conservative"
-        elif "风险" in report and ("激进" in report or "高波动" in report):
-            result["risk_preference"] = "aggressive"
+        try:
+            response = self._preference_extractor_client.invoke(
+                [
+                    SystemMessage(content=system_prompt),
+                    HumanMessage(content=user_prompt),
+                ]
+            )
+            text = self._extract_text(getattr(response, "content", response))
+            parsed = self._parse_json_object(text)
+            return parsed if isinstance(parsed, dict) else {}
+        except Exception:
+            logger.exception("LLM 偏好抽取失败，已跳过本次写回")
+            return {}
 
-        if "总结" in report or "摘要" in report:
-            result["reading_habit"] = "summary_first"
+    @staticmethod
+    def _normalize_preference_payload(payload: Any) -> dict[str, Any]:
+        """清洗 LLM 偏好抽取结果，避免脏数据入库。"""
 
-        return result
+        if not isinstance(payload, dict):
+            return {}
+
+        normalized: dict[str, Any] = {}
+
+        watchlist_raw = payload.get("watchlist")
+        if isinstance(watchlist_raw, list):
+            watchlist: list[str] = []
+            for item in watchlist_raw:
+                token = str(item).strip().upper().lstrip("$")
+                if not token or not re.fullmatch(r"[A-Z0-9._-]{2,20}", token):
+                    continue
+                if token not in watchlist:
+                    watchlist.append(token)
+            if watchlist:
+                normalized["watchlist"] = watchlist
+
+        risk_raw = str(payload.get("risk_preference", "")).strip().lower()
+        if risk_raw in {"conservative", "balanced", "aggressive"}:
+            normalized["risk_preference"] = risk_raw
+
+        reading_habit_raw = str(payload.get("reading_habit", "")).strip().lower()
+        if reading_habit_raw and re.fullmatch(r"[a-z_]{2,32}", reading_habit_raw):
+            normalized["reading_habit"] = reading_habit_raw
+
+        return normalized
+
+    @staticmethod
+    def _merge_preference_payload(base: dict[str, Any], incoming: dict[str, Any]) -> dict[str, Any]:
+        """按规则合并偏好：watchlist 并集，risk/reading 覆盖。"""
+
+        merged: dict[str, Any] = {}
+        base_watchlist = base.get("watchlist")
+        incoming_watchlist = incoming.get("watchlist")
+        merged_watchlist: list[str] = []
+
+        if isinstance(base_watchlist, list):
+            for item in base_watchlist:
+                token = str(item).strip().upper()
+                if token and token not in merged_watchlist:
+                    merged_watchlist.append(token)
+        if isinstance(incoming_watchlist, list):
+            for item in incoming_watchlist:
+                token = str(item).strip().upper()
+                if token and token not in merged_watchlist:
+                    merged_watchlist.append(token)
+        if merged_watchlist:
+            merged["watchlist"] = merged_watchlist
+
+        risk = incoming.get("risk_preference") or base.get("risk_preference")
+        if isinstance(risk, str) and risk:
+            merged["risk_preference"] = risk
+
+        reading_habit = incoming.get("reading_habit") or base.get("reading_habit")
+        if isinstance(reading_habit, str) and reading_habit:
+            merged["reading_habit"] = reading_habit
+
+        return merged
+
+    def _compact_long_term_memory(self, *, user_id: str, long_term: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """将长期记忆压缩为“偏好画像单条记录”。"""
+
+        profile = self._extract_preference_profile(long_term)
+        compact: list[dict[str, Any]] = []
+        if profile:
+            latest_updated_at = max(
+                int(row.get("updated_at", 0) or 0)
+                for row in long_term
+                if str(row.get("memory_type", "")) == MemoryType.PREFERENCE.value
+            )
+            latest_confidence = max(
+                float(row.get("confidence", 0.0) or 0.0)
+                for row in long_term
+                if str(row.get("memory_type", "")) == MemoryType.PREFERENCE.value
+            )
+            compact.append(
+                {
+                    "id": self.build_preference_profile_id(user_id),
+                    "memory_type": MemoryType.PREFERENCE.value,
+                    "content": profile,
+                    "confidence": latest_confidence,
+                    "updated_at": latest_updated_at,
+                }
+            )
+        return compact
+
+    def _extract_preference_profile(self, long_term: list[dict[str, Any]]) -> dict[str, Any]:
+        """从长期记忆中提取并合并偏好画像。"""
+
+        preference_rows = [
+            row for row in long_term if str(row.get("memory_type", "")) == MemoryType.PREFERENCE.value
+        ]
+        if not preference_rows:
+            return {}
+
+        preference_rows.sort(key=lambda item: int(item.get("updated_at", 0) or 0))
+        merged: dict[str, Any] = {}
+        for row in preference_rows:
+            parsed = self._coerce_dict(row.get("content"))
+            if not parsed:
+                continue
+            normalized = self._normalize_preference_payload(parsed)
+            if not normalized:
+                continue
+            merged = self._merge_preference_payload(merged, normalized)
+        return merged
+
+    @staticmethod
+    def _coerce_dict(content: Any) -> dict[str, Any]:
+        """将记忆内容安全转为 dict。"""
+
+        if isinstance(content, dict):
+            return content
+        if isinstance(content, str):
+            try:
+                parsed = json.loads(content)
+            except Exception:
+                return {}
+            return parsed if isinstance(parsed, dict) else {}
+        return {}
+
+    @staticmethod
+    def _extract_text(content: Any) -> str:
+        if isinstance(content, str):
+            return content.strip()
+        if isinstance(content, list):
+            chunks: list[str] = []
+            for item in content:
+                if isinstance(item, dict):
+                    text = item.get("text")
+                    if isinstance(text, str):
+                        chunks.append(text)
+                        continue
+                chunks.append(str(item))
+            return "".join(chunks).strip()
+        return str(content).strip()
+
+    @staticmethod
+    def _parse_json_object(text: str) -> dict[str, Any]:
+        cleaned = text.strip()
+        if not cleaned:
+            return {}
+
+        parsed = MemoryService._try_parse_json(cleaned)
+        if isinstance(parsed, dict):
+            return parsed
+
+        fence_match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", cleaned, flags=re.DOTALL)
+        if fence_match:
+            parsed = MemoryService._try_parse_json(fence_match.group(1))
+            if isinstance(parsed, dict):
+                return parsed
+
+        object_match = re.search(r"(\{.*\})", cleaned, flags=re.DOTALL)
+        if object_match:
+            parsed = MemoryService._try_parse_json(object_match.group(1))
+            if isinstance(parsed, dict):
+                return parsed
+
+        return {}
+
+    @staticmethod
+    def _try_parse_json(text: str) -> Any:
+        try:
+            return json.loads(text)
+        except Exception:
+            return None
 
     def _mem0_add(self, user_id: str, content: str, metadata: dict[str, Any]) -> None:
         """安全调用 Mem0 add，失败仅记录日志。"""

@@ -17,13 +17,22 @@ class _DummyMilvusStore:
         self.records: list[dict[str, Any]] = []
 
     def upsert_user_memory(self, records: list[dict[str, Any]]) -> None:
-        self.records.extend(records)
+        for incoming in records:
+            incoming_id = str(incoming.get("id", ""))
+            self.records = [row for row in self.records if str(row.get("id", "")) != incoming_id]
+            self.records.append(dict(incoming))
         return None
 
     def query_user_memory(self, user_id: str, limit: int) -> list[dict[str, Any]]:
         rows = [item for item in self.records if item.get("user_id") == user_id]
         rows.sort(key=lambda item: int(item.get("updated_at", 0)), reverse=True)
         return rows[:limit]
+
+    def delete_user_memory_by_ids(self, ids: list[str]) -> int:
+        id_set = {str(item).strip() for item in ids if str(item).strip()}
+        before = len(self.records)
+        self.records = [row for row in self.records if str(row.get("id", "")) not in id_set]
+        return before - len(self.records)
 
 
 class _SearchClient:
@@ -33,6 +42,21 @@ class _SearchClient:
     def search(self, **kwargs: Any) -> dict[str, Any]:
         self.last_kwargs = kwargs
         return {"results": [{"id": "m1"}]}
+
+
+class _ExtractorResponse:
+    def __init__(self, content: Any) -> None:
+        self.content = content
+
+
+class _PreferenceExtractorClient:
+    def __init__(self, content: Any) -> None:
+        self.content = content
+        self.messages: list[Any] = []
+
+    def invoke(self, messages: list[Any]) -> _ExtractorResponse:
+        self.messages = messages
+        return _ExtractorResponse(self.content)
 
 
 class Mem0ServiceCompatibilityTestCase(unittest.TestCase):
@@ -165,6 +189,89 @@ class Mem0ServiceCompatibilityTestCase(unittest.TestCase):
         self.assertEqual(len(profile_b["session_memory"]), 1)
         self.assertEqual(profile_a["session_memory"][0]["content"]["symbols"], ["BTC"])
         self.assertEqual(profile_b["session_memory"][0]["content"]["symbols"], ["ETH"])
+
+    def test_persist_report_memory_uses_llm_extractor(self) -> None:
+        with patch.dict(os.environ, {"ZHIPUAI_API_KEY": ""}, clear=False):
+            settings = Settings(mem0_enabled=False)
+            milvus = _DummyMilvusStore()
+            service = MemoryService(
+                settings=settings,
+                milvus_store=milvus,
+                session_store=InMemorySessionMemoryStore(),
+            )
+            service._preference_extractor_client = _PreferenceExtractorClient(
+                """```json
+{"watchlist":["btc","ETH","$sol"],"risk_preference":"aggressive","reading_habit":"summary_first","noise":1}
+```"""
+            )
+
+            service.persist_report_memory(
+                user_id="u-5",
+                query="请给我 BTC 与 ETH 的日内观点",
+                report="本次重点关注 BTC、ETH、SOL。",
+            )
+
+            profile = service.load_memory_profile("u-5")
+            self.assertEqual(len(profile["long_term_memory"]), 1)
+            content = profile["long_term_memory"][0]["content"]
+            self.assertEqual(content["watchlist"], ["BTC", "ETH", "SOL"])
+            self.assertEqual(content["risk_preference"], "aggressive")
+            self.assertEqual(content["reading_habit"], "summary_first")
+
+    def test_persist_report_memory_skips_when_llm_output_invalid(self) -> None:
+        with patch.dict(os.environ, {"ZHIPUAI_API_KEY": ""}, clear=False):
+            settings = Settings(mem0_enabled=False)
+            milvus = _DummyMilvusStore()
+            service = MemoryService(
+                settings=settings,
+                milvus_store=milvus,
+                session_store=InMemorySessionMemoryStore(),
+            )
+            service._preference_extractor_client = _PreferenceExtractorClient("not-json")
+
+            service.persist_report_memory(
+                user_id="u-6",
+                query="给我一份市场观点",
+                report="这是一段没有明确偏好的研报。",
+            )
+
+            self.assertEqual(milvus.records, [])
+
+    def test_preference_profile_keeps_single_record_with_merge_rules(self) -> None:
+        with patch.dict(os.environ, {"ZHIPUAI_API_KEY": ""}, clear=False):
+            settings = Settings(mem0_enabled=False)
+            milvus = _DummyMilvusStore()
+            service = MemoryService(
+                settings=settings,
+                milvus_store=milvus,
+                session_store=InMemorySessionMemoryStore(),
+            )
+
+            service.save_preference(
+                user_id="u-7",
+                preference={
+                    "watchlist": ["BTC", "ETH"],
+                    "risk_preference": "balanced",
+                    "reading_habit": "summary_first",
+                },
+            )
+            service.save_preference(
+                user_id="u-7",
+                preference={
+                    "watchlist": ["SOL", "BTC"],
+                    "risk_preference": "aggressive",
+                },
+            )
+
+            profile = service.load_memory_profile("u-7", conversation_id="conv-u7")
+            self.assertEqual(len(profile["long_term_memory"]), 1)
+            self.assertEqual(profile["watchlist"], ["BTC", "ETH", "SOL"])
+            self.assertEqual(profile["risk_preference"], "aggressive")
+            self.assertEqual(profile["reading_habit"], "summary_first")
+            content = profile["long_term_memory"][0]["content"]
+            self.assertEqual(content["watchlist"], ["BTC", "ETH", "SOL"])
+            self.assertEqual(content["risk_preference"], "aggressive")
+            self.assertEqual(content["reading_habit"], "summary_first")
 
 
 if __name__ == "__main__":

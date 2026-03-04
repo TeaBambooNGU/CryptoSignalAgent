@@ -329,6 +329,98 @@ class MilvusStore:
         rows.sort(key=lambda item: item.get("updated_at", 0), reverse=True)
         return rows
 
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, min=1, max=16),
+        retry=retry_if_exception_type(Exception),
+        reraise=True,
+    )
+    def delete_user_memory_by_ids(self, ids: list[str]) -> int:
+        """按主键批量删除用户记忆。"""
+
+        normalized_ids = [str(item).strip() for item in ids if str(item).strip()]
+        if not normalized_ids:
+            return 0
+
+        if self.using_fallback:
+            original_size = len(self._memory_fallback)
+            delete_set = set(normalized_ids)
+            self._memory_fallback = [row for row in self._memory_fallback if str(row.get("id", "")) not in delete_set]
+            return original_size - len(self._memory_fallback)
+
+        if self._memory_collection is None:
+            raise RuntimeError("memory collection 未初始化")
+
+        expr_values = ",".join(json.dumps(item) for item in normalized_ids)
+        delete_expr = f"id in [{expr_values}]"
+        self._memory_collection.delete(delete_expr)
+        self._memory_collection.flush()
+        return len(normalized_ids)
+
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, min=1, max=16),
+        retry=retry_if_exception_type(Exception),
+        reraise=True,
+    )
+    def list_all_user_memory(
+        self,
+        *,
+        limit: int = 50000,
+        batch_size: int = 2000,
+        include_embedding: bool = False,
+    ) -> list[dict[str, Any]]:
+        """扫描用户记忆集合（用于离线修复脚本）。"""
+
+        final_limit = max(int(limit), 0)
+        if final_limit <= 0:
+            return []
+
+        if self.using_fallback:
+            rows = [dict(row) for row in self._memory_fallback]
+            rows.sort(key=lambda item: item.get("updated_at", 0), reverse=True)
+            return rows[:final_limit]
+
+        if self._memory_collection is None:
+            raise RuntimeError("memory collection 未初始化")
+
+        output_fields = ["id", "user_id", "memory_type", "content", "confidence", "updated_at"]
+        if include_embedding:
+            output_fields.append("embedding")
+
+        rows: list[dict[str, Any]] = []
+        iterator_factory = getattr(self._memory_collection, "query_iterator", None)
+        if callable(iterator_factory):
+            iterator = None
+            try:
+                iterator = iterator_factory(
+                    batch_size=max(1, int(batch_size)),
+                    expr="id != ''",
+                    output_fields=output_fields,
+                )
+                while len(rows) < final_limit:
+                    batch = iterator.next()
+                    if not batch:
+                        break
+                    rows.extend(dict(item) for item in batch)
+            except Exception:
+                logger.exception("query_iterator 扫描 user_memory 失败，回退单次查询")
+                rows = []
+            finally:
+                close_fn = getattr(iterator, "close", None) if iterator is not None else None
+                if callable(close_fn):
+                    close_fn()
+
+        if not rows:
+            rows = self._memory_collection.query(
+                expr="id != ''",
+                output_fields=output_fields,
+                limit=final_limit,
+            )
+
+        rows.sort(key=lambda item: item.get("updated_at", 0), reverse=True)
+        return rows[:final_limit]
+
     def close(self) -> None:
         """关闭连接。"""
 
