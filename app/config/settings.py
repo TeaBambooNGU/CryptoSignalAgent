@@ -69,6 +69,10 @@ class Settings:
     mem0_api_key: str = ""
     mem0_org_id: str = ""
     mem0_project_id: str = ""
+    memory_extractor_model: str = "deepseek-chat"
+    memory_extractor_timeout_seconds: int = 20
+    deepseek_api_key: str = ""
+    deepseek_base_url: str = "https://api.deepseek.com/v1"
 
     conversation_store_path: str = "data/conversation_state.db"
     session_store_backend: str = "memory"
@@ -220,6 +224,13 @@ class Settings:
             mem0_api_key=os.getenv("MEM0_API_KEY", ""),
             mem0_org_id=os.getenv("MEM0_ORG_ID", ""),
             mem0_project_id=os.getenv("MEM0_PROJECT_ID", ""),
+            memory_extractor_model=os.getenv("MEMORY_EXTRACTOR_MODEL", defaults.memory_extractor_model),
+            memory_extractor_timeout_seconds=_as_int(
+                "MEMORY_EXTRACTOR_TIMEOUT_SECONDS",
+                defaults.memory_extractor_timeout_seconds,
+            ),
+            deepseek_api_key=os.getenv("DEEPSEEK_API_KEY", ""),
+            deepseek_base_url=os.getenv("DEEPSEEK_BASE_URL", defaults.deepseek_base_url),
             conversation_store_path=os.getenv("CONVERSATION_STORE_PATH", defaults.conversation_store_path),
             session_store_backend=os.getenv("SESSION_STORE_BACKEND", defaults.session_store_backend),
             redis_url=os.getenv("REDIS_URL", defaults.redis_url),

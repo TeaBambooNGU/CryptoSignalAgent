@@ -55,6 +55,7 @@
 - MCP 多服务工具发现与调用（`langchain-mcp-adapters`）
 - LangGraph 编排研究流程，输出 `workflow_steps`
 - Milvus 向量检索与长期记忆（Mem0 可选）
+- 长期偏好自动抽取（使用小模型）并聚合为单条画像
 - 会话一致性保障：`request_id` 幂等 + `expected_version` CAS
 - 异步 outbox 投影：会话真相库强一致、外部记忆最终一致
 
@@ -146,6 +147,7 @@ npm --prefix frontend run dev
 | LLM | `LLM_PROVIDER` / `LLM_MODEL` | 模型供应商与模型名 |
 | Embedding | `EMBEDDING_PROVIDER` / `ZHIPU_EMBEDDING_MODEL` | 向量化配置 |
 | Milvus | `MILVUS_URI` / `VECTOR_DIM` | 向量库连接与维度 |
+| 记忆抽取 | `MEMORY_EXTRACTOR_MODEL` / `MEMORY_EXTRACTOR_TIMEOUT_SECONDS` / `DEEPSEEK_API_KEY` / `DEEPSEEK_BASE_URL` | 长期偏好自动抽取模型配置 |
 | 会话 | `CONVERSATION_STORE_PATH` | SQLite 真相库存储路径 |
 | Session | `SESSION_STORE_BACKEND` / `REDIS_URL` | 短期会话记忆存储 |
 | MCP | `MCP_CONFIG_PATH` / `MCP_MAX_ROUNDS` | MCP 配置与调用预算 |
@@ -240,6 +242,9 @@ npm --prefix frontend run ui:debug:live
 ```bash
 # 后端单测（示例）
 uv run python -m unittest tests/test_api.py
+
+# 可选：修复历史长期偏好为单条画像结构（先 dry-run）
+uv run python scripts/repair_user_memory_profile.py --dry-run
 
 # 可选：MCP 原始响应巡检
 uv run python scripts/inspect_mcp.py
