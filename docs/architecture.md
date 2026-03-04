@@ -1,6 +1,6 @@
 # 工程架构梳理
 
-- 当前梳理时间: 2026-03-04 14:54:59
+- 当前梳理时间: 2026-03-05 00:21:28
 
 ## 项目概览
 - 项目定位: 面向加密市场研究场景的“对话优先”研报 Agent，支持“持续会话 -> 报告版本化 -> 可恢复回放”。
@@ -12,6 +12,7 @@
   - `from_turn_id` 提供真实分支语义：新 turn 通过 `parent_turn_id` 挂接到指定历史节点，并按该链路构建上下文。
   - 报告版本资产化（`conversation_report`）+ 会话轮次真相库（`conversation_turn`）+ 长会话摘要压缩（`conversation_context_summary`）。
   - 会话一致性采用“同会话单写者锁 + CAS version + request_id 幂等”保障并发安全与重试稳定。
+  - 长期偏好由 DeepSeek 小模型自动抽取，写入前统一归一化并按规则合并为“单条画像”（watchlist 并集、risk/reading 覆盖）。
   - Milvus/Mem0 写入通过 outbox 异步投影，保证会话真相库强一致、外部记忆最终一致。
   - 提供 React 控制台前端，支持持续对话、回溯 turn、按 `parent_turn_id` 展示 Branch Tree、选择报告版本并继续改写/重跑。
 - 关键输出:
@@ -52,7 +53,7 @@
   - `app/observability`: LangSmith 跟踪配置。
   - `app/models`: API 协议、内部信号模型、LangGraph State。
   - `frontend`: React 控制台（Dashboard / Memory / Ingest / Settings）。
-  - `scripts`: 运维初始化、MCP 可用性验证与 MCP 原始响应巡检脚本。
+  - `scripts`: 运维初始化、MCP 可用性验证、MCP 原始响应巡检、长期偏好画像修复脚本。
 - 关键职责:
   - `app/main.py`: 应用创建、生命周期管理、请求级 trace middleware。
   - `app/runtime.py`: 统一装配运行时依赖，并启动 `OutboxProjector`。
@@ -61,7 +62,9 @@
   - `app/conversation/store.py`: snapshot/turn/report/summary/idempotency/event/outbox 的事务化读写。
   - `app/conversation/projector.py`: 消费 outbox 并异步投影到长期记忆写接口。
   - `app/graph/workflow.py`: 主流程 9 节点编排（load memory / resolve symbols / collect via MCP / normalize & index / retrieve / analyze / generate / persist memory / finalize）。
-  - `app/memory/mem0_service.py`: 偏好写回、画像聚合、recent turns + summary 注入、Mem0 platform/oss 兼容。
+  - `app/memory/mem0_service.py`: DeepSeek 偏好抽取、偏好归一化/合并、单条画像写回、recent turns + summary 注入、Mem0 platform/oss 兼容。
+  - `app/retrieval/milvus_store.py`: 用户记忆 upsert/query、按 ID 批量删除、全量扫描（供离线修复脚本使用）。
+  - `scripts/repair_user_memory_profile.py`: 离线修复历史 preference 冗余记录为单条画像结构（支持 `--dry-run`）。
   - `frontend/src/pages/DashboardPage.tsx`: Message Composer、Dialogue 流、Turn Timeline、Branch Tree（含“仅看当前锚点分支”过滤）、Report Version Tape。
 - 主要依赖:
   - 后端: FastAPI/Uvicorn、LangGraph、LangChain、langchain-openai、langchain-mcp-adapters、tenacity、mcp、pymilvus、langchain-community（Zhipu embedding）、llama-index、mem0（可选）、redis（可选）。
@@ -72,6 +75,7 @@
   - LLM: MiniMax（默认，OpenAI-compatible）；可替换为任意 OpenAI-compatible 服务。
   - Embedding: 智谱 `embedding-3`（`ZhipuAIEmbeddings`，自动分批上限 64）。
   - 向量库: Milvus（不可用时按配置降级内存模式）。
+  - 偏好抽取: DeepSeek OpenAI-compatible 接口（通过 `langchain-openai` `ChatOpenAI` 调用）。
   - 记忆增强: Mem0（可选；失败不阻断主流程，支持 `platform/oss`）。
   - Session Cache: Redis（可选；短期会话记忆缓存，失效不影响恢复真相库）。
   - MCP Servers: 由 `.mcp.json` 的 `mcpServers` 提供，支持 `http/stdio/sse`（内部映射为 `streamable_http/stdio/sse`）。
@@ -114,8 +118,9 @@
   5. `chat`：基于“分支摘要 + 分支最近 turns + 分支最新报告”构造 prompt，调用 LLM 生成对话回复。
   6. `rewrite_report`：优先读取目标报告；未指定时读取分支链路可见的最新报告并改写。
   7. `regenerate_report`：调用 `ResearchGraphRunner.arun` 执行完整 9 节点流程并产出新报告版本（透传分支锚点到记忆加载）。
-  8. 事务写入 `conversation_turn`，必要时写入 `conversation_report`，并更新 `idempotency_request=completed`。
-  9. 刷新 `conversation_context_summary`（超过窗口后增量压缩历史轮次）。
+  8. 报告记忆写回阶段会调用偏好抽取模型，仅保留可跨任务复用偏好字段并做脏数据过滤后再入库。
+  9. 事务写入 `conversation_turn`，必要时写入 `conversation_report`，并更新 `idempotency_request=completed`。
+  10. 刷新 `conversation_context_summary`（超过窗口后增量压缩历史轮次）。
 - 兼容链路（`POST /v1/research/query`）:
   - 直接调用 `ConversationService.run_research_turn`，内部固定走 `regenerate_report` 路径并复用同一套一致性语义。
 - 控制/调度流程:
@@ -178,6 +183,7 @@ sequenceDiagram
   - Embedding：`EMBEDDING_PROVIDER=zhipu`、`ZHIPU_EMBEDDING_MODEL`、`ZHIPU_EMBEDDING_BATCH_SIZE`、`ZHIPUAI_API_KEY`。
   - 向量库：`MILVUS_*`、`VECTOR_DIM`。
   - 记忆：`MEM0_ENABLED`、`MEM0_MODE`、`MEM0_OSS_COLLECTION`、`MEM0_API_KEY`、`MEM0_ORG_ID`、`MEM0_PROJECT_ID`。
+  - 偏好抽取：`MEMORY_EXTRACTOR_MODEL`、`MEMORY_EXTRACTOR_TIMEOUT_SECONDS`、`DEEPSEEK_API_KEY`、`DEEPSEEK_BASE_URL`。
   - 会话持久化：`CONVERSATION_STORE_PATH`（SQLite 真相库路径）。
   - 短期会话缓存：`SESSION_STORE_BACKEND`（`memory|redis`）、`REDIS_URL`、`SESSION_MEMORY_TTL_SECONDS`、`SESSION_MEMORY_MAX_ITEMS`。
   - MCP: `MCP_CONFIG_PATH`（默认 `.mcp.json`，Claude Code 风格 `mcpServers`）、`MCP_MAX_ROUNDS`（Agent 工具调用预算提示）。
@@ -191,12 +197,13 @@ sequenceDiagram
 
 ### 运行流程
 - 运行步骤:
-  1. 配置 `.env`（至少填充 MiniMax、MCP、会话存储路径，可选 Zhipu/Mem0/Redis）。
+  1. 配置 `.env`（至少填充 MiniMax、MCP、会话存储路径，可选 Zhipu/Mem0/Redis/DeepSeek 偏好抽取）。
   2. 执行 `uv run python scripts/init_milvus.py` 初始化集合。
   3. 可选执行 `uv run python scripts/verify_mcp_servers.py` 验证 MCP 可用性。
-  4. 可选执行 `uv run python scripts/inspect_mcp.py` 生成 MCP 全量巡检报告（逐工具入参 + 原始响应）。
-  5. 执行 `uv run python main.py` 启动后端并通过 `/docs` 调试。
-  6. 执行 `npm --prefix frontend install && npm --prefix frontend run dev` 启动前端控制台。
+  4. 可选执行 `uv run python scripts/repair_user_memory_profile.py --dry-run` 预览历史偏好画像修复影响。
+  5. 可选执行 `uv run python scripts/inspect_mcp.py` 生成 MCP 全量巡检报告（逐工具入参 + 原始响应）。
+  6. 执行 `uv run python main.py` 启动后端并通过 `/docs` 调试。
+  7. 执行 `npm --prefix frontend install && npm --prefix frontend run dev` 启动前端控制台。
 - 异常/边界处理:
   - CAS 版本冲突返回 `409 conversation_version_conflict`，前端可刷新版本后重试。
   - 同一 `request_id` 处理中返回 `409 request_in_flight`；完成后重试会命中幂等缓存。
@@ -205,6 +212,7 @@ sequenceDiagram
   - Agent 执行异常返回 `agent_failed`；若最终 JSON 解析失败但有 ToolMessage 提取结果，仍会继续使用可提取信号。
   - Milvus 不可用时可降级内存存储（受 `MILVUS_ALLOW_FALLBACK` 控制）。
   - 未配置 LLM 密钥或 LLM 调用失败时，请求返回 500（硬失败）；未配置智谱密钥时降级哈希向量。
+  - 未配置 `DEEPSEEK_API_KEY` 或抽取模型调用失败时，仅跳过偏好自动抽取，不影响主链路出报。
   - Mem0 初始化或调用失败仅告警，不阻断主流程。
 - 观测与日志:
   - 日志由 `app/config/logging.py` 统一初始化，注入 `trace_id/task_id/user_id/component/round`。
@@ -215,6 +223,17 @@ sequenceDiagram
   - LangSmith 通过 `configure_langsmith` 以环境变量控制开启。
 
 ## 改动概要/变更记录
+### 2026-03-05 00:21:28
+- 本次新增/更新要点:
+  - 记忆链路新增 DeepSeek 偏好抽取模型配置（`MEMORY_EXTRACTOR_*`、`DEEPSEEK_*`），并在 `MemoryService` 中引入模型初始化与 JSON 结构化抽取流程。
+  - 长期偏好写回升级为“单条画像”策略：写入前执行字段归一化（watchlist/risk_preference/reading_habit），并按“watchlist 并集、risk/reading 覆盖”进行合并。
+  - Milvus 存储层新增 `delete_user_memory_by_ids` 与 `list_all_user_memory`，支撑清理历史 preference 冗余记录。
+  - 新增 `scripts/repair_user_memory_profile.py` 离线修复脚本，可对历史数据进行 dry-run 预览与批量修复。
+  - 单测补齐偏好抽取与合并行为，覆盖 LLM 输出合法/非法场景以及单条画像保持逻辑。
+- 变更动机/需求来源:
+  - 来源于当前会话需求：将 commit `53f560b38968481d7ddd8eb356c369007a19c936` 的能力变更同步到架构文档。
+- 当前更新时间: 2026-03-05 00:21:28
+
 ### 2026-03-04 14:54:59
 - 本次新增/更新要点:
   - 会话分支语义落地为“真分支”：`resume/message` 在 `from_turn_id` 场景下写入 `parent_turn_id`，并按该链路构建上下文；`rewrite_report` 未指定目标时读取分支可见最新报告。
