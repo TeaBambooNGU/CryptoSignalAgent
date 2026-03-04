@@ -14,7 +14,7 @@
 ![TypeScript](https://img.shields.io/badge/TypeScript-5-3178C6?logo=typescript&logoColor=white&style=flat-square)
 
 基于 `LangChain + LangGraph + MCP + Milvus + Mem0` 构建，面向“信号采集 -> 研报生成 -> 持续对话 -> 分支回放”的完整链路。
-
+演示视频：https://www.bilibili.com/video/BV1SUPvz3Egj
 ## 目录
 
 - [Crypto Signal Agent](#crypto-signal-agent)
