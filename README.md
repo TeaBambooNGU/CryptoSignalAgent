@@ -143,11 +143,11 @@ uv run python main.py
   - `POST /v1/conversation/{conversation_id}/message`
 - 会话查询与回放
   - `GET /v1/conversation/{conversation_id}`
-  - `GET /v1/conversation/{conversation_id}/turns`
+  - `GET /v1/conversation/{conversation_id}/turns`（summary 含 `parent_turn_id`，可直接构建分支树）
   - `GET /v1/conversation/{conversation_id}/turns/{turn_id}`
   - `GET /v1/conversation/{conversation_id}/reports`
   - `GET /v1/conversation/{conversation_id}/reports/{report_id}`
-  - `POST /v1/conversation/{conversation_id}/resume`
+  - `POST /v1/conversation/{conversation_id}/resume`（支持 `from_turn_id` 分支恢复）
 - 兼容入口
   - `POST /v1/research/query`（语义等价于 `action=regenerate_report`）
 - 其他接口
@@ -158,6 +158,14 @@ uv run python main.py
 ## 前端控制台（极简科技风）
 
 前端工程位于 `frontend/`，技术栈为 `React + Vite + TypeScript + TanStack Query + Zustand`。
+
+当前 Dashboard 关键视图：
+- `Message Composer`：发送 `chat/rewrite/regenerate/auto` 消息，支持 `expected_version`、`from_turn_id`
+- `Dialogue`：用户/助手连续对话流
+- `Timeline`：按版本回放 turn
+- `Branch Tree`：基于 `parent_turn_id` 的分支树，可“一键设为 from_turn_id/target_report_id”
+  - 支持“仅看当前锚点分支”开关（聚焦 `from_turn_id -> 祖先` 链路）
+- `Version Tape`：报告版本资产回放与选择
 
 1. 安装依赖：
 
@@ -292,6 +300,20 @@ curl -X POST http://127.0.0.1:8000/v1/conversation/conv-u001-1/message \
 curl "http://127.0.0.1:8000/v1/conversation/conv-u001-1/reports?limit=20"
 ```
 
+5. 从历史 turn 分支恢复后继续（`resume` + `from_turn_id`）
+
+```bash
+curl -X POST http://127.0.0.1:8000/v1/conversation/conv-u001-1/resume \
+  -H "Content-Type: application/json" \
+  -d '{
+    "user_id":"u001",
+    "query":"从 turn-1 分支重跑一版，重点看 ETH 风险",
+    "from_turn_id":"turn-1",
+    "expected_version":3,
+    "request_id":"req-u001-branch-1"
+  }'
+```
+
 > 若你仍在使用 `POST /v1/research/query`，它会走兼容路径，行为等价于 `regenerate_report`。
 
 ## 测试
@@ -306,6 +328,7 @@ uv run python -m unittest tests/test_api.py
 - 报告默认附带风险免责声明：仅供研究，不构成投资建议。
 - 当 Milvus 不可用时，系统可按配置降级到内存存储。
 - 当 LLM 不可用时，`/v1/research/query` 与 `/v1/conversation/{conversation_id}/message` 都会返回 500（硬失败）。
+- `from_turn_id` 在 `message/resume` 中会作为分支锚点：新 turn 挂到该父节点，并仅使用该链路上下文（而非其他分支）。
 - 使用智谱 embedding 时，请确保 `VECTOR_DIM` 与模型输出维度一致。
 - 记忆写入采用 outbox projector 异步投影（Milvus/Mem0 最终一致）；会话真相状态先落地本地 SQLite。
 - 若要启用 `SESSION_STORE_BACKEND=redis`，请先安装 Python Redis 客户端（例如 `uv add redis`）。

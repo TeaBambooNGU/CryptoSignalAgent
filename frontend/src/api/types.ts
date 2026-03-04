@@ -50,6 +50,7 @@ export interface ConversationTurnSummary {
   status: string;
   intent: string;
   turn_type: string;
+  parent_turn_id?: string | null;
   report_id?: string | null;
   created_at: number;
   updated_at: number;

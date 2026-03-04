@@ -137,6 +137,10 @@ class ConversationAPITestCase(unittest.TestCase):
         self.assertEqual(chat_payload["action_taken"], "chat")
         self.assertTrue(chat_payload["report"] is None)
         self.assertTrue(chat_payload["assistant_message"])
+        chat_detail = self.client.get(
+            f"/v1/conversation/{conversation_id}/turns/{chat_payload['turn_id']}"
+        ).json()
+        self.assertEqual(chat_detail["parent_turn_id"], first_payload["turn_id"])
 
         rewrite = self.client.post(
             f"/v1/conversation/{conversation_id}/message",
@@ -256,6 +260,10 @@ class ConversationAPITestCase(unittest.TestCase):
         resume_payload = resume.json()
         self.assertEqual(resume_payload["conversation_version"], 2)
         self.assertNotEqual(resume_payload["turn_id"], first_payload["turn_id"])
+        resume_detail = self.client.get(
+            f"/v1/conversation/{conversation_id}/turns/{resume_payload['turn_id']}"
+        ).json()
+        self.assertEqual(resume_detail["parent_turn_id"], first_payload["turn_id"])
 
         missing = self.client.post(
             f"/v1/conversation/{conversation_id}/resume",
@@ -267,6 +275,115 @@ class ConversationAPITestCase(unittest.TestCase):
             },
         )
         self.assertEqual(missing.status_code, 404)
+
+    def test_resume_branch_lineage_is_isolated(self) -> None:
+        conversation_id = "conv-resume-branch"
+        first = self.client.post(
+            "/v1/research/query",
+            json={
+                "user_id": "u-branch",
+                "query": "主线第一轮",
+                "conversation_id": conversation_id,
+                "request_id": "req-branch-1",
+            },
+        )
+        self.assertEqual(first.status_code, 200)
+        first_payload = first.json()
+
+        second = self.client.post(
+            "/v1/research/query",
+            json={
+                "user_id": "u-branch",
+                "query": "主线第二轮",
+                "conversation_id": conversation_id,
+                "request_id": "req-branch-2",
+                "expected_version": first_payload["conversation_version"],
+            },
+        )
+        self.assertEqual(second.status_code, 200)
+        second_payload = second.json()
+
+        branch = self.client.post(
+            f"/v1/conversation/{conversation_id}/resume",
+            json={
+                "user_id": "u-branch",
+                "query": "从第一轮分叉重跑",
+                "from_turn_id": first_payload["turn_id"],
+                "expected_version": second_payload["conversation_version"],
+                "request_id": "req-branch-3",
+            },
+        )
+        self.assertEqual(branch.status_code, 200)
+        branch_payload = branch.json()
+
+        branch_chat = self.client.post(
+            f"/v1/conversation/{conversation_id}/message",
+            json={
+                "user_id": "u-branch",
+                "message": "继续分支追问",
+                "action": "chat",
+                "from_turn_id": branch_payload["turn_id"],
+                "expected_version": branch_payload["conversation_version"],
+                "request_id": "req-branch-4",
+            },
+        )
+        self.assertEqual(branch_chat.status_code, 200)
+        branch_chat_payload = branch_chat.json()
+
+        runtime_store = self._app.state.runtime.conversation_store
+        lineage = runtime_store.list_turn_lineage(
+            conversation_id=conversation_id,
+            leaf_turn_id=branch_chat_payload["turn_id"],
+            limit=10,
+        )
+        lineage_turn_ids = [row["turn_id"] for row in lineage]
+        self.assertEqual(lineage_turn_ids[:3], [branch_chat_payload["turn_id"], branch_payload["turn_id"], first_payload["turn_id"]])
+        self.assertNotIn(second_payload["turn_id"], lineage_turn_ids)
+
+    def test_rewrite_without_target_report_uses_branch_report(self) -> None:
+        conversation_id = "conv-rewrite-branch"
+        first = self.client.post(
+            f"/v1/conversation/{conversation_id}/message",
+            json={
+                "user_id": "u-rewrite-branch",
+                "message": "生成第一版报告",
+                "action": "regenerate_report",
+                "request_id": "req-rewrite-branch-1",
+            },
+        )
+        self.assertEqual(first.status_code, 200)
+        first_payload = first.json()
+        first_report_id = first_payload.get("report", {}).get("report_id")
+        self.assertTrue(first_report_id)
+
+        second = self.client.post(
+            f"/v1/conversation/{conversation_id}/message",
+            json={
+                "user_id": "u-rewrite-branch",
+                "message": "主线再生成一版",
+                "action": "regenerate_report",
+                "request_id": "req-rewrite-branch-2",
+                "expected_version": first_payload["conversation_version"],
+            },
+        )
+        self.assertEqual(second.status_code, 200)
+        second_payload = second.json()
+
+        rewrite = self.client.post(
+            f"/v1/conversation/{conversation_id}/message",
+            json={
+                "user_id": "u-rewrite-branch",
+                "message": "从第一版分支改写",
+                "action": "rewrite_report",
+                "from_turn_id": first_payload["turn_id"],
+                "request_id": "req-rewrite-branch-3",
+                "expected_version": second_payload["conversation_version"],
+            },
+        )
+        self.assertEqual(rewrite.status_code, 200)
+        rewrite_payload = rewrite.json()
+        self.assertEqual(rewrite_payload["action_taken"], "rewrite_report")
+        self.assertEqual(rewrite_payload["report"]["based_on_report_id"], first_report_id)
 
 
 if __name__ == "__main__":

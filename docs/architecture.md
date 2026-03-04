@@ -1,6 +1,6 @@
 # 工程架构梳理
 
-- 当前梳理时间: 2026-03-04 00:11:08
+- 当前梳理时间: 2026-03-04 14:54:59
 
 ## 项目概览
 - 项目定位: 面向加密市场研究场景的“对话优先”研报 Agent，支持“持续会话 -> 报告版本化 -> 可恢复回放”。
@@ -9,14 +9,16 @@
   - MCP 采集按 server 拆分为并行 Agent 执行：多 MCP 配置会并发拉取信号并在节点内合并。
   - 基于 LangGraph 编排主流程 9 节点，并输出节点级真实耗时 `workflow_steps`。
   - 会话统一入口支持 `auto/chat/rewrite_report/regenerate_report` 四种动作路由。
+  - `from_turn_id` 提供真实分支语义：新 turn 通过 `parent_turn_id` 挂接到指定历史节点，并按该链路构建上下文。
   - 报告版本资产化（`conversation_report`）+ 会话轮次真相库（`conversation_turn`）+ 长会话摘要压缩（`conversation_context_summary`）。
   - 会话一致性采用“同会话单写者锁 + CAS version + request_id 幂等”保障并发安全与重试稳定。
   - Milvus/Mem0 写入通过 outbox 异步投影，保证会话真相库强一致、外部记忆最终一致。
-  - 提供 React 控制台前端，支持持续对话、回溯 turn、选择报告版本并继续改写/重跑。
+  - 提供 React 控制台前端，支持持续对话、回溯 turn、按 `parent_turn_id` 展示 Branch Tree、选择报告版本并继续改写/重跑。
 - 关键输出:
   - `POST /v1/conversation/{conversation_id}/message`：统一对话入口，返回 `action_taken/assistant_message/report?/workflow_steps`。
-  - `GET /v1/conversation/{conversation_id}/turns`、`GET /v1/conversation/{conversation_id}/turns/{turn_id}`：会话轮次回放。
+  - `GET /v1/conversation/{conversation_id}/turns`、`GET /v1/conversation/{conversation_id}/turns/{turn_id}`：会话轮次回放（summary/detail 均含 `parent_turn_id`）。
   - `GET /v1/conversation/{conversation_id}/reports`、`GET /v1/conversation/{conversation_id}/reports/{report_id}`：报告版本回放。
+  - `POST /v1/conversation/{conversation_id}/resume`：基于可选 `from_turn_id` 从历史分支继续执行下一轮 `regenerate_report`。
   - `POST /v1/research/query`：兼容入口，语义等价于 `regenerate_report`。
   - 所有请求通过中间件注入/透传 `X-Trace-Id` 响应头，便于端到端排障。
 
@@ -60,7 +62,7 @@
   - `app/conversation/projector.py`: 消费 outbox 并异步投影到长期记忆写接口。
   - `app/graph/workflow.py`: 主流程 9 节点编排（load memory / resolve symbols / collect via MCP / normalize & index / retrieve / analyze / generate / persist memory / finalize）。
   - `app/memory/mem0_service.py`: 偏好写回、画像聚合、recent turns + summary 注入、Mem0 platform/oss 兼容。
-  - `frontend/src/pages/DashboardPage.tsx`: Message Composer、Dialogue 流、Turn Timeline、Report Version Tape。
+  - `frontend/src/pages/DashboardPage.tsx`: Message Composer、Dialogue 流、Turn Timeline、Branch Tree（含“仅看当前锚点分支”过滤）、Report Version Tape。
 - 主要依赖:
   - 后端: FastAPI/Uvicorn、LangGraph、LangChain、langchain-openai、langchain-mcp-adapters、tenacity、mcp、pymilvus、langchain-community（Zhipu embedding）、llama-index、mem0（可选）、redis（可选）。
   - 前端: React、Vite、TypeScript、TanStack Query、Zustand、React Router。
@@ -107,12 +109,13 @@
 - 主链路（`POST /v1/conversation/{conversation_id}/message`）:
   1. API 路由接收消息并注入/透传 `trace_id`。
   2. `ConversationService.send_message` 执行 `prepare_turn`（CAS + 幂等 + version 分配）。
-  3. `action=auto` 时根据历史报告存在性与关键词路由到 `chat/rewrite/regenerate`。
-  4. `chat`：基于“摘要 + 最近 turns + 最新报告”构造 prompt，直接调用 LLM 生成对话回复。
-  5. `rewrite_report`：读取目标报告（或最新报告）并按用户要求改写，生成新报告版本。
-  6. `regenerate_report`：调用 `ResearchGraphRunner.arun` 执行完整 9 节点流程并产出新报告版本。
-  7. 事务写入 `conversation_turn`，必要时写入 `conversation_report`，并更新 `idempotency_request=completed`。
-  8. 刷新 `conversation_context_summary`（超过窗口后增量压缩历史轮次）。
+  3. 若提供 `from_turn_id`，将其作为分支锚点（父节点）；未提供时默认挂接当前最新 turn。
+  4. `action=auto` 时根据历史报告存在性与关键词路由到 `chat/rewrite/regenerate`。
+  5. `chat`：基于“分支摘要 + 分支最近 turns + 分支最新报告”构造 prompt，调用 LLM 生成对话回复。
+  6. `rewrite_report`：优先读取目标报告；未指定时读取分支链路可见的最新报告并改写。
+  7. `regenerate_report`：调用 `ResearchGraphRunner.arun` 执行完整 9 节点流程并产出新报告版本（透传分支锚点到记忆加载）。
+  8. 事务写入 `conversation_turn`，必要时写入 `conversation_report`，并更新 `idempotency_request=completed`。
+  9. 刷新 `conversation_context_summary`（超过窗口后增量压缩历史轮次）。
 - 兼容链路（`POST /v1/research/query`）:
   - 直接调用 `ConversationService.run_research_turn`，内部固定走 `regenerate_report` 路径并复用同一套一致性语义。
 - 控制/调度流程:
@@ -160,6 +163,8 @@ sequenceDiagram
 - `DashboardPage` 默认通过 `sendConversationMessage` 调用会话统一入口，不再局限单次 `query`。
 - 页面采用四块主视图：`Message Composer`、`Dialogue`、`Timeline`、`Version Tape`。
 - 支持 `action` 选择（auto/chat/rewrite/regenerate）、`expected_version` 回填、`from_turn_id` 分支续写。
+- `Timeline` 上方新增 `Branch Tree`：基于 `parent_turn_id` 构建分支树，可一键设置 `from_turn_id` / `target_report_id`。
+- `Branch Tree` 提供“仅看当前锚点分支”开关：当 `from_turn_id` 有效时仅展示锚点到祖先链路；未设置时回退全量树。
 - 会话冲突（409）会解析 `conversation_version_conflict/request_in_flight` 并提示“按最新版本重试”。
 - 报告区支持版本选择与回放，chat 场景下可只展示助手回复；报告仍支持 `<think>` 分离渲染。
 
@@ -210,6 +215,15 @@ sequenceDiagram
   - LangSmith 通过 `configure_langsmith` 以环境变量控制开启。
 
 ## 改动概要/变更记录
+### 2026-03-04 14:54:59
+- 本次新增/更新要点:
+  - 会话分支语义落地为“真分支”：`resume/message` 在 `from_turn_id` 场景下写入 `parent_turn_id`，并按该链路构建上下文；`rewrite_report` 未指定目标时读取分支可见最新报告。
+  - 会话读取增强：`GET /v1/conversation/{id}/turns` 的 summary 增加 `parent_turn_id`，前端可直接构建分支树而无需逐条查询 detail。
+  - 前端 Dashboard 新增 `Branch Tree` 与“仅看当前锚点分支”开关，支持围绕 `from_turn_id` 快速聚焦分支链路。
+- 变更动机/需求来源:
+  - 来源于当前会话需求：用户要求 `resume` 支持真实分支续写，并要求前端增加分支树与锚点分支过滤能力。
+- 当前更新时间: 2026-03-04 14:54:59
+
 ### 2026-03-04 00:11:08
 - 本次新增/更新要点:
   - 架构主入口从“单次 query”扩展为“会话消息驱动”：新增 `POST /v1/conversation/{conversation_id}/message`，支持 `auto/chat/rewrite_report/regenerate_report`。

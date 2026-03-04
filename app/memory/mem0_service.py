@@ -316,13 +316,25 @@ class MemoryService:
             },
         )
 
-    def load_memory_profile(self, user_id: str, conversation_id: str | None = None) -> dict[str, Any]:
+    def load_memory_profile(
+        self,
+        user_id: str,
+        conversation_id: str | None = None,
+        context_anchor_turn_id: str | None = None,
+    ) -> dict[str, Any]:
         """聚合用户长期记忆与短期记忆。"""
 
         long_term = self.milvus_store.query_user_memory(user_id=user_id, limit=100)
         session = self.session_store.get(conversation_id=conversation_id or user_id, limit=50)
-        recent_turn_context = self.load_recent_turn_context(conversation_id=conversation_id, limit=8)
-        conversation_summary = self.load_conversation_summary(conversation_id=conversation_id)
+        recent_turn_context = self.load_recent_turn_context(
+            conversation_id=conversation_id,
+            limit=8,
+            context_anchor_turn_id=context_anchor_turn_id,
+        )
+        conversation_summary = self.load_conversation_summary(
+            conversation_id=conversation_id,
+            context_anchor_turn_id=context_anchor_turn_id,
+        )
 
         profile = {
             "user_id": user_id,
@@ -341,15 +353,29 @@ class MemoryService:
             profile["mem0_recent"] = mem0_recent
         return profile
 
-    def load_recent_turn_context(self, conversation_id: str | None, limit: int = 8) -> list[dict[str, Any]]:
+    def load_recent_turn_context(
+        self,
+        conversation_id: str | None,
+        limit: int = 8,
+        context_anchor_turn_id: str | None = None,
+    ) -> list[dict[str, Any]]:
         """从会话真相库读取最近轮次上下文。"""
 
         if not conversation_id or self.conversation_store is None:
             return []
         try:
-            rows = self.conversation_store.list_turns(
-                conversation_id=conversation_id,
-                limit=max(1, min(limit, 20)),
+            final_limit = max(1, min(limit, 20))
+            rows = (
+                self.conversation_store.list_turn_lineage(
+                    conversation_id=conversation_id,
+                    leaf_turn_id=context_anchor_turn_id,
+                    limit=final_limit,
+                )
+                if context_anchor_turn_id
+                else self.conversation_store.list_turns(
+                    conversation_id=conversation_id,
+                    limit=final_limit,
+                )
             )
         except Exception:
             logger.exception("读取会话 turn 上下文失败，已降级为空")
@@ -370,12 +396,39 @@ class MemoryService:
             )
         return result
 
-    def load_conversation_summary(self, conversation_id: str | None) -> dict[str, Any] | None:
+    def load_conversation_summary(
+        self,
+        conversation_id: str | None,
+        context_anchor_turn_id: str | None = None,
+    ) -> dict[str, Any] | None:
         """读取会话摘要压缩结果。"""
 
         if not conversation_id or self.conversation_store is None:
             return None
         try:
+            if context_anchor_turn_id:
+                lineage_turns = self.conversation_store.list_turn_lineage(
+                    conversation_id=conversation_id,
+                    leaf_turn_id=context_anchor_turn_id,
+                    limit=24,
+                )
+                if len(lineage_turns) <= 8:
+                    return None
+                older_turns = lineage_turns[8:]
+                if not older_turns:
+                    return None
+                lines: list[str] = []
+                for turn in reversed(older_turns[:16]):
+                    query = str(turn.get("query", "")).strip().replace("\n", " ")
+                    answer = str(turn.get("assistant_message", "")).strip().replace("\n", " ")
+                    if len(answer) > 120:
+                        answer = answer[:120] + "..."
+                    lines.append(f"- v{turn.get('version')}[{turn.get('intent', '')}] Q:{query} A:{answer}")
+                return {
+                    "through_version": int(older_turns[0].get("version", 0) or 0),
+                    "summary_text": "\n".join(lines),
+                    "updated_at": int(lineage_turns[0].get("updated_at", 0) or 0),
+                }
             row = self.conversation_store.get_context_summary(conversation_id=conversation_id)
             if not row:
                 return None

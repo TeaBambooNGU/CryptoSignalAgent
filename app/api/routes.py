@@ -213,7 +213,7 @@ async def resume_conversation(
     request: Request,
     runtime: AppRuntime = Depends(get_runtime),
 ) -> QueryResponse:
-    """基于历史会话继续执行下一轮。"""
+    """基于历史会话继续执行下一轮（支持 from_turn_id 分支恢复）。"""
 
     trace_id = getattr(request.state, "trace_id", "") or get_current_trace_id()
     if not trace_id or trace_id == "-":

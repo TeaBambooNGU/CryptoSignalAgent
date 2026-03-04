@@ -50,7 +50,7 @@ class ResumeConversationRequest(BaseModel):
     user_id: str = Field(..., description="用户唯一标识")
     query: str = Field(..., description="研究问题")
     task_context: dict[str, Any] | None = Field(default=None, description="可选任务上下文")
-    from_turn_id: str | None = Field(default=None, description="恢复起点 turn_id（可选，默认最新）")
+    from_turn_id: str | None = Field(default=None, description="分支恢复锚点 turn_id（可选，默认沿当前最新继续）")
     request_id: str | None = Field(default=None, description="请求幂等键（可选）")
     expected_version: int | None = Field(default=None, ge=0, description="会话 CAS 版本（可选）")
 
@@ -120,6 +120,7 @@ class ConversationTurnSummary(BaseModel):
     status: str = Field(..., description="turn 状态")
     intent: str = Field(default="", description="意图类型")
     turn_type: str = Field(default="", description="turn 类型")
+    parent_turn_id: str | None = Field(default=None, description="父轮次 ID")
     report_id: str | None = Field(default=None, description="关联报告 ID")
     created_at: int = Field(..., ge=0, description="创建时间（Unix 秒）")
     updated_at: int = Field(..., ge=0, description="更新时间（Unix 秒）")
@@ -175,7 +176,7 @@ class ConversationMessageRequest(BaseModel):
     task_context: dict[str, Any] | None = Field(default=None, description="可选任务上下文")
     action: ConversationAction = Field(default=ConversationAction.AUTO, description="会话动作")
     target_report_id: str | None = Field(default=None, description="目标报告 ID（重写时可选）")
-    from_turn_id: str | None = Field(default=None, description="关联起点 turn_id（可选）")
+    from_turn_id: str | None = Field(default=None, description="分支锚点 turn_id（可选，用于从历史分叉续写）")
     request_id: str | None = Field(default=None, description="请求幂等键（可选）")
     expected_version: int | None = Field(default=None, ge=0, description="会话 CAS 版本（可选）")
 

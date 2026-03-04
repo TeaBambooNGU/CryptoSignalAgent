@@ -97,6 +97,7 @@ class ResearchGraphRunner:
         turn_id: str | None = None,
         request_id: str | None = None,
         conversation_version: int | None = None,
+        context_anchor_turn_id: str | None = None,
     ) -> QueryResponse:
         """执行研报流程并返回 API 响应。"""
 
@@ -112,6 +113,7 @@ class ResearchGraphRunner:
             "task_context": task_context,
             "conversation_id": final_conversation_id,
             "turn_id": final_turn_id,
+            "context_anchor_turn_id": context_anchor_turn_id,
             "request_id": final_request_id,
             "conversation_version": final_conversation_version,
             "task_id": task_id,
@@ -157,6 +159,7 @@ class ResearchGraphRunner:
         turn_id: str | None = None,
         request_id: str | None = None,
         conversation_version: int | None = None,
+        context_anchor_turn_id: str | None = None,
     ) -> QueryResponse:
         """同步包装器（兼容旧调用方）。"""
 
@@ -170,6 +173,7 @@ class ResearchGraphRunner:
                 turn_id=turn_id,
                 request_id=request_id,
                 conversation_version=conversation_version,
+                context_anchor_turn_id=context_anchor_turn_id,
             )
         )
 
@@ -194,6 +198,7 @@ class ResearchGraphRunner:
                 profile = self.memory_service.load_memory_profile(
                     user_id=user_id,
                     conversation_id=conversation_id,
+                    context_anchor_turn_id=state.get("context_anchor_turn_id"),
                 )
                 logger.info(
                     "节点完成 long_term=%s session=%s",

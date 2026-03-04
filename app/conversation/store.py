@@ -225,6 +225,9 @@ class SQLiteConversationTruthStore:
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_turn_report_id ON conversation_turn(conversation_id, report_id)"
             )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_turn_parent_turn ON conversation_turn(conversation_id, parent_turn_id)"
+            )
 
     def prepare_turn(
         self,
@@ -695,7 +698,7 @@ class SQLiteConversationTruthStore:
                     """
                     SELECT conversation_id, turn_id, version, request_id, user_id, query_text,
                            assistant_message_text, response_report, trace_id, status,
-                           intent, turn_type, report_id, created_at, updated_at
+                           intent, turn_type, parent_turn_id, report_id, created_at, updated_at
                     FROM conversation_turn
                     WHERE conversation_id = ?
                     ORDER BY version DESC
@@ -708,7 +711,7 @@ class SQLiteConversationTruthStore:
                     """
                     SELECT conversation_id, turn_id, version, request_id, user_id, query_text,
                            assistant_message_text, response_report, trace_id, status,
-                           intent, turn_type, report_id, created_at, updated_at
+                           intent, turn_type, parent_turn_id, report_id, created_at, updated_at
                     FROM conversation_turn
                     WHERE conversation_id = ? AND version < ?
                     ORDER BY version DESC
@@ -731,6 +734,7 @@ class SQLiteConversationTruthStore:
                 "status": str(row["status"]),
                 "intent": str(row["intent"] or ""),
                 "turn_type": str(row["turn_type"] or ""),
+                "parent_turn_id": str(row["parent_turn_id"]) if row["parent_turn_id"] else None,
                 "report_id": str(row["report_id"]) if row["report_id"] else None,
                 "created_at": int(row["created_at"]),
                 "updated_at": int(row["updated_at"]),
@@ -778,6 +782,54 @@ class SQLiteConversationTruthStore:
         if row is None:
             return None
         return self._decode_turn_row(row)
+
+    def list_turn_lineage(
+        self,
+        *,
+        conversation_id: str,
+        leaf_turn_id: str,
+        limit: int = 20,
+    ) -> list[dict[str, Any]]:
+        """获取从叶子 turn 回溯到祖先链路的明细（按叶子->祖先顺序）。"""
+
+        final_limit = min(max(int(limit), 1), 500)
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                WITH RECURSIVE lineage AS (
+                    SELECT conversation_id, turn_id, version, request_id, user_id, query_text,
+                           assistant_message_text, task_context_json, response_report,
+                           response_citations_json, response_errors_json, workflow_steps_json,
+                           trace_id, status, intent, turn_type, parent_turn_id, report_id,
+                           created_at, updated_at, 0 AS depth
+                    FROM conversation_turn
+                    WHERE conversation_id = ? AND turn_id = ?
+
+                    UNION ALL
+
+                    SELECT parent.conversation_id, parent.turn_id, parent.version, parent.request_id, parent.user_id,
+                           parent.query_text, parent.assistant_message_text, parent.task_context_json, parent.response_report,
+                           parent.response_citations_json, parent.response_errors_json, parent.workflow_steps_json,
+                           parent.trace_id, parent.status, parent.intent, parent.turn_type, parent.parent_turn_id,
+                           parent.report_id, parent.created_at, parent.updated_at, lineage.depth + 1 AS depth
+                    FROM conversation_turn AS parent
+                    JOIN lineage
+                      ON parent.conversation_id = lineage.conversation_id
+                     AND parent.turn_id = lineage.parent_turn_id
+                    WHERE lineage.parent_turn_id IS NOT NULL
+                )
+                SELECT conversation_id, turn_id, version, request_id, user_id, query_text,
+                       assistant_message_text, task_context_json, response_report,
+                       response_citations_json, response_errors_json, workflow_steps_json,
+                       trace_id, status, intent, turn_type, parent_turn_id, report_id,
+                       created_at, updated_at
+                FROM lineage
+                ORDER BY depth ASC
+                LIMIT ?
+                """,
+                (conversation_id, leaf_turn_id, final_limit),
+            ).fetchall()
+        return [self._decode_turn_row(row) for row in rows]
 
     def list_reports(
         self,
@@ -844,6 +896,50 @@ class SQLiteConversationTruthStore:
                 LIMIT 1
                 """,
                 (conversation_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        return self._decode_report_row(row)
+
+    def get_latest_report_on_lineage(
+        self,
+        *,
+        conversation_id: str,
+        leaf_turn_id: str,
+    ) -> dict[str, Any] | None:
+        """获取分支链路可见的最新报告。"""
+
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                WITH RECURSIVE lineage AS (
+                    SELECT conversation_id, turn_id, parent_turn_id
+                    FROM conversation_turn
+                    WHERE conversation_id = ? AND turn_id = ?
+
+                    UNION ALL
+
+                    SELECT parent.conversation_id, parent.turn_id, parent.parent_turn_id
+                    FROM conversation_turn AS parent
+                    JOIN lineage
+                      ON parent.conversation_id = lineage.conversation_id
+                     AND parent.turn_id = lineage.parent_turn_id
+                    WHERE lineage.parent_turn_id IS NOT NULL
+                )
+                SELECT report.report_id, report.conversation_id, report.report_version,
+                       report.created_by_turn_id, report.based_on_report_id, report.mode,
+                       report.report_text, report.citations_json, report.workflow_steps_json,
+                       report.status, report.created_at, report.updated_at
+                FROM lineage
+                JOIN conversation_turn AS turn_row
+                  ON turn_row.conversation_id = lineage.conversation_id
+                 AND turn_row.turn_id = lineage.turn_id
+                JOIN conversation_report AS report
+                  ON report.report_id = turn_row.report_id
+                ORDER BY report.report_version DESC
+                LIMIT 1
+                """,
+                (conversation_id, leaf_turn_id),
             ).fetchone()
         if row is None:
             return None

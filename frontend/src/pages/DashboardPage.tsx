@@ -8,7 +8,12 @@ import {
   listConversationTurns,
   sendConversationMessage,
 } from "../api/client";
-import type { ConversationAction, ConversationReport, WorkflowStep } from "../api/types";
+import type {
+  ConversationAction,
+  ConversationReport,
+  ConversationTurnSummary,
+  WorkflowStep,
+} from "../api/types";
 import { PulseRail } from "../components/PulseRail";
 import { BASE_WORKFLOW, type WorkflowNode, useConsoleStore } from "../store/useConsoleStore";
 
@@ -317,6 +322,97 @@ interface ConflictHint {
   message: string;
 }
 
+interface BranchTreeRow {
+  turn: ConversationTurnSummary;
+  depth: number;
+  childCount: number;
+  hasDetachedParent: boolean;
+}
+
+function buildBranchTreeRows(turns: ConversationTurnSummary[]): BranchTreeRow[] {
+  if (!turns.length) return [];
+  const turnsByVersion = [...turns].sort((left, right) => left.version - right.version);
+  const turnById = new Map(turnsByVersion.map((turn) => [turn.turn_id, turn]));
+  const childrenByParentId = new Map<string, string[]>();
+  const roots: ConversationTurnSummary[] = [];
+  const detachedParentSet = new Set<string>();
+
+  for (const turn of turnsByVersion) {
+    const parentId = (turn.parent_turn_id || "").trim();
+    if (!parentId) {
+      roots.push(turn);
+      continue;
+    }
+    if (!turnById.has(parentId)) {
+      roots.push(turn);
+      detachedParentSet.add(turn.turn_id);
+      continue;
+    }
+    const siblings = childrenByParentId.get(parentId) ?? [];
+    siblings.push(turn.turn_id);
+    childrenByParentId.set(parentId, siblings);
+  }
+
+  for (const siblings of childrenByParentId.values()) {
+    siblings.sort((leftId, rightId) => {
+      const left = turnById.get(leftId);
+      const right = turnById.get(rightId);
+      return (left?.version ?? 0) - (right?.version ?? 0);
+    });
+  }
+
+  const rows: BranchTreeRow[] = [];
+  const visited = new Set<string>();
+  const visitNode = (turnId: string, depth: number) => {
+    if (visited.has(turnId)) return;
+    const turn = turnById.get(turnId);
+    if (!turn) return;
+    visited.add(turnId);
+    const children = childrenByParentId.get(turnId) ?? [];
+    rows.push({
+      turn,
+      depth,
+      childCount: children.length,
+      hasDetachedParent: detachedParentSet.has(turnId),
+    });
+    for (const childId of children) {
+      visitNode(childId, depth + 1);
+    }
+  };
+
+  for (const root of roots) {
+    visitNode(root.turn_id, 0);
+  }
+
+  // 兜底处理异常链路，避免任何 turn 在树上丢失。
+  for (const turn of turnsByVersion) {
+    if (!visited.has(turn.turn_id)) {
+      visitNode(turn.turn_id, 0);
+    }
+  }
+  return rows;
+}
+
+function collectAnchorLineageTurnIds(
+  turns: ConversationTurnSummary[],
+  anchorTurnId: string,
+): Set<string> {
+  const target = anchorTurnId.trim();
+  if (!target) return new Set<string>();
+  const turnById = new Map(turns.map((turn) => [turn.turn_id, turn]));
+  const result = new Set<string>();
+  let cursor: string | undefined = target;
+  while (cursor) {
+    const turn = turnById.get(cursor);
+    if (!turn) break;
+    if (result.has(turn.turn_id)) break;
+    result.add(turn.turn_id);
+    const parentId = (turn.parent_turn_id || "").trim();
+    cursor = parentId || undefined;
+  }
+  return result;
+}
+
 function parseConflictHint(error: unknown): ConflictHint | null {
   if (!(error instanceof ApiError) || error.status !== 409) {
     return null;
@@ -371,6 +467,7 @@ export function DashboardPage() {
   const [traceVersionInput, setTraceVersionInput] = useState("");
   const [conflictHint, setConflictHint] = useState<ConflictHint | null>(null);
   const [newTurnId, setNewTurnId] = useState<string | null>(null);
+  const [showAnchorBranchOnly, setShowAnchorBranchOnly] = useState(false);
   const dialogueListRef = useRef<HTMLOListElement | null>(null);
   const previousLatestTurnIdRef = useRef<string | null>(null);
   const {
@@ -506,6 +603,17 @@ export function DashboardPage() {
   );
 
   const turns = useMemo(() => (turnsQuery.data?.pages ?? []).flat(), [turnsQuery.data?.pages]);
+  const branchTreeRows = useMemo(() => buildBranchTreeRows(turns), [turns]);
+  const anchorLineageTurnIds = useMemo(
+    () => collectAnchorLineageTurnIds(turns, fromTurnId),
+    [turns, fromTurnId],
+  );
+  const hasAnchorLineage = anchorLineageTurnIds.size > 0;
+  const visibleBranchTreeRows = useMemo(() => {
+    if (!showAnchorBranchOnly) return branchTreeRows;
+    if (!hasAnchorLineage) return branchTreeRows;
+    return branchTreeRows.filter((row) => anchorLineageTurnIds.has(row.turn.turn_id));
+  }, [showAnchorBranchOnly, hasAnchorLineage, branchTreeRows, anchorLineageTurnIds]);
   const dialogueTurns = useMemo(
     () => [...turns].sort((left, right) => left.version - right.version),
     [turns],
@@ -826,6 +934,75 @@ export function DashboardPage() {
         </header>
 
         {turnsQuery.isLoading ? <p className="helper-line">加载会话轮次中...</p> : null}
+
+        {branchTreeRows.length ? (
+          <section className="branch-tree-panel">
+            <header className="branch-tree-head">
+              <h3>Branch Tree</h3>
+              <label className="branch-toggle">
+                <input
+                  type="checkbox"
+                  checked={showAnchorBranchOnly}
+                  onChange={(event) => setShowAnchorBranchOnly(event.target.checked)}
+                />
+                <span>仅看当前锚点分支</span>
+              </label>
+              <p className="helper-line">
+                已加载 <code>{turns.length}</code> 条 turn，当前展示 <code>{visibleBranchTreeRows.length}</code> 条。
+              </p>
+              {showAnchorBranchOnly && !hasAnchorLineage ? (
+                <p className="helper-line">未设置有效 from_turn_id，已回退展示全量分支树。</p>
+              ) : null}
+            </header>
+            <ol className="branch-tree-list">
+              {visibleBranchTreeRows.map((row) => {
+                const turn = row.turn;
+                const roleTag = row.childCount > 1 ? `fork×${row.childCount}` : row.childCount ? "branch" : "leaf";
+                return (
+                  <li
+                    key={`branch-tree-${turn.turn_id}`}
+                    className={`branch-node ${row.depth === 0 ? "branch-node--root" : ""} ${fromTurnId === turn.turn_id ? "branch-node--active" : ""} ${newTurnId === turn.turn_id ? "branch-node--new" : ""}`}
+                    style={{ marginLeft: `${Math.min(row.depth, 10) * 22}px` }}
+                  >
+                    <div className="branch-node__meta">
+                      <span>v{turn.version}</span>
+                      <span>{turn.intent || "unknown"}</span>
+                      <span>{roleTag}</span>
+                      <span>{formatTime(turn.created_at)}</span>
+                    </div>
+                    <p className="branch-node__query">{turn.query}</p>
+                    <p className="branch-node__hint">
+                      {row.hasDetachedParent
+                        ? `父节点 ${turn.parent_turn_id || "-"} 未加载，当前以该节点作为局部根展示。`
+                        : `turn_id=${turn.turn_id}${turn.parent_turn_id ? ` · parent=${turn.parent_turn_id}` : " · root"}`}
+                    </p>
+                    <div className="turn-actions">
+                      {turn.report_id ? (
+                        <button
+                          type="button"
+                          className="ghost-button"
+                          onClick={() => setTargetReportId(turn.report_id ?? "")}
+                        >
+                          选为目标报告
+                        </button>
+                      ) : null}
+                      <button
+                        type="button"
+                        className="ghost-button"
+                        onClick={() => {
+                          setFromTurnId(turn.turn_id);
+                          setTraceVersionInput(String(turn.version));
+                        }}
+                      >
+                        设为 from_turn_id
+                      </button>
+                    </div>
+                  </li>
+                );
+              })}
+            </ol>
+          </section>
+        ) : null}
 
         {turns.length ? (
           <ol className="turn-list">

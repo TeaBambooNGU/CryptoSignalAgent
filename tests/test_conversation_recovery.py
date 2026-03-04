@@ -164,6 +164,155 @@ class ConversationRecoveryTestCase(unittest.TestCase):
         self.assertEqual(len(profile["recent_turn_context"]), 1)
         self.assertEqual(profile["recent_turn_context"][0]["query"], "query-1")
 
+    def test_lineage_and_latest_report_on_lineage(self) -> None:
+        conversation_id = "conv-lineage"
+
+        first = self.store.prepare_turn(
+            conversation_id=conversation_id,
+            turn_id=None,
+            request_id="req-lineage-1",
+            expected_version=0,
+        )
+        first_report = self.store.save_turn_result(
+            request_id="req-lineage-1",
+            user_id="u-lineage",
+            query_text="根节点报告",
+            task_context={},
+            assistant_message="report-root",
+            response={
+                "conversation_id": conversation_id,
+                "turn_id": first.turn_id,
+                "request_id": "req-lineage-1",
+                "conversation_version": first.conversation_version,
+                "trace_id": "trace-lineage-1",
+                "report": "report-root",
+                "citations": [],
+                "errors": [],
+                "workflow_steps": [],
+            },
+            parent_turn_id=None,
+            report_payload={
+                "mode": "regenerate",
+                "report": "report-root",
+                "citations": [],
+                "workflow_steps": [],
+            },
+        )
+        assert first_report is not None
+
+        branch = self.store.prepare_turn(
+            conversation_id=conversation_id,
+            turn_id=None,
+            request_id="req-lineage-2",
+            expected_version=1,
+        )
+        branch_report = self.store.save_turn_result(
+            request_id="req-lineage-2",
+            user_id="u-lineage",
+            query_text="从根节点分支报告",
+            task_context={},
+            assistant_message="report-branch",
+            response={
+                "conversation_id": conversation_id,
+                "turn_id": branch.turn_id,
+                "request_id": "req-lineage-2",
+                "conversation_version": branch.conversation_version,
+                "trace_id": "trace-lineage-2",
+                "report": "report-branch",
+                "citations": [],
+                "errors": [],
+                "workflow_steps": [],
+            },
+            parent_turn_id=first.turn_id,
+            report_payload={
+                "mode": "regenerate",
+                "report": "report-branch",
+                "citations": [],
+                "workflow_steps": [],
+            },
+        )
+        assert branch_report is not None
+
+        main = self.store.prepare_turn(
+            conversation_id=conversation_id,
+            turn_id=None,
+            request_id="req-lineage-3",
+            expected_version=2,
+        )
+        main_report = self.store.save_turn_result(
+            request_id="req-lineage-3",
+            user_id="u-lineage",
+            query_text="主线后续报告",
+            task_context={},
+            assistant_message="report-main",
+            response={
+                "conversation_id": conversation_id,
+                "turn_id": main.turn_id,
+                "request_id": "req-lineage-3",
+                "conversation_version": main.conversation_version,
+                "trace_id": "trace-lineage-3",
+                "report": "report-main",
+                "citations": [],
+                "errors": [],
+                "workflow_steps": [],
+            },
+            parent_turn_id=first.turn_id,
+            report_payload={
+                "mode": "regenerate",
+                "report": "report-main",
+                "citations": [],
+                "workflow_steps": [],
+            },
+        )
+        assert main_report is not None
+
+        branch_chat = self.store.prepare_turn(
+            conversation_id=conversation_id,
+            turn_id=None,
+            request_id="req-lineage-4",
+            expected_version=3,
+        )
+        self.store.save_turn_result(
+            request_id="req-lineage-4",
+            user_id="u-lineage",
+            query_text="分支继续追问",
+            task_context={},
+            assistant_message="chat-branch",
+            response={
+                "conversation_id": conversation_id,
+                "turn_id": branch_chat.turn_id,
+                "request_id": "req-lineage-4",
+                "conversation_version": branch_chat.conversation_version,
+                "trace_id": "trace-lineage-4",
+                "report": "chat-branch",
+                "citations": [],
+                "errors": [],
+                "workflow_steps": [],
+            },
+            parent_turn_id=branch.turn_id,
+            report_payload=None,
+        )
+
+        lineage_turns = self.store.list_turn_lineage(
+            conversation_id=conversation_id,
+            leaf_turn_id=branch_chat.turn_id,
+            limit=10,
+        )
+        lineage_turn_ids = [row["turn_id"] for row in lineage_turns]
+        self.assertEqual(lineage_turn_ids[:3], [branch_chat.turn_id, branch.turn_id, first.turn_id])
+        self.assertNotIn(main.turn_id, lineage_turn_ids)
+
+        global_latest_report = self.store.get_latest_report(conversation_id=conversation_id)
+        assert global_latest_report is not None
+        self.assertEqual(global_latest_report["report_id"], main_report["report_id"])
+
+        branch_latest_report = self.store.get_latest_report_on_lineage(
+            conversation_id=conversation_id,
+            leaf_turn_id=branch_chat.turn_id,
+        )
+        assert branch_latest_report is not None
+        self.assertEqual(branch_latest_report["report_id"], branch_report["report_id"])
+
 
 if __name__ == "__main__":
     unittest.main()

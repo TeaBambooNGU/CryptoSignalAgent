@@ -19,6 +19,7 @@ class ResearchState(TypedDict, total=False):
     task_context: dict[str, Any] | None
     conversation_id: str
     turn_id: str
+    context_anchor_turn_id: str | None
     request_id: str
     conversation_version: int
     task_id: str

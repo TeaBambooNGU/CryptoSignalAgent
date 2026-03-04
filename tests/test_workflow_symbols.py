@@ -12,8 +12,13 @@ class _DummyMemoryService:
     def save_task_context(self, user_id: str, conversation_id: str, task_context):  # pragma: no cover - not used
         del user_id, conversation_id, task_context
 
-    def load_memory_profile(self, user_id: str, conversation_id: str | None = None):  # pragma: no cover
-        del user_id, conversation_id
+    def load_memory_profile(
+        self,
+        user_id: str,
+        conversation_id: str | None = None,
+        context_anchor_turn_id: str | None = None,
+    ):  # pragma: no cover
+        del user_id, conversation_id, context_anchor_turn_id
         return {}
 
     def persist_report_memory(  # pragma: no cover - not used in this suite
