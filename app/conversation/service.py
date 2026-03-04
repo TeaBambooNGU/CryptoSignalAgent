@@ -276,14 +276,26 @@ class ConversationService:
         if action != ConversationAction.AUTO:
             return action
 
-        latest_report = self.truth_store.get_latest_report(conversation_id=conversation_id)
-        if latest_report is None:
-            return ConversationAction.REGENERATE_REPORT
-
         lowered = message.lower()
+        generate_keywords = (
+            "生成研报",
+            "生成报告",
+            "生成一版",
+            "生成一份",
+            "给我一版",
+            "先给我一版",
+            "来一版",
+            "出一版",
+            "出个报告",
+            "产出报告",
+            "generate report",
+            "draft report",
+        )
         rewrite_keywords = ("重写", "改写", "润色", "改成", "改为")
         regenerate_keywords = ("重跑", "重新生成", "重做", "按最新", "重新分析", "regenerate", "rerun")
 
+        if any(keyword in lowered for keyword in generate_keywords):
+            return ConversationAction.REGENERATE_REPORT
         if any(keyword in lowered for keyword in regenerate_keywords):
             return ConversationAction.REGENERATE_REPORT
         if any(keyword in lowered for keyword in rewrite_keywords):

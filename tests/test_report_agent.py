@@ -55,6 +55,10 @@ class ReportAgentTestCase(unittest.TestCase):
         self.assertIn("9. [mcp-news/BTC]", user_prompt)
         self.assertIn(f"doc-1 {long_text}", user_prompt)
         self.assertNotIn("A" * 180 + "...", user_prompt)
+        reinforcement_signal = "【强化信号】请严格遵守：先给结论和置信度；每个结论绑定证据；明确风险与反例；保持中文专业研报风格。"
+        self.assertEqual(user_prompt.count(reinforcement_signal), 2)
+        self.assertTrue(user_prompt.startswith(reinforcement_signal))
+        self.assertTrue(user_prompt.strip().endswith(reinforcement_signal))
 
 
 if __name__ == "__main__":

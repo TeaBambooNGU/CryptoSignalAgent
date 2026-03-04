@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import unittest
 
 from app.graph.workflow import ResearchGraphRunner
@@ -30,6 +31,15 @@ class _DummyMemoryService:
 class _DummyMCPSubgraph:
     async def arun(self, **kwargs):  # pragma: no cover - not used in this suite
         del kwargs
+        return {"raw_signals": [], "errors": []}
+
+
+class _CaptureMCPSubgraph:
+    def __init__(self) -> None:
+        self.calls: list[dict[str, object]] = []
+
+    async def arun(self, **kwargs):
+        self.calls.append(kwargs)
         return {"raw_signals": [], "errors": []}
 
 
@@ -99,6 +109,32 @@ class WorkflowSymbolResolutionTestCase(unittest.TestCase):
         self.assertEqual(output["hard_symbols"], [])
         self.assertEqual(output["soft_symbols"], ["BTC", "ETH"])
         self.assertEqual(output["symbols"], [])
+
+    def test_collect_signals_uses_hard_symbols_and_passes_soft_as_hint(self) -> None:
+        capture_mcp = _CaptureMCPSubgraph()
+        runner = ResearchGraphRunner(
+            memory_service=_DummyMemoryService(),
+            mcp_subgraph=capture_mcp,
+            research_service=_DummyResearchService(),
+            report_agent=_DummyReportAgent(),
+        )
+        state = {
+            "user_id": "u1",
+            "query": "请分析 BTC",
+            "task_id": "task-1",
+            "symbols": ["BTC"],
+            "hard_symbols": ["BTC"],
+            "soft_symbols": ["BTC", "ETH"],
+            "errors": [],
+            "workflow_steps": [],
+        }
+
+        asyncio.run(runner.collect_signals_via_mcp(state))
+
+        self.assertEqual(len(capture_mcp.calls), 1)
+        call = capture_mcp.calls[0]
+        self.assertEqual(call["symbols"], ["BTC"])
+        self.assertEqual(call["hint_symbols"], ["BTC", "ETH"])
 
 
 if __name__ == "__main__":

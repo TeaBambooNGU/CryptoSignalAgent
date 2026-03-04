@@ -113,10 +113,12 @@ class MCPSignalSubgraphRunner:
         task_id: str,
         symbols: list[str],
         errors: list[str] | None,
+        hint_symbols: list[str] | None = None,
     ) -> MCPSubgraphState:
         """执行 MCP 采集并返回原始信号。"""
 
         merged_errors = list(errors or [])
+        effective_hint_symbols = hint_symbols if isinstance(hint_symbols, list) else symbols
         catalog, tools_by_server, discovery_errors = await self._discover_tools_with_official_client()
         merged_errors.extend(discovery_errors)
 
@@ -140,6 +142,7 @@ class MCPSignalSubgraphRunner:
                     user_id=user_id,
                     query=query,
                     symbols=symbols,
+                    hint_symbols=effective_hint_symbols,
                     task_id=task_id,
                     catalog_entries=catalog.get(server_name, []),
                 )
@@ -179,6 +182,7 @@ class MCPSignalSubgraphRunner:
         task_id: str,
         symbols: list[str],
         errors: list[str] | None,
+        hint_symbols: list[str] | None = None,
     ) -> MCPSubgraphState:
         """同步包装器（兼容旧调用方）。"""
 
@@ -188,6 +192,7 @@ class MCPSignalSubgraphRunner:
                 query=query,
                 task_id=task_id,
                 symbols=symbols,
+                hint_symbols=hint_symbols,
                 errors=errors,
             )
         )
@@ -259,18 +264,22 @@ class MCPSignalSubgraphRunner:
         user_id: str,
         query: str,
         symbols: list[str],
+        hint_symbols: list[str],
         task_id: str,
         server_name: str,
         tool_catalog: list[dict[str, Any]],
     ) -> str:
         symbols_text = ",".join(symbols) if symbols else "AUTO"
+        hint_symbols_text = ",".join(hint_symbols) if hint_symbols else "NONE"
         return (
             f"user_id={user_id}\n"
             f"task_id={task_id}\n"
             f"query={query}\n"
             f"server={server_name}\n"
             f"target_symbols={symbols_text}\n"
+            f"hint_symbols={hint_symbols_text}\n"
             f"tool_call_budget_hint={self.max_rounds}\n\n"
+            "target_symbols 是硬目标，hint_symbols 仅作参考提示。"
             "请根据 query 与 symbols 自主选择合适工具，再输出最终 JSON。"
             "如果某个工具失败，把错误摘要写入 errors。"
             "不要输出解释性文本，只输出最终 JSON。\n\n"
@@ -285,6 +294,7 @@ class MCPSignalSubgraphRunner:
         user_id: str,
         query: str,
         symbols: list[str],
+        hint_symbols: list[str],
         task_id: str,
         catalog_entries: list[dict[str, Any]],
     ) -> _ServerAgentResult:
@@ -310,6 +320,7 @@ class MCPSignalSubgraphRunner:
                                 user_id=user_id,
                                 query=query,
                                 symbols=symbols,
+                                hint_symbols=hint_symbols,
                                 task_id=task_id,
                                 server_name=server_name,
                                 tool_catalog=catalog_entries,

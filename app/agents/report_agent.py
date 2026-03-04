@@ -59,8 +59,10 @@ class ReportAgent:
 
         signal_summary = self._summarize_signals(payload.signals)
         docs_summary = self._summarize_docs(payload.retrieved_docs)
+        reinforcement_signal = self._build_reinforcement_signal()
 
         return (
+            f"{reinforcement_signal}\n\n"
             f"用户ID: {payload.user_id}\n"
             f"任务ID: {payload.task_id}\n"
             f"用户问题: {payload.query}\n\n"
@@ -71,7 +73,17 @@ class ReportAgent:
             "1) 先给出结论和置信度；\n"
             "2) 每个结论关联至少一条证据；\n"
             "3) 明确风险与反例；\n"
-            "4) 使用中文，风格偏专业研报。"
+            "4) 使用中文，风格偏专业研报。\n\n"
+            f"{reinforcement_signal}"
+        )
+
+    @staticmethod
+    def _build_reinforcement_signal() -> str:
+        """构造首尾复用的强化信号，避免长上下文下指令衰减。"""
+
+        return (
+            "【强化信号】请严格遵守：先给结论和置信度；每个结论绑定证据；"
+            "明确风险与反例；保持中文专业研报风格。"
         )
 
     def _summarize_signals(self, signals: list[NormalizedSignal]) -> str:

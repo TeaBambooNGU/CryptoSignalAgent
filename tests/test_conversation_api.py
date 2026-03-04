@@ -177,6 +177,37 @@ class ConversationAPITestCase(unittest.TestCase):
         self.assertEqual(idem_retry.json()["turn_id"], rewrite_payload["turn_id"])
         self.assertEqual(idem_retry.json()["conversation_version"], rewrite_payload["conversation_version"])
 
+    def test_auto_action_allows_chat_before_first_report(self) -> None:
+        conversation_id = "conv-auto-chat-first"
+        chat_first = self.client.post(
+            f"/v1/conversation/{conversation_id}/message",
+            json={
+                "user_id": "u-auto-chat-first",
+                "message": "先聊聊今天市场风险",
+                "action": "auto",
+                "request_id": "req-auto-chat-first-1",
+            },
+        )
+        self.assertEqual(chat_first.status_code, 200)
+        chat_payload = chat_first.json()
+        self.assertEqual(chat_payload["action_taken"], "chat")
+        self.assertTrue(chat_payload["report"] is None)
+
+        generate = self.client.post(
+            f"/v1/conversation/{conversation_id}/message",
+            json={
+                "user_id": "u-auto-chat-first",
+                "message": "请生成一版 BTC 报告",
+                "action": "auto",
+                "request_id": "req-auto-chat-first-2",
+                "expected_version": chat_payload["conversation_version"],
+            },
+        )
+        self.assertEqual(generate.status_code, 200)
+        generate_payload = generate.json()
+        self.assertEqual(generate_payload["action_taken"], "regenerate_report")
+        self.assertTrue(generate_payload["report"] is not None)
+
     def test_context_summary_is_generated_for_long_conversation(self) -> None:
         conversation_id = "conv-summary-1"
         for idx in range(1, 11):

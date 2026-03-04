@@ -246,13 +246,16 @@ class ResearchGraphRunner:
 
         async def _node_logic() -> ResearchState:
             with log_context(component="graph.collect_signals"):
+                hard_symbols = state.get("hard_symbols")
                 soft_symbols = state.get("soft_symbols")
-                request_symbols = soft_symbols if isinstance(soft_symbols, list) else state.get("symbols", [])
+                request_symbols = hard_symbols if isinstance(hard_symbols, list) else state.get("symbols", [])
+                hint_symbols = soft_symbols if isinstance(soft_symbols, list) else request_symbols
                 result = await self.mcp_subgraph.arun(
                     user_id=state["user_id"],
                     query=state["query"],
                     task_id=state["task_id"],
                     symbols=request_symbols,
+                    hint_symbols=hint_symbols,
                     errors=state.get("errors", []),
                 )
                 logger.info(

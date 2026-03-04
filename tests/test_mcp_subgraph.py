@@ -85,6 +85,26 @@ class MCPAgentRunnerTestCase(unittest.TestCase):
         self.assertEqual(connections["s2"]["command"], "python")
         self.assertEqual(connections["s2"]["args"], ["server.py"])
 
+    def test_build_agent_user_prompt_separates_target_and_hint_symbols(self) -> None:
+        runner = MCPSignalSubgraphRunner(
+            llm=_DummyLLM(),
+            mcp_connections={"srv": {"transport": "streamable_http", "url": "http://localhost:3000/mcp"}},
+            mcp_client_factory=_FakeMCPClient,
+            agent_factory=lambda **kwargs: _FakeAgent([]),
+        )
+        prompt = runner._build_agent_user_prompt(
+            user_id="u1",
+            query="分析 BTC",
+            symbols=["BTC"],
+            hint_symbols=["BTC", "ETH"],
+            task_id="task-0",
+            server_name="srv",
+            tool_catalog=[],
+        )
+
+        self.assertIn("target_symbols=BTC", prompt)
+        self.assertIn("hint_symbols=BTC,ETH", prompt)
+
     def test_run_collects_rows_from_tool_messages_and_payload(self) -> None:
         messages = [
             ToolMessage(name="srv_get_news", content='{"symbol":"BTC","title":"ETF"}', tool_call_id="call-1"),
