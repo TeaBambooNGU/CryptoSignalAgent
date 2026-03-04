@@ -60,6 +60,7 @@ class ReportAgent:
         signal_summary = self._summarize_signals(payload.signals)
         docs_summary = self._summarize_docs(payload.retrieved_docs)
         reinforcement_signal = self._build_reinforcement_signal()
+        query_reinforcement = self._build_query_reinforcement(payload.query)
 
         return (
             f"{reinforcement_signal}\n\n"
@@ -74,7 +75,8 @@ class ReportAgent:
             "2) 每个结论关联至少一条证据；\n"
             "3) 明确风险与反例；\n"
             "4) 使用中文，风格偏专业研报。\n\n"
-            f"{reinforcement_signal}"
+            f"{reinforcement_signal}\n"
+            f"{query_reinforcement}"
         )
 
     @staticmethod
@@ -85,6 +87,13 @@ class ReportAgent:
             "【强化信号】请严格遵守：先给结论和置信度；每个结论绑定证据；"
             "明确风险与反例；保持中文专业研报风格。"
         )
+
+    @staticmethod
+    def _build_query_reinforcement(query: str) -> str:
+        """将用户问题放在提示词最后一行，避免主诉求被长上下文稀释。"""
+
+        normalized_query = " ".join(str(query or "").split())
+        return f"【用户问题强化】{normalized_query}" if normalized_query else "【用户问题强化】(空)"
 
     def _summarize_signals(self, signals: list[NormalizedSignal]) -> str:
         """汇总信号统计信息。"""
