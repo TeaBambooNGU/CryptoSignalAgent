@@ -2,16 +2,16 @@
 
 > 对话优先的加密研究 Agent：整合 MCP 多源信号、记忆系统与可追溯报告版本。
 
-![Python](https://img.shields.io/badge/Python-3.12%2B-3776AB?logo=python&logoColor=white)
-![FastAPI](https://img.shields.io/badge/FastAPI-0.135%2B-009688?logo=fastapi&logoColor=white)
-![LangChain](https://img.shields.io/badge/LangChain-Enabled-1C3C3C)
-![LangGraph](https://img.shields.io/badge/LangGraph-1.0%2B-1f6feb)
-![MCP](https://img.shields.io/badge/MCP-Integrated-6f42c1)
-![Milvus](https://img.shields.io/badge/Milvus-2.x-00A1EA)
-![Mem0](https://img.shields.io/badge/Mem0-Optional-FF6B6B)
-![React](https://img.shields.io/badge/React-18-61DAFB?logo=react&logoColor=000)
-![Vite](https://img.shields.io/badge/Vite-5-646CFF?logo=vite&logoColor=white)
-![TypeScript](https://img.shields.io/badge/TypeScript-5-3178C6?logo=typescript&logoColor=white)
+![Python](https://img.shields.io/badge/Python-3.12%2B-3776AB?logo=python&logoColor=white&style=flat-square)
+![FastAPI](https://img.shields.io/badge/FastAPI-0.135%2B-009688?logo=fastapi&logoColor=white&style=flat-square)
+![LangChain](https://img.shields.io/badge/LangChain-Enabled-1C3C3C?style=flat-square)
+![LangGraph](https://img.shields.io/badge/LangGraph-1.0%2B-1f6feb?style=flat-square)
+![MCP](https://img.shields.io/badge/MCP-Integrated-6f42c1?style=flat-square)
+![Milvus](https://img.shields.io/badge/Milvus-2.x-00A1EA?style=flat-square)
+![Mem0](https://img.shields.io/badge/Mem0-Optional-FF6B6B?style=flat-square)
+![React](https://img.shields.io/badge/React-18-61DAFB?logo=react&logoColor=000&style=flat-square)
+![Vite](https://img.shields.io/badge/Vite-5-646CFF?logo=vite&logoColor=white&style=flat-square)
+![TypeScript](https://img.shields.io/badge/TypeScript-5-3178C6?logo=typescript&logoColor=white&style=flat-square)
 
 基于 `LangChain + LangGraph + MCP + Milvus + Mem0` 构建，面向“信号采集 -> 研报生成 -> 持续对话 -> 分支回放”的完整链路。
 
