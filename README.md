@@ -1,215 +1,285 @@
 # Crypto Signal Agent
 
-基于 `LangChain + LangGraph + Mem0 + LlamaIndex + Milvus` 的加密市场信号研报 Agent。
+> 对话优先的加密研究 Agent：整合 MCP 多源信号、记忆系统与可追溯报告版本。
+
+![Python](https://img.shields.io/badge/Python-3.12%2B-3776AB?logo=python&logoColor=white&style=flat-square)
+![FastAPI](https://img.shields.io/badge/FastAPI-0.135%2B-009688?logo=fastapi&logoColor=white&style=flat-square)
+![LangChain](https://img.shields.io/badge/LangChain-Enabled-1C3C3C?style=flat-square)
+![LangGraph](https://img.shields.io/badge/LangGraph-1.0%2B-1f6feb?style=flat-square)
+![MCP](https://img.shields.io/badge/MCP-Integrated-6f42c1?style=flat-square)
+![Milvus](https://img.shields.io/badge/Milvus-2.x-00A1EA?style=flat-square)
+![Mem0](https://img.shields.io/badge/Mem0-Optional-FF6B6B?style=flat-square)
+![React](https://img.shields.io/badge/React-18-61DAFB?logo=react&logoColor=000&style=flat-square)
+![Vite](https://img.shields.io/badge/Vite-5-646CFF?logo=vite&logoColor=white&style=flat-square)
+![TypeScript](https://img.shields.io/badge/TypeScript-5-3178C6?logo=typescript&logoColor=white&style=flat-square)
+
+基于 `LangChain + LangGraph + MCP + Milvus + Mem0` 构建，面向“信号采集 -> 研报生成 -> 持续对话 -> 分支回放”的完整链路。
+
+## 目录
+
+- [Crypto Signal Agent](#crypto-signal-agent)
+  - [目录](#目录)
+  - [为什么选择它](#为什么选择它)
+  - [核心能力](#核心能力)
+  - [系统架构](#系统架构)
+  - [快速开始](#快速开始)
+    - [1) 环境准备](#1-环境准备)
+    - [2) 安装依赖](#2-安装依赖)
+    - [3) 配置环境变量](#3-配置环境变量)
+    - [4) 初始化 Milvus（可选但推荐）](#4-初始化-milvus可选但推荐)
+    - [5) 验证 MCP 可用性（推荐）](#5-验证-mcp-可用性推荐)
+    - [6) 启动后端](#6-启动后端)
+    - [7) 启动前端](#7-启动前端)
+  - [配置说明](#配置说明)
+  - [MCP 配置示例](#mcp-配置示例)
+  - [API 快速体验](#api-快速体验)
+    - [1) 生成首版研报](#1-生成首版研报)
+    - [2) 基于当前会话继续追问](#2-基于当前会话继续追问)
+    - [3) 查看报告版本历史](#3-查看报告版本历史)
+  - [前端控制台](#前端控制台)
+  - [开发与测试](#开发与测试)
+  - [项目结构](#项目结构)
+  - [常见问题](#常见问题)
+  - [许可证](#许可证)
+  - [风险声明](#风险声明)
+
+## 为什么选择它
+
+- **对话优先**：统一入口支持 `auto/chat/rewrite_report/regenerate_report`。
+- **可追溯**：会话与报告版本可回放，支持从历史 `turn` 分支恢复。
+- **多源信号**：通过标准 MCP 协议接入行情、链上、新闻等数据。
+- **工程化可观测**：请求级 `X-Trace-Id`、节点级耗时、重试与降级策略。
 
 ## 核心能力
 
-- 通过 **MCP 数据源**采集市场信号（V1 仅 MCP，工具选择与参数由 LLM 规划）
-- 对信号做统一标准化并入库 Milvus
-- 基于用户长期/短期记忆生成个性化研报
-- 使用 LangGraph 编排完整研究流程
-- LLM 客户端可配置替换，当前默认接入 MiniMax M2.5
-- 使用 tenacity 对关键节点提供重试
+- MCP 多服务工具发现与调用（`langchain-mcp-adapters`）
+- LangGraph 编排研究流程，输出 `workflow_steps`
+- Milvus 向量检索与长期记忆（Mem0 可选）
+- 会话一致性保障：`request_id` 幂等 + `expected_version` CAS
+- 异步 outbox 投影：会话真相库强一致、外部记忆最终一致
 
-## 工程结构
+## 系统架构
 
-```text
-/Users/teabamboo/Documents/AIplusLLM/CryptoSignalAgent
-  app/
-    api/
-    agents/
-    config/
-    graph/
-    memory/
-    retrieval/
-    tools/
-    models/
-    observability/
-  scripts/
-  tests/
-  docs/
+```mermaid
+flowchart LR
+    U[User / Frontend] --> API[FastAPI API]
+    API --> CS[Conversation Service]
+    CS --> G[LangGraph Workflow]
+    G --> MCP[MCP Servers]
+    G --> RET[Milvus Retrieval]
+    G --> LLM[LLM Provider]
+    CS --> TRUTH[(SQLite Truth Store)]
+    CS --> OUTBOX[Outbox Projector]
+    OUTBOX --> MEM[Milvus / Mem0 Memory]
 ```
 
-## 环境变量
+详细架构说明见：[`docs/architecture.md`](docs/architecture.md)
 
-建议创建 `.env`：
+## 快速开始
 
-```env
-APP_ENV=dev
-APP_HOST=0.0.0.0
-APP_PORT=8000
-LOG_LEVEL=INFO
-LOG_TO_FILE=false
-LOG_FILE_PATH=logs/app.log
-LOG_FILE_MAX_MB=10
-LOG_FILE_BACKUP_DAYS=5
+### 1) 环境准备
 
-# LangSmith
-LANGSMITH_TRACING=false
-LANGSMITH_API_KEY=
-LANGSMITH_PROJECT=crypto-signal-agent
-LANGSMITH_ENDPOINT=https://api.smith.langchain.com
+- Python `3.12+`
+- [uv](https://docs.astral.sh/uv/)
+- Node.js `18+`（前端需要）
+- 可选：Milvus、Redis
 
-# 可替换 LLM 客户端
-LLM_PROVIDER=minimax
-LLM_MODEL=MiniMax-M2.5
-LLM_TEMPERATURE=0.2
-LLM_TIMEOUT_SECONDS=60
+### 2) 安装依赖
 
-# MiniMax(OpenAI-compatible)
-MINIMAX_API_KEY=
-MINIMAX_BASE_URL=https://api.minimax.chat/v1
+```bash
+# 后端
+uv sync
 
-# 其他 OpenAI-compatible 供应商（可选）
-OPENAI_COMPATIBLE_API_KEY=
-OPENAI_COMPATIBLE_BASE_URL=
-
-# Embedding（默认智谱）
-EMBEDDING_PROVIDER=zhipu
-ZHIPU_EMBEDDING_MODEL=embedding-3
-ZHIPU_EMBEDDING_BATCH_SIZE=64
-ZHIPUAI_API_KEY=
-
-# Milvus
-MILVUS_ENABLED=true
-MILVUS_ALLOW_FALLBACK=true
-MILVUS_URI=http://127.0.0.1:19530
-MILVUS_TOKEN=
-MILVUS_DB_NAME=default
-MILVUS_RESEARCH_COLLECTION=research_chunks
-MILVUS_MEMORY_COLLECTION=user_memory
-VECTOR_DIM=384
-
-# Mem0
-MEM0_ENABLED=false
-# 可选: platform / oss
-MEM0_MODE=platform
-# 仅在 MEM0_MODE=oss 时生效（建议独立 collection）
-MEM0_OSS_COLLECTION=mem0_memory
-# 可选：覆盖 OSS 模式下智谱 Embedding 的 OpenAI-compatible Base URL
-ZHIPU_OPENAI_BASE_URL=https://open.bigmodel.cn/api/paas/v4
-# 仅在 MEM0_MODE=platform 时生效
-MEM0_API_KEY=
-MEM0_ORG_ID=
-MEM0_PROJECT_ID=
-
-# MCP（逗号分隔或 JSON 数组）
-# 标准 MCP Server（JSON 数组，推荐）
-MCP_SERVERS=
+# 前端
+npm --prefix frontend install
 ```
 
-## 启动方式
+### 3) 配置环境变量
 
-1. 初始化 Milvus（可选但推荐）：
+```bash
+cp .env.example .env
+```
+
+最少请配置：
+
+- `LLM_PROVIDER` + 对应密钥（默认 MiniMax）
+- `MCP_CONFIG_PATH` 指向 `.mcp.json`
+- 若启用向量库：`MILVUS_URI`
+
+### 4) 初始化 Milvus（可选但推荐）
 
 ```bash
 uv run python scripts/init_milvus.py
 ```
 
-2. 启动服务：
-
-```bash
-uv run python main.py
-```
-
-3. 访问文档：
-
-- `http://127.0.0.1:8000/docs`
-
-## API 列表
-
-- `POST /v1/research/query`
-- `POST /v1/user/preferences`
-- `GET /v1/user/profile/{user_id}`
-- `POST /v1/research/ingest`
-
-## 前端控制台（极简科技风）
-
-前端工程位于 `frontend/`，技术栈为 `React + Vite + TypeScript + TanStack Query + Zustand`。
-
-1. 安装依赖：
-
-```bash
-cd frontend
-npm install
-```
-
-2. 启动前端：
-
-```bash
-npm run dev
-```
-
-3. 默认通过 Vite 代理请求后端 `http://127.0.0.1:8000` 的 `/v1/*` 接口。  
-   若需要自定义后端地址，设置环境变量：
-
-```bash
-VITE_API_BASE=http://127.0.0.1:8000
-```
-
-4. UI 联调（浏览器页面 + 终端日志）：
-
-```bash
-# 无头模式：自动抓日志与截图（推荐先用）
-npm run ui:debug
-
-# 有头模式：会真实打开 Chromium 页面
-npm run ui:debug:live
-```
-
-截图输出到 `frontend/artifacts/`，终端会打印：
-- 浏览器 Console（`[browser-console:*]`）
-- 页面运行错误（`[browser-pageerror]`）
-- 失败请求/4xx/5xx（`[browser-requestfailed]` / `[browser-http-*]`）
-
-## 标准 MCP 配置示例（已验证）
-
-```env
-MCP_SERVERS=[{"name":"coingecko","transport":"streamable_http","url":"https://mcp.api.coingecko.com/mcp"},{"name":"defillama","transport":"streamable_http","url":"https://mcpllama.com/mcp"},{"name":"crypto-news-mcp","transport":"stdio","command":"uv","args":["run","crypto-news-mcp"],"cwd":"/Users/teabamboo/Documents/AIplusLLM/cryptorNewsMCP","env":{"CRYPTOPANIC_AUTH_TOKEN":"<YOUR_CRYPTOPANIC_TOKEN>"},"tool_allowlist":["get_research_signals","get_news_digest","build_market_brief"],"max_tools_per_server":3}]
-```
-
-- `coingecko`：行情/币种/趋势数据
-- `defillama`：链上 TVL/协议维度数据
-- `crypto-news-mcp`：CryptoPanic 新闻/投研信号（stdio，本地 `uv run crypto-news-mcp`）
-
-对接 `crypto-news-mcp` 前请先在对应目录完成一次初始化：
-
-```bash
-cd /Users/teabamboo/Documents/AIplusLLM/cryptorNewsMCP
-uv sync
-```
-
-可用性验证：
+### 5) 验证 MCP 可用性（推荐）
 
 ```bash
 uv run python scripts/verify_mcp_servers.py
 ```
 
-## 用户如何拿到研报
-
-1. 可选：先写入用户偏好
-2. 调用 `POST /v1/research/query` 获取 `report + citations + trace_id`
+### 6) 启动后端
 
 ```bash
-curl -X POST http://127.0.0.1:8000/v1/research/query \
+uv run python main.py
+```
+
+启动后访问：<http://127.0.0.1:8000/docs>
+
+### 7) 启动前端
+
+```bash
+npm --prefix frontend run dev
+```
+
+默认地址：<http://127.0.0.1:5173>
+
+## 配置说明
+
+完整变量请参考 [`.env.example`](.env.example)。
+
+常用项：
+
+| 分类 | 变量 | 说明 |
+|---|---|---|
+| 服务 | `APP_HOST` / `APP_PORT` | API 服务监听地址 |
+| LLM | `LLM_PROVIDER` / `LLM_MODEL` | 模型供应商与模型名 |
+| Embedding | `EMBEDDING_PROVIDER` / `ZHIPU_EMBEDDING_MODEL` | 向量化配置 |
+| Milvus | `MILVUS_URI` / `VECTOR_DIM` | 向量库连接与维度 |
+| 会话 | `CONVERSATION_STORE_PATH` | SQLite 真相库存储路径 |
+| Session | `SESSION_STORE_BACKEND` / `REDIS_URL` | 短期会话记忆存储 |
+| MCP | `MCP_CONFIG_PATH` / `MCP_MAX_ROUNDS` | MCP 配置与调用预算 |
+
+## MCP 配置示例
+
+项目默认读取根目录 `.mcp.json`：
+
+```json
+{
+  "mcpServers": {
+    "coingecko": {
+      "type": "http",
+      "url": "https://mcp.api.coingecko.com/mcp"
+    },
+    "defillama": {
+      "type": "http",
+      "url": "https://mcpllama.com/mcp"
+    },
+    "cryptonews": {
+      "type": "stdio",
+      "command": "uv",
+      "args": ["run", "crypto-news-mcp"],
+      "cwd": "/path/to/cryptoNewsMCP",
+      "env": {
+        "CRYPTOPANIC_AUTH_TOKEN": "${CRYPTOPANIC_AUTH_TOKEN}"
+      }
+    }
+  }
+}
+```
+
+## API 快速体验
+
+### 1) 生成首版研报
+
+```bash
+curl -X POST http://127.0.0.1:8000/v1/conversation/conv-u001/message \
   -H "Content-Type: application/json" \
   -d '{
-    "user_id":"u001",
-    "query":"请给我 BTC 和 ETH 的 24 小时风险信号研报",
-    "task_context":{"symbols":["BTC","ETH"]}
+    "user_id": "u001",
+    "message": "请给我 BTC 和 ETH 的 24 小时风险信号研报",
+    "action": "regenerate_report",
+    "task_context": {"symbols": ["BTC", "ETH"]},
+    "request_id": "req-u001-turn1"
   }'
 ```
 
-## 测试
+### 2) 基于当前会话继续追问
 
 ```bash
-uv run python -m unittest tests/test_api.py
+curl -X POST http://127.0.0.1:8000/v1/conversation/conv-u001/message \
+  -H "Content-Type: application/json" \
+  -d '{
+    "user_id": "u001",
+    "message": "请解释这版报告里最关键的下行风险",
+    "action": "chat",
+    "expected_version": 1,
+    "request_id": "req-u001-turn2"
+  }'
 ```
 
-## 关键说明
+### 3) 查看报告版本历史
 
-- V1 严格只处理 MCP 可获取的数据源。
-- 报告默认附带风险免责声明：仅供研究，不构成投资建议。
-- 当 Milvus 不可用时，系统可按配置降级到内存存储。
-- 当 LLM 不可用时，`/v1/research/query` 会直接返回 500（硬失败）。
-- 使用智谱 embedding 时，请确保 `VECTOR_DIM` 与模型输出维度一致。
+```bash
+curl "http://127.0.0.1:8000/v1/conversation/conv-u001/reports?limit=20"
+```
+
+更多接口请查看 OpenAPI 文档或 [`app/api/routes.py`](app/api/routes.py)。
+
+## 前端控制台
+
+前端位于 `frontend/`，技术栈：`React + Vite + TypeScript + TanStack Query + Zustand`。
+
+- Message Composer：支持 `chat/rewrite/regenerate/auto`
+- Dialogue：连续对话流
+- Timeline + Branch Tree：按 `parent_turn_id` 回放分支
+- Version Tape：报告版本选择与回放
+
+UI 联调辅助：
+
+```bash
+# 无头模式（自动截图+日志）
+npm --prefix frontend run ui:debug
+
+# 有头模式
+npm --prefix frontend run ui:debug:live
+```
+
+## 开发与测试
+
+```bash
+# 后端单测（示例）
+uv run python -m unittest tests/test_api.py
+
+# 可选：MCP 原始响应巡检
+uv run python scripts/inspect_mcp.py
+```
+
+## 项目结构
+
+```text
+.
+├── app/                  # 后端核心代码
+│   ├── api/              # HTTP 路由
+│   ├── agents/           # LLM 代理与报告生成
+│   ├── config/           # 配置与日志
+│   ├── conversation/     # 会话真相库/幂等/CAS/outbox
+│   ├── graph/            # LangGraph 工作流与 MCP 子图
+│   ├── memory/           # 会话/长期记忆服务
+│   ├── models/           # 数据模型
+│   └── retrieval/        # 向量检索与入库
+├── frontend/             # React 控制台
+├── scripts/              # 初始化与诊断脚本
+├── tests/                # 测试用例
+├── docs/                 # 设计与架构文档
+└── main.py               # 启动入口
+```
+
+## 常见问题
+
+- **Q: 没配置 Milvus 能跑吗？**  
+  A: 可以，按配置可降级为内存模式（生产仍建议启用 Milvus）。
+
+- **Q: LLM 不可用时会怎样？**  
+  A: `/v1/research/query` 与 `/v1/conversation/{conversation_id}/message` 会返回 500（硬失败）。
+
+- **Q: `from_turn_id` 的作用？**  
+  A: 作为分支锚点，后续上下文仅基于该分支链路构建。
+
+## 许可证
+
+本项目采用 [MIT License](LICENSE)。
+
+## 风险声明
+
+本项目输出仅用于研究与信息参考，不构成任何投资建议。

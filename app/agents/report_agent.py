@@ -9,7 +9,9 @@ from __future__ import annotations
 from collections import Counter
 from typing import Any
 
-from app.agents.llm.base import BaseLLMClient
+from langchain_core.language_models.chat_models import BaseChatModel
+from langchain_core.messages import HumanMessage, SystemMessage
+
 from app.config.settings import Settings
 from app.models.schemas import Citation, NormalizedSignal, ReportGenerationInput, ReportGenerationOutput, RetrievedChunk
 
@@ -17,9 +19,9 @@ from app.models.schemas import Citation, NormalizedSignal, ReportGenerationInput
 class ReportAgent:
     """报告生成服务。"""
 
-    def __init__(self, settings: Settings, llm_client: BaseLLMClient) -> None:
+    def __init__(self, settings: Settings, llm: BaseChatModel) -> None:
         self.settings = settings
-        self.llm_client = llm_client
+        self.llm = llm
 
     def generate(self, payload: ReportGenerationInput) -> ReportGenerationOutput:
         """生成结构化研报。"""
@@ -27,7 +29,13 @@ class ReportAgent:
         system_prompt = self._build_system_prompt()
         user_prompt = self._build_user_prompt(payload)
 
-        report_text = self.llm_client.generate(system_prompt=system_prompt, user_prompt=user_prompt)
+        response = self.llm.invoke(
+            [
+                SystemMessage(content=system_prompt),
+                HumanMessage(content=user_prompt),
+            ]
+        )
+        report_text = self._extract_text(getattr(response, "content", response))
         citations = self._build_citations(payload.retrieved_docs)
         final_report = self._append_disclaimer(report_text)
 
@@ -51,8 +59,10 @@ class ReportAgent:
 
         signal_summary = self._summarize_signals(payload.signals)
         docs_summary = self._summarize_docs(payload.retrieved_docs)
+        reinforcement_signal = self._build_reinforcement_signal()
 
         return (
+            f"{reinforcement_signal}\n\n"
             f"用户ID: {payload.user_id}\n"
             f"任务ID: {payload.task_id}\n"
             f"用户问题: {payload.query}\n\n"
@@ -63,7 +73,17 @@ class ReportAgent:
             "1) 先给出结论和置信度；\n"
             "2) 每个结论关联至少一条证据；\n"
             "3) 明确风险与反例；\n"
-            "4) 使用中文，风格偏专业研报。"
+            "4) 使用中文，风格偏专业研报。\n\n"
+            f"{reinforcement_signal}"
+        )
+
+    @staticmethod
+    def _build_reinforcement_signal() -> str:
+        """构造首尾复用的强化信号，避免长上下文下指令衰减。"""
+
+        return (
+            "【强化信号】请严格遵守：先给结论和置信度；每个结论绑定证据；"
+            "明确风险与反例；保持中文专业研报风格。"
         )
 
     def _summarize_signals(self, signals: list[NormalizedSignal]) -> str:
@@ -96,10 +116,8 @@ class ReportAgent:
             return "暂无可引用历史证据。"
 
         lines = []
-        for index, doc in enumerate(docs[:8], start=1):
+        for index, doc in enumerate(docs, start=1):
             snippet = doc.text.replace("\n", " ").strip()
-            if len(snippet) > 180:
-                snippet = snippet[:180] + "..."
             lines.append(f"{index}. [{doc.source}/{doc.symbol}] score={doc.score:.3f} {snippet}")
         return "\n".join(lines)
 
@@ -128,3 +146,19 @@ class ReportAgent:
         if not cleaned:
             cleaned = "当前证据不足，建议补充数据后再执行结论判断。"
         return f"{cleaned}\n\n{self.settings.report_disclaimer}"
+
+    @staticmethod
+    def _extract_text(content: Any) -> str:
+        if isinstance(content, str):
+            return content.strip()
+        if isinstance(content, list):
+            chunks: list[str] = []
+            for item in content:
+                if isinstance(item, dict):
+                    text = item.get("text")
+                    if isinstance(text, str):
+                        chunks.append(text)
+                        continue
+                chunks.append(str(item))
+            return "".join(chunks).strip()
+        return str(content).strip()

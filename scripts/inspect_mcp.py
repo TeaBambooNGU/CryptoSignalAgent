@@ -25,7 +25,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from app.config.settings import Settings
-from app.tools.mcp_client import MCPClient
+from app.graph.mcp_subgraph import MCPSignalSubgraphRunner
 
 # 固定执行配置（无 CLI 参数）
 QUERY = "请提供 BTC 与 ETH 的最新市场、链上与新闻数据"
@@ -172,23 +172,24 @@ def _build_inspect_arguments(tool: types.Tool) -> dict[str, Any]:
 
 async def _inspect_server(
     *,
-    client: MCPClient,
+    client,
+    server_name: str,
     spec,
     output_handle,
 ) -> None:
     """检查单个 server，逐个调用工具并落盘。"""
 
-    output_handle.write(f"## Server: {spec.name}\n\n")
-    output_handle.write(f"- transport: `{spec.transport}`\n")
-    if spec.url:
-        output_handle.write(f"- url: `{spec.url}`\n")
-    if spec.command:
-        output_handle.write(f"- command: `{spec.command}`\n")
+    output_handle.write(f"## Server: {server_name}\n\n")
+    output_handle.write(f"- transport: `{spec.get('transport', '')}`\n")
+    if spec.get("url"):
+        output_handle.write(f"- url: `{spec['url']}`\n")
+    if spec.get("command"):
+        output_handle.write(f"- command: `{spec['command']}`\n")
     output_handle.write("\n")
     output_handle.flush()
 
     try:
-        async with client._open_session(spec) as session:
+        async with client.session(server_name) as session:
             tools_result = await session.list_tools()
             tools = list(tools_result.tools)
             _write_json_block(output_handle, "tools/list", tools_result)
@@ -208,7 +209,7 @@ async def _inspect_server(
                     output_handle,
                     "request",
                     {
-                        "server": spec.name,
+                        "server": server_name,
                         "tool": tool.name,
                         "arguments": arguments,
                     },
@@ -227,11 +228,14 @@ async def _inspect_server(
 
 async def main() -> None:
     settings = Settings.from_env()
-    client = MCPClient(settings=settings)
-    specs = client._load_server_specs()
+    connections = MCPSignalSubgraphRunner.build_connections_from_settings(settings.mcp_servers)
+    if not connections:
+        raise SystemExit("未配置 MCP Servers（请检查 .mcp.json），无法巡检。")
 
-    if not specs:
-        raise SystemExit("未配置 MCP_SERVERS，无法巡检。")
+    from langchain_mcp_adapters.client import MultiServerMCPClient
+
+    client = MultiServerMCPClient(connections, tool_name_prefix=True)
+    specs = list(connections.items())
 
     log_dir = Path("logs")
     log_dir.mkdir(parents=True, exist_ok=True)
@@ -249,10 +253,10 @@ async def main() -> None:
         handle.write("---\n\n")
         handle.flush()
 
-        for spec in specs:
-            print(f"[inspect] start server={spec.name}")
-            await _inspect_server(client=client, spec=spec, output_handle=handle)
-            print(f"[inspect] done server={spec.name}")
+        for server_name, spec in specs:
+            print(f"[inspect] start server={server_name}")
+            await _inspect_server(client=client, server_name=server_name, spec=spec, output_handle=handle)
+            print(f"[inspect] done server={server_name}")
 
     print(f"[inspect] report saved: {output_path}")
 

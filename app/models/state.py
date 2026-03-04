@@ -17,11 +17,18 @@ class ResearchState(TypedDict, total=False):
     user_id: str
     query: str
     task_context: dict[str, Any] | None
+    conversation_id: str
+    turn_id: str
+    context_anchor_turn_id: str | None
+    request_id: str
+    conversation_version: int
     task_id: str
     trace_id: str
 
     memory_profile: dict[str, Any]
     symbols: list[str]
+    hard_symbols: list[str]
+    soft_symbols: list[str]
 
     raw_signals: list[dict[str, Any]]
     signals: list[NormalizedSignal]
@@ -35,5 +42,6 @@ class ResearchState(TypedDict, total=False):
 
     errors: list[str]
     retry_count: int
-    mcp_failures: list[dict[str, Any]]
-    mcp_corrections: list[dict[str, Any]]
+
+    mcp_tools_count: int
+    mcp_termination_reason: str

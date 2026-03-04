@@ -9,10 +9,10 @@
 from __future__ import annotations
 
 import asyncio
-import json
-import os
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
+import sys
 from typing import Any
 
 from mcp import ClientSession, types
@@ -20,24 +20,12 @@ from mcp.client.sse import sse_client
 from mcp.client.stdio import StdioServerParameters, stdio_client
 from mcp.client.streamable_http import streamablehttp_client
 
-DEFAULT_SERVERS = [
-    {
-        "name": "coingecko",
-        "transport": "streamable_http",
-        "url": "https://mcp.api.coingecko.com/mcp",
-    },
-    {
-        "name": "defillama",
-        "transport": "streamable_http",
-        "url": "https://mcpllama.com/mcp",
-    },
-    {
-        "name": "cryptonews",
-        "transport": "stdio",
-        "command": "uvx",
-        "args": ["cryptonewsmcp"],
-    },
-]
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from app.config.settings import Settings
+from app.graph.mcp_subgraph import MCPSignalSubgraphRunner
 
 
 @dataclass(slots=True)
@@ -50,22 +38,15 @@ class ServerSpec:
 
 
 def load_specs() -> list[ServerSpec]:
-    raw = os.getenv("MCP_SERVERS", "").strip()
-    if not raw:
-        data = DEFAULT_SERVERS
-    else:
-        parsed = json.loads(raw)
-        if not isinstance(parsed, list):
-            raise ValueError("MCP_SERVERS 必须是 JSON 数组")
-        data = parsed
-
+    settings = Settings.from_env()
+    connections = MCPSignalSubgraphRunner.build_connections_from_settings(settings.mcp_servers)
     specs: list[ServerSpec] = []
-    for index, item in enumerate(data, start=1):
+    for name, item in connections.items():
         if not isinstance(item, dict):
             continue
         specs.append(
             ServerSpec(
-                name=str(item.get("name", f"server-{index}")),
+                name=str(name),
                 transport=str(item.get("transport", "streamable_http")).lower(),
                 url=str(item.get("url", "")),
                 command=str(item.get("command", "")),
@@ -132,28 +113,27 @@ async def verify_one(spec: ServerSpec) -> tuple[bool, str]:
             async with stdio_client(params) as (read, write):
                 async with ClientSession(read, write) as session:
                     await session.initialize()
-                    return await _verify_session(session, spec.name)
+                    return await _verify_session(session)
 
         if spec.transport == "sse":
             async with sse_client(spec.url, timeout=20, sse_read_timeout=120) as (read, write):
                 async with ClientSession(read, write) as session:
                     await session.initialize()
-                    return await _verify_session(session, spec.name)
+                    return await _verify_session(session)
 
         async with streamablehttp_client(spec.url, timeout=20, sse_read_timeout=120) as (read, write, _):
             async with ClientSession(read, write) as session:
                 await session.initialize()
-                return await _verify_session(session, spec.name)
+                return await _verify_session(session)
     except Exception as exc:
         return False, f"连接失败: {type(exc).__name__}: {exc}"
 
 
-async def _verify_session(session: ClientSession, name: str) -> tuple[bool, str]:
+async def _verify_session(session: ClientSession) -> tuple[bool, str]:
     tools = await session.list_tools()
     if not tools.tools:
         return False, "list_tools 成功，但无可用工具"
 
-    # 优先调用无必填参数工具，避免参数不匹配。
     sorted_tools = sorted(
         tools.tools,
         key=lambda tool: len((tool.inputSchema or {}).get("required", []))
@@ -182,7 +162,7 @@ async def _verify_session(session: ClientSession, name: str) -> tuple[bool, str]
 async def main() -> None:
     specs = load_specs()
     if not specs:
-        print("未配置可验证的 MCP 服务器")
+        print("未配置 MCP Servers（请检查 .mcp.json），无法验证")
         return
 
     print(f"开始验证 {len(specs)} 个 MCP 服务器...\n")

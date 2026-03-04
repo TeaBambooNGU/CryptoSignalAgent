@@ -7,7 +7,8 @@ from __future__ import annotations
 
 import json
 import os
-from dataclasses import dataclass
+import re
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -44,10 +45,10 @@ class Settings:
     llm_timeout_seconds: int = 60
 
     minimax_api_key: str = ""
-    minimax_base_url: str = "https://api.minimax.chat/v1"
+    minimax_api_host: str = "https://api.minimax.chat"
 
-    openai_compatible_api_key: str = ""
-    openai_compatible_base_url: str = ""
+    openai_api_key: str = ""
+    openai_base_url: str = ""
 
     embedding_provider: str = "zhipu"
     zhipu_embedding_model: str = "embedding-3"
@@ -69,7 +70,14 @@ class Settings:
     mem0_org_id: str = ""
     mem0_project_id: str = ""
 
-    mcp_servers: tuple[dict[str, Any], ...] = ()
+    conversation_store_path: str = "data/conversation_state.db"
+    session_store_backend: str = "memory"
+    redis_url: str = ""
+    session_memory_ttl_seconds: int = 86400
+    session_memory_max_items: int = 50
+
+    mcp_servers: dict[str, dict[str, Any]] = field(default_factory=dict)
+    mcp_max_rounds: int = 4
 
     report_disclaimer: str = "免责声明：本报告仅用于研究与信息交流，不构成任何投资建议。"
 
@@ -106,21 +114,66 @@ class Settings:
             except ValueError:
                 return default
 
-        def _as_dict_tuple(name: str) -> tuple[dict[str, Any], ...]:
-            raw = os.getenv(name, "")
-            if not raw:
-                return ()
+        env_pattern = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
+
+        def _resolve_env_placeholders(value: Any) -> Any:
+            if isinstance(value, str):
+                return env_pattern.sub(lambda match: os.getenv(match.group(1), ""), value)
+            if isinstance(value, list):
+                return [_resolve_env_placeholders(item) for item in value]
+            if isinstance(value, dict):
+                return {
+                    str(key): _resolve_env_placeholders(item)
+                    for key, item in value.items()
+                }
+            return value
+
+        def _as_mcp_servers(default_config_path: str = ".mcp.json") -> dict[str, dict[str, Any]]:
+            config_path_raw = os.getenv("MCP_CONFIG_PATH", default_config_path).strip()
+            if not config_path_raw:
+                return {}
+
+            config_path = Path(config_path_raw).expanduser()
+            if not config_path.is_absolute():
+                config_path = (env_path.parent / config_path).resolve()
+
+            if not config_path.exists():
+                return {}
+
             try:
-                parsed: Any = json.loads(raw)
-            except json.JSONDecodeError:
-                return ()
-            if not isinstance(parsed, list):
-                return ()
-            result: list[dict[str, Any]] = []
-            for item in parsed:
-                if isinstance(item, dict):
-                    result.append(item)
-            return tuple(result)
+                parsed: Any = json.loads(config_path.read_text(encoding="utf-8"))
+            except Exception:
+                return {}
+
+            servers_block: Any = parsed
+            if isinstance(parsed, dict) and isinstance(parsed.get("mcpServers"), dict):
+                servers_block = parsed["mcpServers"]
+
+            if not isinstance(servers_block, dict):
+                return {}
+
+            resolved = _resolve_env_placeholders(servers_block)
+            if not isinstance(resolved, dict):
+                return {}
+
+            servers: dict[str, dict[str, Any]] = {}
+            for raw_name, raw_spec in resolved.items():
+                name = str(raw_name).strip()
+                if not name or not isinstance(raw_spec, dict):
+                    continue
+                servers[name] = {str(key): value for key, value in raw_spec.items()}
+            return servers
+
+        def _normalize_minimax_host(default: str) -> str:
+            raw_host = os.getenv("MINIMAX_API_HOST", "").strip()
+            if raw_host:
+                return raw_host.rstrip("/")
+            legacy_base = os.getenv("MINIMAX_BASE_URL", "").strip().rstrip("/")
+            if not legacy_base:
+                return default
+            if legacy_base.endswith("/v1"):
+                return legacy_base[: -len("/v1")]
+            return legacy_base
 
         return cls(
             app_name=os.getenv("APP_NAME", defaults.app_name),
@@ -141,9 +194,9 @@ class Settings:
             llm_temperature=_as_float("LLM_TEMPERATURE", defaults.llm_temperature),
             llm_timeout_seconds=_as_int("LLM_TIMEOUT_SECONDS", defaults.llm_timeout_seconds),
             minimax_api_key=os.getenv("MINIMAX_API_KEY", ""),
-            minimax_base_url=os.getenv("MINIMAX_BASE_URL", defaults.minimax_base_url),
-            openai_compatible_api_key=os.getenv("OPENAI_COMPATIBLE_API_KEY", ""),
-            openai_compatible_base_url=os.getenv("OPENAI_COMPATIBLE_BASE_URL", ""),
+            minimax_api_host=_normalize_minimax_host(defaults.minimax_api_host),
+            openai_api_key=os.getenv("OPENAI_API_KEY", ""),
+            openai_base_url=os.getenv("OPENAI_BASE_URL", ""),
             embedding_provider=os.getenv("EMBEDDING_PROVIDER", defaults.embedding_provider),
             zhipu_embedding_model=os.getenv("ZHIPU_EMBEDDING_MODEL", defaults.zhipu_embedding_model),
             zhipu_embedding_batch_size=_as_int(
@@ -167,7 +220,19 @@ class Settings:
             mem0_api_key=os.getenv("MEM0_API_KEY", ""),
             mem0_org_id=os.getenv("MEM0_ORG_ID", ""),
             mem0_project_id=os.getenv("MEM0_PROJECT_ID", ""),
-            mcp_servers=_as_dict_tuple("MCP_SERVERS"),
+            conversation_store_path=os.getenv("CONVERSATION_STORE_PATH", defaults.conversation_store_path),
+            session_store_backend=os.getenv("SESSION_STORE_BACKEND", defaults.session_store_backend),
+            redis_url=os.getenv("REDIS_URL", defaults.redis_url),
+            session_memory_ttl_seconds=_as_int(
+                "SESSION_MEMORY_TTL_SECONDS",
+                defaults.session_memory_ttl_seconds,
+            ),
+            session_memory_max_items=_as_int(
+                "SESSION_MEMORY_MAX_ITEMS",
+                defaults.session_memory_max_items,
+            ),
+            mcp_servers=_as_mcp_servers(),
+            mcp_max_rounds=_as_int("MCP_MAX_ROUNDS", defaults.mcp_max_rounds),
             report_disclaimer=os.getenv("REPORT_DISCLAIMER", defaults.report_disclaimer),
         )
 

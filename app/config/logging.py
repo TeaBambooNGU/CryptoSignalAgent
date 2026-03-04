@@ -21,12 +21,14 @@ TRACE_ID_KEY = "trace_id"
 TASK_ID_KEY = "task_id"
 USER_ID_KEY = "user_id"
 COMPONENT_KEY = "component"
+ROUND_KEY = "round"
 _EMPTY_VALUE = "-"
 
 _trace_id_ctx: contextvars.ContextVar[str] = contextvars.ContextVar(TRACE_ID_KEY, default=_EMPTY_VALUE)
 _task_id_ctx: contextvars.ContextVar[str] = contextvars.ContextVar(TASK_ID_KEY, default=_EMPTY_VALUE)
 _user_id_ctx: contextvars.ContextVar[str] = contextvars.ContextVar(USER_ID_KEY, default=_EMPTY_VALUE)
 _component_ctx: contextvars.ContextVar[str] = contextvars.ContextVar(COMPONENT_KEY, default=_EMPTY_VALUE)
+_round_ctx: contextvars.ContextVar[str] = contextvars.ContextVar(ROUND_KEY, default=_EMPTY_VALUE)
 
 _LOGGING_INITIALIZED = False
 
@@ -38,6 +40,7 @@ class _ContextFilter(logging.Filter):
         record.trace_id = _trace_id_ctx.get()  # type: ignore[attr-defined]
         record.task_id = _task_id_ctx.get()  # type: ignore[attr-defined]
         record.user_id = _user_id_ctx.get()  # type: ignore[attr-defined]
+        record.round = _round_ctx.get()  # type: ignore[attr-defined]
 
         component = _component_ctx.get()
         if component == _EMPTY_VALUE:
@@ -257,6 +260,7 @@ def set_log_context(
     task_id: str | None = None,
     user_id: str | None = None,
     component: str | None = None,
+    round: int | str | None = None,
 ) -> dict[str, contextvars.Token[str]]:
     """设置日志上下文并返回可回滚 token。"""
 
@@ -269,6 +273,8 @@ def set_log_context(
         tokens[USER_ID_KEY] = _user_id_ctx.set(user_id)
     if component is not None:
         tokens[COMPONENT_KEY] = _component_ctx.set(component)
+    if round is not None:
+        tokens[ROUND_KEY] = _round_ctx.set(str(round))
     return tokens
 
 
@@ -284,6 +290,8 @@ def reset_log_context(tokens: dict[str, contextvars.Token[str]]) -> None:
             _user_id_ctx.reset(token)
         elif key == COMPONENT_KEY:
             _component_ctx.reset(token)
+        elif key == ROUND_KEY:
+            _round_ctx.reset(token)
 
 
 @contextlib.contextmanager
@@ -293,10 +301,17 @@ def log_context(
     task_id: str | None = None,
     user_id: str | None = None,
     component: str | None = None,
+    round: int | str | None = None,
 ) -> Iterator[None]:
     """上下文管理器版本的日志上下文设置。"""
 
-    tokens = set_log_context(trace_id=trace_id, task_id=task_id, user_id=user_id, component=component)
+    tokens = set_log_context(
+        trace_id=trace_id,
+        task_id=task_id,
+        user_id=user_id,
+        component=component,
+        round=round,
+    )
     try:
         yield
     finally:
@@ -310,3 +325,4 @@ def clear_log_context() -> None:
     _task_id_ctx.set(_EMPTY_VALUE)
     _user_id_ctx.set(_EMPTY_VALUE)
     _component_ctx.set(_EMPTY_VALUE)
+    _round_ctx.set(_EMPTY_VALUE)

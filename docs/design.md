@@ -186,7 +186,7 @@ REP --> U
 
 ## 10.2 节点定义
 1. `load_user_memory`：加载长期偏好与会话上下文。
-2. `parse_intent_scope`：解析查询目标、范围和输出格式。
+2. `resolve_symbols`：解析本次任务标的（硬路由）并生成 MCP 软提示标的集合。
 3. `collect_signals_via_mcp`：通过 MCP 拉取信号源数据。
 4. `normalize_and_index`：标准化并入库/建索引。
 5. `retrieve_context`：检索历史证据与最新上下文。

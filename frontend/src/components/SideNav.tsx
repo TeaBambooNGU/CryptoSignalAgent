@@ -16,7 +16,7 @@ export function SideNav() {
         </span>
         <div>
           <p className="brand-title">Crypto Signal Agent</p>
-          <p className="brand-subtitle">Cold Relay Console</p>
+          <p className="brand-subtitle">Dialogue Report Console</p>
         </div>
       </div>
 
@@ -36,7 +36,7 @@ export function SideNav() {
       </nav>
 
       <div className="nav-footer">
-        <p className="mono-line">V1 · MCP-first</p>
+        <p className="mono-line">V2 · Conversation-first</p>
         <p className="mono-line">LangGraph x Milvus</p>
       </div>
     </aside>

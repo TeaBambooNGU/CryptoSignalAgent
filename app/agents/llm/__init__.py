@@ -2,15 +2,16 @@
 
 from __future__ import annotations
 
-from app.agents.llm.base import BaseLLMClient
-from app.agents.llm.openai_compatible import OpenAICompatibleLLMClient
+from langchain_core.language_models.chat_models import BaseChatModel
+from langchain_openai import ChatOpenAI
+
 from app.config.settings import Settings
 
 
-def create_llm_client(settings: Settings) -> BaseLLMClient:
-    """根据配置构建可替换 LLM 客户端。
+def create_llm_client(settings: Settings) -> BaseChatModel:
+    """根据配置构建 LangChain 原生 ChatModel。
 
-    当前默认 `LLM_PROVIDER=minimax`，通过 OpenAI-compatible 协议接入。
+    当前支持 `minimax` 与 `openai`（均走 OpenAI-compatible 协议）。
     """
 
     provider = settings.llm_provider.strip().lower()
@@ -19,26 +20,26 @@ def create_llm_client(settings: Settings) -> BaseLLMClient:
         if not settings.minimax_api_key:
             raise ValueError("MINIMAX_API_KEY 未配置，无法初始化 LLM 客户端")
 
-        return OpenAICompatibleLLMClient(
-            api_key=settings.minimax_api_key,
-            base_url=settings.minimax_base_url,
-            model=settings.llm_model,
+        minimax_llm = ChatOpenAI(
+            model_name=settings.llm_model,
             temperature=settings.llm_temperature,
-            timeout_seconds=settings.llm_timeout_seconds,
-            provider_name="minimax",
+            request_timeout=settings.llm_timeout_seconds,
+            openai_api_key=settings.minimax_api_key,
+            openai_api_base=f"{settings.minimax_api_host.rstrip('/')}/v1",
         )
+        return minimax_llm
 
-    if provider in {"openai_compatible", "openai-compatible"}:
-        if not settings.openai_compatible_api_key or not settings.openai_compatible_base_url:
-            raise ValueError("OPENAI_COMPATIBLE_API_KEY 或 OPENAI_COMPATIBLE_BASE_URL 未配置，无法初始化 LLM 客户端")
+    if provider == "openai":
+        if not settings.openai_api_key:
+            raise ValueError("OPENAI_API_KEY 未配置，无法初始化 LLM 客户端")
 
-        return OpenAICompatibleLLMClient(
-            api_key=settings.openai_compatible_api_key,
-            base_url=settings.openai_compatible_base_url,
-            model=settings.llm_model,
+        openai_llm = ChatOpenAI(
+            model_name=settings.llm_model,
             temperature=settings.llm_temperature,
-            timeout_seconds=settings.llm_timeout_seconds,
-            provider_name="openai_compatible",
+            request_timeout=settings.llm_timeout_seconds,
+            openai_api_key=settings.openai_api_key,
+            openai_api_base=settings.openai_base_url or None,
         )
+        return openai_llm
 
     raise ValueError(f"未知 LLM_PROVIDER={provider}")

@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import re
 from collections import Counter
 from time import perf_counter
@@ -16,16 +17,30 @@ from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_ex
 
 from app.agents.report_agent import ReportAgent
 from app.config.logging import get_logger, log_context
+from app.graph.mcp_subgraph import MCPSignalSubgraphRunner
 from app.memory.mem0_service import MemoryService
 from app.models.schemas import QueryResponse, ReportGenerationInput
 from app.models.state import ResearchState
 from app.retrieval.research_service import ResearchService
-from app.tools.mcp_client import MCPClient
 
 logger = get_logger(__name__)
 
-SYMBOL_PATTERN = re.compile(r"\b[A-Z]{2,10}\b")
-MCP_FEEDBACK_MAX_ROUNDS = 2
+PAIR_SYMBOL_PATTERN = re.compile(r"\b([A-Za-z]{2,10})/(?:USDT|USD|BTC|ETH|BUSD)\b")
+TOKEN_SYMBOL_PATTERN = re.compile(r"(?<![A-Za-z0-9])\$?([A-Za-z]{2,10})(?![A-Za-z0-9])")
+SYMBOL_STOPWORDS = {
+    "ETF",
+    "SEC",
+    "CPI",
+    "PPI",
+    "FOMC",
+    "FED",
+    "NFP",
+    "GDP",
+    "PMI",
+    "USD",
+    "US",
+    "AI",
+}
 
 
 class ResearchGraphRunner:
@@ -34,12 +49,12 @@ class ResearchGraphRunner:
     def __init__(
         self,
         memory_service: MemoryService,
-        mcp_client: MCPClient,
+        mcp_subgraph: MCPSignalSubgraphRunner,
         research_service: ResearchService,
         report_agent: ReportAgent,
     ) -> None:
         self.memory_service = memory_service
-        self.mcp_client = mcp_client
+        self.mcp_subgraph = mcp_subgraph
         self.research_service = research_service
         self.report_agent = report_agent
         self.graph = self._build_graph()
@@ -50,7 +65,7 @@ class ResearchGraphRunner:
         builder = StateGraph(ResearchState)
 
         builder.add_node("load_user_memory", self.load_user_memory)
-        builder.add_node("parse_intent_scope", self.parse_intent_scope)
+        builder.add_node("resolve_symbols", self.resolve_symbols)
         builder.add_node("collect_signals_via_mcp", self.collect_signals_via_mcp)
         builder.add_node("normalize_and_index", self.normalize_and_index)
         builder.add_node("retrieve_context", self.retrieve_context)
@@ -60,8 +75,8 @@ class ResearchGraphRunner:
         builder.add_node("finalize_response", self.finalize_response)
 
         builder.add_edge(START, "load_user_memory")
-        builder.add_edge("load_user_memory", "parse_intent_scope")
-        builder.add_edge("parse_intent_scope", "collect_signals_via_mcp")
+        builder.add_edge("load_user_memory", "resolve_symbols")
+        builder.add_edge("resolve_symbols", "collect_signals_via_mcp")
         builder.add_edge("collect_signals_via_mcp", "normalize_and_index")
         builder.add_edge("normalize_and_index", "retrieve_context")
         builder.add_edge("retrieve_context", "analyze_signals")
@@ -72,21 +87,35 @@ class ResearchGraphRunner:
 
         return builder.compile()
 
-    def run(
+    async def arun(
         self,
         user_id: str,
         query: str,
         task_context: dict[str, Any] | None = None,
         trace_id: str | None = None,
+        conversation_id: str | None = None,
+        turn_id: str | None = None,
+        request_id: str | None = None,
+        conversation_version: int | None = None,
+        context_anchor_turn_id: str | None = None,
     ) -> QueryResponse:
         """执行研报流程并返回 API 响应。"""
 
         task_id = str(uuid4())
         final_trace_id = trace_id or str(uuid4())
+        final_conversation_id = conversation_id or f"default:{user_id}"
+        final_turn_id = turn_id or "turn-1"
+        final_request_id = request_id or str(uuid4())
+        final_conversation_version = conversation_version or 1
         initial_state: ResearchState = {
             "user_id": user_id,
             "query": query,
             "task_context": task_context,
+            "conversation_id": final_conversation_id,
+            "turn_id": final_turn_id,
+            "context_anchor_turn_id": context_anchor_turn_id,
+            "request_id": final_request_id,
+            "conversation_version": final_conversation_version,
             "task_id": task_id,
             "trace_id": final_trace_id,
             "errors": [],
@@ -101,7 +130,7 @@ class ResearchGraphRunner:
             component="graph.runner",
         ):
             logger.info("工作流开始 query_len=%s", len(query))
-            output = self.graph.invoke(initial_state)
+            output = await self.graph.ainvoke(initial_state)
             logger.info(
                 "工作流结束 citations=%s errors=%s",
                 len(output.get("citations", [])),
@@ -112,8 +141,40 @@ class ResearchGraphRunner:
             report=output.get("final_report", "未能生成报告，请稍后重试。"),
             citations=output.get("citations", []),
             trace_id=final_trace_id,
+            conversation_id=final_conversation_id,
+            turn_id=final_turn_id,
+            request_id=final_request_id,
+            conversation_version=final_conversation_version,
             errors=output.get("errors", []),
             workflow_steps=output.get("workflow_steps", []),
+        )
+
+    def run(
+        self,
+        user_id: str,
+        query: str,
+        task_context: dict[str, Any] | None = None,
+        trace_id: str | None = None,
+        conversation_id: str | None = None,
+        turn_id: str | None = None,
+        request_id: str | None = None,
+        conversation_version: int | None = None,
+        context_anchor_turn_id: str | None = None,
+    ) -> QueryResponse:
+        """同步包装器（兼容旧调用方）。"""
+
+        return asyncio.run(
+            self.arun(
+                user_id=user_id,
+                query=query,
+                task_context=task_context,
+                trace_id=trace_id,
+                conversation_id=conversation_id,
+                turn_id=turn_id,
+                request_id=request_id,
+                conversation_version=conversation_version,
+                context_anchor_turn_id=context_anchor_turn_id,
+            )
         )
 
     # ===== 节点定义 =====
@@ -126,10 +187,19 @@ class ResearchGraphRunner:
 
         def _node_logic() -> ResearchState:
             user_id = state["user_id"]
+            conversation_id = state.get("conversation_id") or f"default:{user_id}"
             with log_context(component="graph.load_user_memory"):
                 logger.info("节点开始")
-                self.memory_service.save_task_context(user_id=user_id, task_context=state.get("task_context"))
-                profile = self.memory_service.load_memory_profile(user_id=user_id)
+                self.memory_service.save_task_context(
+                    user_id=user_id,
+                    conversation_id=conversation_id,
+                    task_context=state.get("task_context"),
+                )
+                profile = self.memory_service.load_memory_profile(
+                    user_id=user_id,
+                    conversation_id=conversation_id,
+                    context_anchor_turn_id=state.get("context_anchor_turn_id"),
+                )
                 logger.info(
                     "节点完成 long_term=%s session=%s",
                     len(profile.get("long_term_memory", [])),
@@ -139,227 +209,79 @@ class ResearchGraphRunner:
 
         return self._run_tracked_node(state, node_id="load_user_memory", handler=_node_logic)
 
-    def parse_intent_scope(self, state: ResearchState) -> ResearchState:
-        """节点目标：解析查询范围与关注标的。
+    def resolve_symbols(self, state: ResearchState) -> ResearchState:
+        """节点目标：确定本次任务 symbols 路由参数。
 
         前置条件：state 已包含 `query` 与 `memory_profile`。
-        状态产出：`symbols`。
+        状态产出：`hard_symbols`、`soft_symbols`。
         """
 
         def _node_logic() -> ResearchState:
             query = state["query"]
-            with log_context(component="graph.parse_intent_scope"):
-                symbols = {token.upper() for token in SYMBOL_PATTERN.findall(query)}
-
-                profile_watchlist = state.get("memory_profile", {}).get("watchlist", [])
-                if isinstance(profile_watchlist, list):
-                    symbols.update(str(item).upper() for item in profile_watchlist)
-
+            with log_context(component="graph.resolve_symbols"):
                 task_context = state.get("task_context") or {}
-                ctx_symbols = task_context.get("symbols") if isinstance(task_context, dict) else None
-                if isinstance(ctx_symbols, list):
-                    symbols.update(str(item).upper() for item in ctx_symbols)
+                context_symbols = self._extract_symbols_from_task_context(task_context)
+                query_symbols = self._extract_symbols_from_query(query)
+                watchlist = self._normalize_symbols(state.get("memory_profile", {}).get("watchlist", []))
 
-                if not symbols:
-                    symbols = {"BTC", "ETH"}
+                # 优先级：task_context > query；watchlist 仅用于 MCP 软提示，不扩张检索边界。
+                if context_symbols:
+                    hard_symbols = context_symbols
+                elif query_symbols:
+                    hard_symbols = query_symbols
+                else:
+                    hard_symbols = []
 
-                sorted_symbols = sorted(symbols)
-                logger.info("节点完成 symbols=%s", sorted_symbols)
-                return {"symbols": sorted_symbols}
+                soft_symbols = self._merge_symbols(hard_symbols, watchlist)
+                logger.info("节点完成 hard_symbols=%s soft_symbols=%s", hard_symbols, soft_symbols)
+                return {
+                    "hard_symbols": hard_symbols,
+                    "soft_symbols": soft_symbols,
+                    "symbols": hard_symbols,
+                }
 
-        return self._run_tracked_node(state, node_id="parse_intent_scope", handler=_node_logic)
+        return self._run_tracked_node(state, node_id="resolve_symbols", handler=_node_logic)
 
-    def collect_signals_via_mcp(self, state: ResearchState) -> ResearchState:
+    async def collect_signals_via_mcp(self, state: ResearchState) -> ResearchState:
         """节点目标：通过 MCP 拉取信号。
 
-        前置条件：state 已包含 `task_id`、`query`、`symbols`。
+        前置条件：state 已包含 `task_id`、`query`。
         状态产出：`raw_signals`、`errors`。
         """
 
-        def _node_logic() -> ResearchState:
+        async def _node_logic() -> ResearchState:
             with log_context(component="graph.collect_signals"):
-                historical_corrections = self._load_tool_corrections_for_planner(state=state)
-                combined_signals = []
-                combined_errors: list[str] = []
-                combined_failures: list[dict[str, Any]] = []
-                correction_events: list[dict[str, Any]] = []
-                feedback_for_retry: dict[str, list[dict[str, Any]]] = {}
-                previous_feedback: dict[str, list[dict[str, Any]]] = {}
-
-                for round_index in range(MCP_FEEDBACK_MAX_ROUNDS):
-                    result = self._collect_with_retry(
-                        task_id=state["task_id"],
-                        query=state["query"],
-                        symbols=state.get("symbols", []),
-                        planning_context={
-                            "historical_corrections": historical_corrections,
-                            "server_failures": feedback_for_retry,
-                        },
-                    )
-                    combined_signals = self._merge_raw_signals(combined_signals, result.signals)
-                    combined_errors.extend(result.errors)
-                    combined_failures.extend(result.failures)
-
-                    deterministic_feedback = self._group_deterministic_failures(result.failures)
-                    if deterministic_feedback and round_index + 1 < MCP_FEEDBACK_MAX_ROUNDS:
-                        previous_feedback = deterministic_feedback
-                        feedback_for_retry = deterministic_feedback
-                        logger.info(
-                            "触发 MCP 纠错重试 round=%s deterministic_failures=%s",
-                            round_index + 2,
-                            sum(len(items) for items in deterministic_feedback.values()),
-                        )
-                        continue
-
-                    if previous_feedback:
-                        correction_events = self._build_correction_events(
-                            previous_feedback=previous_feedback,
-                            successes=result.successes,
-                        )
-                        if correction_events:
-                            self._persist_tool_corrections(user_id=state["user_id"], corrections=correction_events)
-                            logger.info("MCP 纠错经验写回长期记忆 count=%s", len(correction_events))
-                    break
-
-                logger.info(
-                    "节点完成 raw_signals=%s errors=%s failures=%s corrections=%s",
-                    len(combined_signals),
-                    len(combined_errors),
-                    len(combined_failures),
-                    len(correction_events),
+                hard_symbols = state.get("hard_symbols")
+                soft_symbols = state.get("soft_symbols")
+                request_symbols = hard_symbols if isinstance(hard_symbols, list) else state.get("symbols", [])
+                hint_symbols = soft_symbols if isinstance(soft_symbols, list) else request_symbols
+                result = await self.mcp_subgraph.arun(
+                    user_id=state["user_id"],
+                    query=state["query"],
+                    task_id=state["task_id"],
+                    symbols=request_symbols,
+                    hint_symbols=hint_symbols,
+                    errors=state.get("errors", []),
                 )
-
-            merged_errors = [*state.get("errors", []), *combined_errors]
+                logger.info(
+                    "节点完成 raw_signals=%s errors=%s tools=%s termination=%s",
+                    len(result.get("raw_signals", [])),
+                    len(result.get("errors", [])),
+                    int(result.get("mcp_tools_count", 0)),
+                    result.get("mcp_termination_reason", ""),
+                )
             return {
-                "raw_signals": [item.model_dump() for item in combined_signals],
-                "errors": merged_errors,
-                "mcp_failures": combined_failures,
-                "mcp_corrections": correction_events,
+                "raw_signals": result.get("raw_signals", []),
+                "errors": result.get("errors", []),
+                "mcp_tools_count": int(result.get("mcp_tools_count", 0)),
+                "mcp_termination_reason": result.get("mcp_termination_reason", ""),
             }
 
-        return self._run_tracked_node(state, node_id="collect_signals_via_mcp", handler=_node_logic)
-
-    @retry(
-        stop=stop_after_attempt(3),
-        wait=wait_exponential(multiplier=1, min=1, max=16),
-        retry=retry_if_exception_type(Exception),
-        reraise=True,
-    )
-    def _collect_with_retry(
-        self,
-        task_id: str,
-        query: str,
-        symbols: list[str],
-        planning_context: dict[str, Any] | None,
-    ):
-        """MCP 采集重试包装。
-
-        触发条件：网络异常、超时、上游瞬时错误。
-        停止条件：最多 3 次。
-        """
-
-        return self.mcp_client.collect_signals_detailed(
-            task_id=task_id,
-            query=query,
-            symbols=symbols,
-            planning_context=planning_context,
+        return await self._run_tracked_node_async(
+            state,
+            node_id="collect_signals_via_mcp",
+            handler=_node_logic,
         )
-
-    def _load_tool_corrections_for_planner(self, state: ResearchState) -> list[dict[str, Any]]:
-        """从状态画像读取 MCP 纠错记忆。"""
-
-        profile = state.get("memory_profile", {})
-        corrections = profile.get("tool_corrections", []) if isinstance(profile, dict) else []
-        if isinstance(corrections, list):
-            return [item for item in corrections if isinstance(item, dict)]
-        return []
-
-    def _merge_raw_signals(self, existing: list[Any], incoming: list[Any]) -> list[Any]:
-        """跨轮次去重合并 RawSignal，避免重复写入。"""
-
-        merged: list[Any] = []
-        seen: set[tuple[str, str, str, str]] = set()
-        for signal in [*existing, *incoming]:
-            key = (
-                str(getattr(signal, "source", "")),
-                str(getattr(signal, "symbol", "")),
-                str(getattr(signal, "raw_ref", "")),
-                str(getattr(signal, "published_at", "")),
-            )
-            if key in seen:
-                continue
-            seen.add(key)
-            merged.append(signal)
-        return merged
-
-    def _group_deterministic_failures(self, failures: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
-        """按 server 聚合可用于纠错重规划的确定性失败。"""
-
-        grouped: dict[str, list[dict[str, Any]]] = {}
-        for item in failures:
-            if not isinstance(item, dict) or not item.get("deterministic"):
-                continue
-            server = str(item.get("server", "")).strip()
-            if not server:
-                continue
-            grouped.setdefault(server, []).append(item)
-        return grouped
-
-    def _build_correction_events(
-        self,
-        *,
-        previous_feedback: dict[str, list[dict[str, Any]]],
-        successes: list[dict[str, Any]],
-    ) -> list[dict[str, Any]]:
-        """从“上一轮失败 + 本轮成功”提取可复用纠错样本。"""
-
-        success_by_server: dict[str, list[dict[str, Any]]] = {}
-        for success in successes:
-            if not isinstance(success, dict):
-                continue
-            server = str(success.get("server", "")).strip()
-            if not server:
-                continue
-            success_by_server.setdefault(server, []).append(success)
-
-        events: list[dict[str, Any]] = []
-        for server, failures in previous_feedback.items():
-            server_successes = success_by_server.get(server, [])
-            if not failures or not server_successes:
-                continue
-            representative_success = next(
-                (item for item in server_successes if int(item.get("rows", 0) or 0) > 0),
-                server_successes[0],
-            )
-            for failure in failures[:3]:
-                error_detail = failure.get("error_detail", {})
-                events.append(
-                    {
-                        "server": server,
-                        "failed_tool": str(failure.get("tool_name", "")),
-                        "failed_arguments": failure.get("arguments", {}),
-                        "error_signature": self._build_error_signature_from_detail(
-                            error_detail if isinstance(error_detail, dict) else {}
-                        ),
-                        "fixed_tool": str(representative_success.get("tool_name", "")),
-                        "fixed_arguments": representative_success.get("arguments", {}),
-                    }
-                )
-        return events
-
-    def _persist_tool_corrections(self, *, user_id: str, corrections: list[dict[str, Any]]) -> None:
-        """将纠错经验写入长期记忆。"""
-
-        for item in corrections:
-            self.memory_service.save_tool_correction(user_id=user_id, correction=item, confidence=0.78)
-
-    def _build_error_signature_from_detail(self, detail: dict[str, Any]) -> str:
-        """构建轻量错误签名，便于记忆检索。"""
-
-        status = detail.get("status_code", "unknown")
-        message = detail.get("error_message") or detail.get("message") or detail.get("response_body") or ""
-        raw = f"status={status} message={message}"
-        return raw.replace("\n", " ")[:220]
 
     def normalize_and_index(self, state: ResearchState) -> ResearchState:
         """节点目标：标准化信号并入库。
@@ -392,13 +314,14 @@ class ResearchGraphRunner:
     def retrieve_context(self, state: ResearchState) -> ResearchState:
         """节点目标：检索历史证据与最新上下文。
 
-        前置条件：state 已包含 `query` 与 `symbols`。
+        前置条件：state 已包含 `query` 与 `hard_symbols`。
         状态产出：`retrieved_docs`。
         """
 
         def _node_logic() -> ResearchState:
             query = state["query"]
-            symbols = state.get("symbols", [])
+            hard_symbols = state.get("hard_symbols")
+            symbols = hard_symbols if isinstance(hard_symbols, list) else state.get("symbols", [])
 
             with log_context(component="graph.retrieve_context"):
                 docs = self._retrieve_with_retry(query=query, symbols=symbols)
@@ -514,6 +437,9 @@ class ResearchGraphRunner:
                     user_id=state["user_id"],
                     query=state["query"],
                     report=state.get("final_report", ""),
+                    conversation_id=state.get("conversation_id"),
+                    turn_id=state.get("turn_id"),
+                    request_id=state.get("request_id"),
                 )
                 logger.info("节点完成")
             return {}
@@ -551,6 +477,20 @@ class ResearchGraphRunner:
             "workflow_steps": self._append_workflow_step(state, node_id=node_id, status="success", start=start),
         }
 
+    async def _run_tracked_node_async(self, state: ResearchState, node_id: str, handler) -> ResearchState:
+        """异步执行节点并记录真实耗时与状态。"""
+
+        start = perf_counter()
+        try:
+            update = await handler() or {}
+        except Exception:
+            state["workflow_steps"] = self._append_workflow_step(state, node_id=node_id, status="error", start=start)
+            raise
+        return {
+            **update,
+            "workflow_steps": self._append_workflow_step(state, node_id=node_id, status="success", start=start),
+        }
+
     def _append_workflow_step(
         self,
         state: ResearchState,
@@ -563,6 +503,46 @@ class ResearchGraphRunner:
         duration_ms = max(int((perf_counter() - start) * 1000), 0)
         step = {"node_id": node_id, "status": status, "duration_ms": duration_ms}
         return [*state.get("workflow_steps", []), step]
+
+    def _extract_symbols_from_query(self, query: str) -> list[str]:
+        pair_symbols = [match.upper() for match in PAIR_SYMBOL_PATTERN.findall(query or "")]
+        token_symbols = [match.upper() for match in TOKEN_SYMBOL_PATTERN.findall(query or "")]
+        merged = self._merge_symbols(pair_symbols, token_symbols)
+        return [symbol for symbol in merged if symbol not in SYMBOL_STOPWORDS]
+
+    def _extract_symbols_from_task_context(self, task_context: Any) -> list[str]:
+        if not isinstance(task_context, dict):
+            return []
+        return self._normalize_symbols(task_context.get("symbols", []))
+
+    def _normalize_symbols(self, symbols: Any) -> list[str]:
+        if not isinstance(symbols, list):
+            return []
+        normalized: list[str] = []
+        for item in symbols:
+            text = str(item).strip().upper()
+            if not text or not (2 <= len(text) <= 10):
+                continue
+            if not re.fullmatch(r"[A-Z0-9]{2,10}", text):
+                continue
+            normalized.append(text)
+        return self._dedupe_keep_order(normalized)
+
+    def _merge_symbols(self, *symbol_groups: list[str]) -> list[str]:
+        merged: list[str] = []
+        for group in symbol_groups:
+            merged.extend(group)
+        return self._dedupe_keep_order(merged)
+
+    def _dedupe_keep_order(self, items: list[str]) -> list[str]:
+        seen: set[str] = set()
+        result: list[str] = []
+        for item in items:
+            if item in seen:
+                continue
+            seen.add(item)
+            result.append(item)
+        return result
 
     def _raw_signal_from_dict(self, item: dict[str, Any]):
         """将字典恢复为 RawSignal。"""

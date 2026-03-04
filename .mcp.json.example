@@ -1,0 +1,24 @@
+{
+  "mcpServers": {
+    "coingecko": {
+      "type": "http",
+      "url": "https://mcp.api.coingecko.com/mcp"
+    },
+    "defillama": {
+      "type": "http",
+      "url": "https://mcpllama.com/mcp"
+    },
+    "crypto_news": {
+      "type": "stdio",
+      "command": "uv",
+      "args": [
+        "run",
+        "crypto-news-mcp"
+      ],
+      "cwd": "/Users/teabamboo/Documents/AIplusLLM/cryptorNewsMCP",
+      "env": {
+        "CRYPTOPANIC_AUTH_TOKEN": "${CRYPTOPANIC_AUTH_TOKEN}"
+      }
+    }
+  }
+}
