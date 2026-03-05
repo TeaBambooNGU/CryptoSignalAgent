@@ -53,6 +53,8 @@
 ## 核心能力
 
 - MCP 多服务工具发现与调用（`langchain-mcp-adapters`）
+- 通过每个MCP对应一个子agent的方式,解决多MCP导致agent上下文爆炸的问题，同时多agent并行收集数据，优化了性能
+- 每个子agent会自修复mcp工具调用错误
 - LangGraph 编排研究流程，输出 `workflow_steps`
 - Milvus 向量检索与长期记忆（Mem0 可选）
 - 长期偏好自动抽取（使用小模型）并聚合为单条画像
