@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import time
 import unittest
+from types import SimpleNamespace
 from typing import Any
 
 from langchain_core.messages import AIMessage, ToolMessage
@@ -104,6 +105,89 @@ class MCPAgentRunnerTestCase(unittest.TestCase):
 
         self.assertIn("target_symbols=BTC", prompt)
         self.assertIn("hint_symbols=BTC,ETH", prompt)
+
+    def test_build_agent_passes_retry_middlewares(self) -> None:
+        captured: dict[str, Any] = {}
+
+        def _agent_factory(**kwargs):
+            captured.update(kwargs)
+            return _FakeAgent([])
+
+        runner = MCPSignalSubgraphRunner(
+            llm=_DummyLLM(),
+            mcp_connections={"srv": {"transport": "streamable_http", "url": "http://localhost:3000/mcp"}},
+            mcp_client_factory=_FakeMCPClient,
+            agent_factory=_agent_factory,
+        )
+
+        runner._build_agent(tools=[], agent_name="agent", system_prompt="prompt")
+
+        middleware = captured.get("middleware", [])
+        self.assertEqual(len(middleware), 2)
+        self.assertEqual(type(middleware[0]).__name__, "MCPToolErrorMiddleware")
+        self.assertEqual(type(middleware[1]).__name__, "ToolRetryMiddleware")
+
+    def test_retryable_error_classifier_distinguishes_transient_and_input_errors(self) -> None:
+        runner = MCPSignalSubgraphRunner(
+            llm=_DummyLLM(),
+            mcp_connections={"srv": {"transport": "streamable_http", "url": "http://localhost:3000/mcp"}},
+            mcp_client_factory=_FakeMCPClient,
+            agent_factory=lambda **kwargs: _FakeAgent([]),
+        )
+
+        self.assertTrue(runner._is_retryable_tool_error(TimeoutError("socket timeout")))
+        self.assertFalse(runner._is_retryable_tool_error(ValueError("missing required field: symbol")))
+
+    def test_tool_error_middleware_returns_tool_message(self) -> None:
+        runner = MCPSignalSubgraphRunner(
+            llm=_DummyLLM(),
+            mcp_connections={"srv": {"transport": "streamable_http", "url": "http://localhost:3000/mcp"}},
+            mcp_client_factory=_FakeMCPClient,
+            agent_factory=lambda **kwargs: _FakeAgent([]),
+        )
+        middleware = runner._build_agent_middleware()[0]
+        request = SimpleNamespace(
+            tool_call={"id": "call-1", "name": "srv_get_news", "args": {"limit": 10}},
+            tool=_FakeTool(name="srv_get_news", description="fetch news", schema={"type": "object", "required": ["limit"]}),
+        )
+
+        async def _handler(_request):
+            del _request
+            raise ValueError("missing required field: symbol")
+
+        message = asyncio.run(middleware.awrap_tool_call(request, _handler))
+
+        self.assertIsInstance(message, ToolMessage)
+        self.assertEqual(message.status, "error")
+        self.assertEqual(message.tool_call_id, "call-1")
+        self.assertIn('"error_type":"invalid_input"', str(message.content))
+
+    def test_retry_middleware_retries_transient_tool_errors(self) -> None:
+        runner = MCPSignalSubgraphRunner(
+            llm=_DummyLLM(),
+            mcp_connections={"srv": {"transport": "streamable_http", "url": "http://localhost:3000/mcp"}},
+            mcp_client_factory=_FakeMCPClient,
+            agent_factory=lambda **kwargs: _FakeAgent([]),
+        )
+        retry_middleware = runner._build_agent_middleware()[1]
+        request = SimpleNamespace(
+            tool_call={"id": "call-2", "name": "srv_get_news", "args": {}},
+            tool=_FakeTool(name="srv_get_news", description="fetch news", schema={"type": "object"}),
+        )
+        attempts = {"count": 0}
+
+        async def _handler(_request):
+            del _request
+            attempts["count"] += 1
+            if attempts["count"] < 3:
+                raise TimeoutError("socket timeout")
+            return ToolMessage(content='{"ok":true}', tool_call_id="call-2")
+
+        message = asyncio.run(retry_middleware.awrap_tool_call(request, _handler))
+
+        self.assertEqual(attempts["count"], 3)
+        self.assertIsInstance(message, ToolMessage)
+        self.assertEqual(str(message.content), '{"ok":true}')
 
     def test_run_collects_rows_from_tool_messages_and_payload(self) -> None:
         messages = [

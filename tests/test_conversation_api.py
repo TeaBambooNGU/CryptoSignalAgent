@@ -17,6 +17,31 @@ class ConversationAPITestCase(unittest.TestCase):
             del messages
             return "会话恢复测试报告"
 
+    class _ActionClassifierLLM:
+        def __init__(self) -> None:
+            self.calls: list[str] = []
+
+        def invoke(self, messages):
+            content = str(getattr(messages[-1], "content", ""))
+            self.calls.append(content)
+            if "改成更保守" in content or "改写" in content or "重写" in content or "润色" in content:
+                return '{"action":"rewrite_report"}'
+            if (
+                "生成" in content
+                or "来一版" in content
+                or "给我一版" in content
+                or "先给我一版" in content
+                or "出个报告" in content
+                or "重新分析" in content
+            ):
+                return '{"action":"regenerate_report"}'
+            return '{"action":"chat"}'
+
+    class _FailingActionClassifierLLM:
+        def invoke(self, messages):
+            del messages
+            raise RuntimeError("classifier unavailable")
+
     @classmethod
     def setUpClass(cls) -> None:
         cls._tmpdir = tempfile.TemporaryDirectory()
@@ -40,12 +65,16 @@ class ConversationAPITestCase(unittest.TestCase):
 
         runtime = cls._app.state.runtime
         cls._original_llm = runtime.report_agent.llm
+        cls._original_action_classifier_llm = runtime.conversation_service.action_classifier_llm
+        cls._action_classifier_llm = cls._ActionClassifierLLM()
         runtime.report_agent.llm = cls._StubLLM()
+        runtime.conversation_service.action_classifier_llm = cls._action_classifier_llm
 
     @classmethod
     def tearDownClass(cls) -> None:
         runtime = cls._app.state.runtime
         runtime.report_agent.llm = cls._original_llm
+        runtime.conversation_service.action_classifier_llm = cls._original_action_classifier_llm
         cls._client_cm.__exit__(None, None, None)
         cls._tmpdir.cleanup()
 
@@ -211,6 +240,61 @@ class ConversationAPITestCase(unittest.TestCase):
         generate_payload = generate.json()
         self.assertEqual(generate_payload["action_taken"], "regenerate_report")
         self.assertTrue(generate_payload["report"] is not None)
+
+    def test_auto_action_uses_llm_to_route_rewrite(self) -> None:
+        conversation_id = "conv-auto-llm-rewrite"
+        service = self._app.state.runtime.conversation_service
+
+        first = self.client.post(
+            f"/v1/conversation/{conversation_id}/message",
+            json={
+                "user_id": "u-auto-llm-rewrite",
+                "message": "先给我一版 BTC 报告",
+                "action": "auto",
+                "request_id": "req-auto-llm-rewrite-1",
+            },
+        )
+        self.assertEqual(first.status_code, 200)
+        first_payload = first.json()
+        self.assertEqual(first_payload["action_taken"], "regenerate_report")
+
+        call_count_before = len(self._action_classifier_llm.calls)
+        rewrite = self.client.post(
+            f"/v1/conversation/{conversation_id}/message",
+            json={
+                "user_id": "u-auto-llm-rewrite",
+                "message": "把这版报告改成更保守的版本",
+                "action": "auto",
+                "request_id": "req-auto-llm-rewrite-2",
+                "expected_version": first_payload["conversation_version"],
+            },
+        )
+        self.assertEqual(rewrite.status_code, 200)
+        rewrite_payload = rewrite.json()
+        self.assertEqual(rewrite_payload["action_taken"], "rewrite_report")
+        self.assertEqual(len(service.action_classifier_llm.calls), call_count_before + 1)
+
+    def test_auto_action_falls_back_to_rules_when_classifier_errors(self) -> None:
+        conversation_id = "conv-auto-classifier-fallback"
+        service = self._app.state.runtime.conversation_service
+        original_classifier = service.action_classifier_llm
+        service.action_classifier_llm = self._FailingActionClassifierLLM()
+        try:
+            response = self.client.post(
+                f"/v1/conversation/{conversation_id}/message",
+                json={
+                    "user_id": "u-auto-classifier-fallback",
+                    "message": "请生成一版 BTC 报告",
+                    "action": "auto",
+                    "request_id": "req-auto-classifier-fallback-1",
+                },
+            )
+        finally:
+            service.action_classifier_llm = original_classifier
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(payload["action_taken"], "regenerate_report")
 
     def test_context_summary_is_generated_for_long_conversation(self) -> None:
         conversation_id = "conv-summary-1"

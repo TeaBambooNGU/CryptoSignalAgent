@@ -5,7 +5,7 @@
 
 from __future__ import annotations
 
-from app.agents.llm import create_llm_client
+from app.agents.llm import create_deepseek_client, create_llm_client
 from app.agents.report_agent import ReportAgent
 from app.config.logging import get_logger, log_context
 from app.config.settings import Settings
@@ -39,6 +39,19 @@ class AppRuntime:
 
             self.conversation_store = SQLiteConversationTruthStore(settings.conversation_store_path)
             self.llm = create_llm_client(settings)
+            try:
+                self.conversation_action_llm = create_deepseek_client(
+                    settings,
+                    model_name=settings.conversation_action_model,
+                    timeout_seconds=settings.conversation_action_timeout_seconds,
+                )
+                logger.info("会话动作分类模型初始化完成 model=%s", settings.conversation_action_model)
+            except ValueError:
+                self.conversation_action_llm = None
+                logger.warning("未配置 DEEPSEEK_API_KEY，auto 动作路由将回退到规则判断")
+            except Exception:
+                self.conversation_action_llm = None
+                logger.exception("会话动作分类模型初始化失败，auto 动作路由将回退到规则判断")
             self.session_store = build_session_memory_store(
                 backend=settings.session_store_backend,
                 redis_url=settings.redis_url,
@@ -71,6 +84,7 @@ class AppRuntime:
             self.conversation_service = ConversationService(
                 graph_runner=self.graph_runner,
                 truth_store=self.conversation_store,
+                action_classifier_llm=self.conversation_action_llm,
             )
             self.outbox_projector = OutboxProjector(
                 truth_store=self.conversation_store,

@@ -35,7 +35,8 @@
   - [API 快速体验](#api-快速体验)
     - [1) 生成首版研报](#1-生成首版研报)
     - [2) 基于当前会话继续追问](#2-基于当前会话继续追问)
-    - [3) 查看报告版本历史](#3-查看报告版本历史)
+    - [3) 使用 auto 自动判定动作](#3-使用-auto-自动判定动作)
+    - [4) 查看报告版本历史](#4-查看报告版本历史)
   - [前端控制台](#前端控制台)
   - [开发与测试](#开发与测试)
   - [项目结构](#项目结构)
@@ -45,7 +46,7 @@
 
 ## 为什么选择它
 
-- **对话优先**：统一入口支持 `auto/chat/rewrite_report/regenerate_report`。
+- **对话优先**：统一入口支持 `auto/chat/rewrite_report/regenerate_report`，其中 `auto` 优先由 DeepSeek 小模型判定动作。
 - **可追溯**：会话与报告版本可回放，支持从历史 `turn` 分支恢复。
 - **多源信号**：通过标准 MCP 协议接入行情、链上、新闻等数据。
 - **工程化可观测**：请求级 `X-Trace-Id`、节点级耗时、重试与降级策略。
@@ -54,10 +55,12 @@
 
 - MCP 多服务工具发现与调用（`langchain-mcp-adapters`）
 - 通过每个MCP对应一个子agent的方式,解决多MCP导致agent上下文爆炸的问题，同时多agent并行收集数据，优化了性能
-- 每个子agent会自修复mcp工具调用错误
+- 每个子agent支持 MCP 工具失败后的自动重试与错误回传，具备基础自修复能力
 - LangGraph 编排研究流程，输出 `workflow_steps`
 - Milvus 向量检索与长期记忆（Mem0 可选）
 - 长期偏好自动抽取（使用小模型）并聚合为单条画像
+- `action=auto` 优先使用 DeepSeek 小模型分类为 `chat / rewrite_report / regenerate_report`
+- DeepSeek 动作分类失败或未配置时，自动回退到规则判断
 - 会话一致性保障：`request_id` 幂等 + `expected_version` CAS
 - 异步 outbox 投影：会话真相库强一致、外部记忆最终一致
 
@@ -106,6 +109,7 @@ cp .env.example .env
 最少请配置：
 
 - `LLM_PROVIDER` + 对应密钥（默认 MiniMax）
+- `DEEPSEEK_API_KEY`（用于长期偏好抽取与 `auto` 动作分类）
 - `MCP_CONFIG_PATH` 指向 `.mcp.json`
 - 若启用向量库：`MILVUS_URI`
 
@@ -150,6 +154,7 @@ npm --prefix frontend run dev
 | Embedding | `EMBEDDING_PROVIDER` / `ZHIPU_EMBEDDING_MODEL` | 向量化配置 |
 | Milvus | `MILVUS_URI` / `VECTOR_DIM` | 向量库连接与维度 |
 | 记忆抽取 | `MEMORY_EXTRACTOR_MODEL` / `MEMORY_EXTRACTOR_TIMEOUT_SECONDS` / `DEEPSEEK_API_KEY` / `DEEPSEEK_BASE_URL` | 长期偏好自动抽取模型配置 |
+| 动作分类 | `CONVERSATION_ACTION_MODEL` / `CONVERSATION_ACTION_TIMEOUT_SECONDS` / `DEEPSEEK_API_KEY` / `DEEPSEEK_BASE_URL` | `action=auto` 的 DeepSeek 动作分类配置 |
 | 会话 | `CONVERSATION_STORE_PATH` | SQLite 真相库存储路径 |
 | Session | `SESSION_STORE_BACKEND` / `REDIS_URL` | 短期会话记忆存储 |
 | MCP | `MCP_CONFIG_PATH` / `MCP_MAX_ROUNDS` | MCP 配置与调用预算 |
@@ -212,7 +217,26 @@ curl -X POST http://127.0.0.1:8000/v1/conversation/conv-u001/message \
   }'
 ```
 
-### 3) 查看报告版本历史
+### 3) 使用 auto 自动判定动作
+
+```bash
+curl -X POST http://127.0.0.1:8000/v1/conversation/conv-u001/message \
+  -H "Content-Type: application/json" \
+  -d '{
+    "user_id": "u001",
+    "message": "把刚才那版 BTC 报告改成更保守的版本",
+    "action": "auto",
+    "expected_version": 2,
+    "request_id": "req-u001-turn3"
+  }'
+```
+
+说明：
+
+- `action=auto` 会优先调用 DeepSeek 小模型判断当前请求更适合 `chat`、`rewrite_report` 还是 `regenerate_report`
+- 若 `DEEPSEEK_API_KEY` 未配置，或分类模型调用失败，会自动回退到现有规则判断
+
+### 4) 查看报告版本历史
 
 ```bash
 curl "http://127.0.0.1:8000/v1/conversation/conv-u001/reports?limit=20"
@@ -282,6 +306,9 @@ uv run python scripts/inspect_mcp.py
 
 - **Q: `from_turn_id` 的作用？**  
   A: 作为分支锚点，后续上下文仅基于该分支链路构建。
+
+- **Q: `action=auto` 现在怎么判定？**  
+  A: 优先由 DeepSeek 小模型判定 `chat / rewrite_report / regenerate_report`；若 DeepSeek 未配置或分类失败，则回退到规则判断。
 
 ## 许可证
 
