@@ -46,7 +46,7 @@ export const BASE_WORKFLOW: WorkflowNode[] = [
   { id: "resolve_symbols", label: "解析标的", status: "idle" },
   { id: "collect_signals_via_mcp", label: "采集信号", status: "idle" },
   { id: "normalize_and_index", label: "标准化入库", status: "idle" },
-  { id: "retrieve_context", label: "检索上下文", status: "idle" },
+  { id: "retrieve_knowledge_evidence", label: "检索知识证据", status: "idle" },
   { id: "analyze_signals", label: "分析信号", status: "idle" },
   { id: "generate_report", label: "生成研报", status: "idle" },
   { id: "persist_memory", label: "写回记忆", status: "idle" },

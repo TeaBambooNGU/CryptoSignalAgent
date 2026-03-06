@@ -1,8 +1,8 @@
 """Milvus 存储层封装。
 
 职责：
-1. 初始化并维护 `research_chunks` 与 `user_memory` 两个集合。
-2. 对外暴露统一的写入/检索接口。
+1. 初始化并维护 `signal_chunks`、`knowledge_chunks` 与 `user_memory` 三个集合。
+2. 对外暴露实时信号、知识库文档、用户记忆的写入/检索接口。
 3. 在 Milvus 不可用时按配置降级到内存存储，保证主流程可用。
 """
 
@@ -28,12 +28,14 @@ class MilvusStore:
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
         self.alias = "crypto_signal_agent"
-        self._research_collection: Collection | None = None
+        self._signal_collection: Collection | None = None
+        self._knowledge_collection: Collection | None = None
         self._memory_collection: Collection | None = None
         self._connected = False
 
         # 降级存储：仅在允许 fallback 且 Milvus 不可用时使用。
-        self._research_fallback: list[dict[str, Any]] = []
+        self._signal_fallback: list[dict[str, Any]] = []
+        self._knowledge_fallback: list[dict[str, Any]] = []
         self._memory_fallback: list[dict[str, Any]] = []
 
     @property
@@ -78,13 +80,13 @@ class MilvusStore:
             logger.warning("启用内存降级模式，数据不会持久化")
 
     def _ensure_collections(self) -> None:
-        """确保研究集合与记忆集合存在并可检索。"""
+        """确保信号集合、知识集合与记忆集合存在并可检索。"""
 
-        self._research_collection = self._prepare_research_collection()
+        self._signal_collection = self._prepare_signal_collection()
+        self._knowledge_collection = self._prepare_knowledge_collection()
         self._memory_collection = self._prepare_memory_collection()
 
-    def _prepare_research_collection(self) -> Collection:
-        name = self.settings.milvus_research_collection
+    def _prepare_chunk_collection(self, *, name: str, description: str) -> Collection:
         if not utility.has_collection(name, using=self.alias):
             fields = [
                 FieldSchema("id", DataType.VARCHAR, is_primary=True, max_length=128),
@@ -98,7 +100,7 @@ class MilvusStore:
                 FieldSchema("task_id", DataType.VARCHAR, max_length=128),
                 FieldSchema("embedding", DataType.FLOAT_VECTOR, dim=self.settings.vector_dim),
             ]
-            schema = CollectionSchema(fields=fields, description="研究语料分块", enable_dynamic_field=False)
+            schema = CollectionSchema(fields=fields, description=description, enable_dynamic_field=False)
             collection = Collection(name=name, schema=schema, using=self.alias)
             collection.create_index(
                 field_name="embedding",
@@ -114,6 +116,18 @@ class MilvusStore:
 
         collection.load()
         return collection
+
+    def _prepare_signal_collection(self) -> Collection:
+        return self._prepare_chunk_collection(
+            name=self.settings.milvus_signal_collection,
+            description="实时信号分块",
+        )
+
+    def _prepare_knowledge_collection(self) -> Collection:
+        return self._prepare_chunk_collection(
+            name=self.settings.milvus_knowledge_collection,
+            description="知识库文档分块",
+        )
 
     def _prepare_memory_collection(self) -> Collection:
         name = self.settings.milvus_memory_collection
@@ -150,8 +164,15 @@ class MilvusStore:
         retry=retry_if_exception_type(Exception),
         reraise=True,
     )
-    def upsert_research_chunks(self, rows: list[dict[str, Any]]) -> int:
-        """写入研究语料分块。
+    def _upsert_chunk_rows(
+        self,
+        *,
+        rows: list[dict[str, Any]],
+        collection: Collection | None,
+        fallback_store: list[dict[str, Any]],
+        collection_name: str,
+    ) -> int:
+        """写入 chunk 行。
 
         幂等策略：
         - 调用方需提供稳定 `id`（通常由 doc_id + chunk_id 组成）。
@@ -162,11 +183,11 @@ class MilvusStore:
             return 0
 
         if self.using_fallback:
-            self._research_fallback.extend(rows)
+            fallback_store.extend(rows)
             return len(rows)
 
-        if self._research_collection is None:
-            raise RuntimeError("research collection 未初始化")
+        if collection is None:
+            raise RuntimeError(f"{collection_name} collection 未初始化")
 
         normalized_rows = []
         for row in rows:
@@ -188,10 +209,30 @@ class MilvusStore:
         ids = [item["id"] for item in normalized_rows]
         expr_values = ",".join(json.dumps(item) for item in ids)
         delete_expr = f"id in [{expr_values}]"
-        self._research_collection.delete(delete_expr)
-        self._research_collection.insert(normalized_rows)
-        self._research_collection.flush()
+        collection.delete(delete_expr)
+        collection.insert(normalized_rows)
+        collection.flush()
         return len(normalized_rows)
+
+    def upsert_signal_chunks(self, rows: list[dict[str, Any]]) -> int:
+        """写入实时信号分块。"""
+
+        return self._upsert_chunk_rows(
+            rows=rows,
+            collection=self._signal_collection,
+            fallback_store=self._signal_fallback,
+            collection_name="signal",
+        )
+
+    def upsert_knowledge_chunks(self, rows: list[dict[str, Any]]) -> int:
+        """写入知识库文档分块。"""
+
+        return self._upsert_chunk_rows(
+            rows=rows,
+            collection=self._knowledge_collection,
+            fallback_store=self._knowledge_fallback,
+            collection_name="knowledge",
+        )
 
     @retry(
         stop=stop_after_attempt(3),
@@ -199,19 +240,23 @@ class MilvusStore:
         retry=retry_if_exception_type(Exception),
         reraise=True,
     )
-    def search_research_chunks(
+    def _search_chunk_rows(
         self,
+        *,
         query_vector: list[float],
         top_k: int = 8,
         symbols: list[str] | None = None,
+        collection: Collection | None,
+        fallback_store: list[dict[str, Any]],
+        collection_name: str,
     ) -> list[dict[str, Any]]:
-        """检索研究语料分块。"""
+        """检索 chunk 行。"""
 
         if not query_vector:
             return []
 
         if self.using_fallback:
-            candidates = self._research_fallback
+            candidates = fallback_store
             if symbols:
                 symbols_set = set(symbols)
                 candidates = [item for item in candidates if item.get("symbol") in symbols_set]
@@ -222,15 +267,15 @@ class MilvusStore:
             )
             return ranked[:top_k]
 
-        if self._research_collection is None:
-            raise RuntimeError("research collection 未初始化")
+        if collection is None:
+            raise RuntimeError(f"{collection_name} collection 未初始化")
 
         expr = ""
         if symbols:
             symbol_values = ",".join(json.dumps(symbol) for symbol in symbols)
             expr = f"symbol in [{symbol_values}]"
 
-        result = self._research_collection.search(
+        result = collection.search(
             data=[query_vector],
             anns_field="embedding",
             param={"metric_type": "COSINE", "params": {"ef": 64}},
@@ -257,6 +302,85 @@ class MilvusStore:
                 }
             )
         return records
+
+    def search_signal_chunks(
+        self,
+        query_vector: list[float],
+        top_k: int = 8,
+        symbols: list[str] | None = None,
+    ) -> list[dict[str, Any]]:
+        """检索实时信号分块。"""
+
+        return self._search_chunk_rows(
+            query_vector=query_vector,
+            top_k=top_k,
+            symbols=symbols,
+            collection=self._signal_collection,
+            fallback_store=self._signal_fallback,
+            collection_name="signal",
+        )
+
+    def search_knowledge_chunks(
+        self,
+        query_vector: list[float],
+        top_k: int = 8,
+        symbols: list[str] | None = None,
+    ) -> list[dict[str, Any]]:
+        """检索知识库文档分块。"""
+
+        return self._search_chunk_rows(
+            query_vector=query_vector,
+            top_k=top_k,
+            symbols=symbols,
+            collection=self._knowledge_collection,
+            fallback_store=self._knowledge_fallback,
+            collection_name="knowledge",
+        )
+
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, min=1, max=16),
+        retry=retry_if_exception_type(Exception),
+        reraise=True,
+    )
+    def delete_knowledge_chunks_by_doc_id(self, doc_id: str) -> int:
+        """按文档 ID 删除知识库 chunk。"""
+
+        normalized_doc_id = str(doc_id).strip()
+        if not normalized_doc_id:
+            return 0
+
+        if self.using_fallback:
+            original_size = len(self._knowledge_fallback)
+            self._knowledge_fallback = [
+                row for row in self._knowledge_fallback if str(row.get("doc_id", "")) != normalized_doc_id
+            ]
+            return original_size - len(self._knowledge_fallback)
+
+        if self._knowledge_collection is None:
+            raise RuntimeError("knowledge collection 未初始化")
+
+        delete_expr = f"doc_id == {json.dumps(normalized_doc_id)}"
+        self._knowledge_collection.delete(delete_expr)
+        self._knowledge_collection.flush()
+        return 1
+
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, min=1, max=16),
+        retry=retry_if_exception_type(Exception),
+        reraise=True,
+    )
+    def drop_legacy_research_collection(self, name: str = "research_chunks") -> bool:
+        """删除历史遗留的统一 research collection。"""
+
+        if self.using_fallback:
+            return False
+        if not utility.has_collection(name, using=self.alias):
+            return False
+        utility.drop_collection(name, using=self.alias)
+        logger.info("已删除历史遗留 collection: %s", name)
+        return True
 
     @retry(
         stop=stop_after_attempt(3),

@@ -47,7 +47,7 @@
   - `app/api`: HTTP 路由与依赖注入。
   - `app/conversation`: 会话真相库、锁与幂等控制、对话路由、outbox 投影器。
   - `app/graph`: LangGraph 主流程（`workflow.py`）与 MCP Agent 执行器（`mcp_subgraph.py`）。
-  - `app/retrieval`: Embedding、Milvus 存储封装、信号入库与检索服务。
+  - `app/retrieval`: Embedding、Milvus 双向量库封装（`signal_chunks` / `knowledge_chunks`）、信号入库与知识证据检索服务。
   - `app/memory`: 记忆服务（Mem0 优先，Milvus + Session 降级）与 SessionStore 抽象（memory/redis）。
   - `app/agents`: LLM 抽象、客户端工厂、研报生成代理。
   - `app/config`: 环境变量配置与日志配置（trace 上下文注入、按天+按大小轮转）。
@@ -62,7 +62,7 @@
   - `app/conversation/service.py`: 会话动作路由（auto/chat/rewrite/regenerate）、上下文拼装、摘要刷新。
   - `app/conversation/store.py`: snapshot/turn/report/summary/idempotency/event/outbox 的事务化读写。
   - `app/conversation/projector.py`: 消费 outbox 并异步投影到长期记忆写接口。
-  - `app/graph/workflow.py`: 主流程 9 节点编排（load memory / resolve symbols / collect via MCP / normalize & index / retrieve / analyze / generate / persist memory / finalize）。
+  - `app/graph/workflow.py`: 主流程 9 节点编排（load memory / resolve symbols / collect via MCP / normalize & index / retrieve knowledge evidence / analyze / generate / persist memory / finalize）。
   - `app/memory/mem0_service.py`: DeepSeek 偏好抽取、偏好归一化/合并、单条画像写回、recent turns + summary 注入、Mem0 platform/oss 兼容。
   - `app/retrieval/milvus_store.py`: 用户记忆 upsert/query、按 ID 批量删除、全量扫描（供离线修复脚本使用）。
   - `scripts/repair_user_memory_profile.py`: 离线修复历史 preference 冗余记录为单条画像结构（支持 `--dry-run`）。
@@ -110,7 +110,7 @@
 - 数据来源:
   - 用户消息（`message/action/task_context/expected_version/from_turn_id`）。
   - MCP tools 返回的结构化或文本内容。
-  - 历史研究语料（`research_chunks`）与用户记忆（`user_memory`）以及会话真相库 turn/report/summary。
+  - 实时信号向量库（`signal_chunks`）、知识证据向量库（`knowledge_chunks`）、用户记忆（`user_memory`）以及会话真相库 turn/report/summary。
 - 主链路（`POST /v1/conversation/{conversation_id}/message`）:
   1. API 路由接收消息并注入/透传 `trace_id`。
   2. `ConversationService.send_message` 执行 `prepare_turn`（CAS + 幂等 + version 分配）。
@@ -210,7 +210,7 @@ sequenceDiagram
   - CAS 版本冲突返回 `409 conversation_version_conflict`，前端可刷新版本后重试。
   - 同一 `request_id` 处理中返回 `409 request_in_flight`；完成后重试会命中幂等缓存。
   - `rewrite_report` 在无可用报告版本时返回 404；`from_turn_id` 不存在时 resume/message 返回 404。
-  - MCP 未配置或无工具可用时返回 `no_tools`，主流程走历史检索降级生成报告。
+  - MCP 未配置或无工具可用时返回 `no_tools`，主流程走知识库证据 + 用户偏好降级生成报告。
   - MCP 工具瞬时失败会先自动重试；若仍失败，则将错误摘要作为 `ToolMessage` 回传给模型，由模型尝试修正参数或改用其他工具。
   - 非可重试错误（如权限、资源不存在、明显参数错误）不会无意义重试；失败摘要会进入 `errors`，并保留其他 server 的部分成功结果。
   - Agent 执行异常返回 `agent_failed`；若最终 JSON 解析失败但有 `ToolMessage` 可提取结果，仍会继续使用可提取信号。

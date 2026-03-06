@@ -23,14 +23,25 @@ from typing import Any
 from uuid import uuid4
 
 from app.conversation.errors import ConversationConflictError, DuplicateRequestInFlightError
+from app.models.schemas import Citation, WorkflowStep
 
 
 def _now_ts() -> int:
     return int(datetime.now(timezone.utc).timestamp())
 
 
+def _jsonable(payload: Any) -> Any:
+    if isinstance(payload, Citation | WorkflowStep):
+        return payload.model_dump(mode="json")
+    if isinstance(payload, list):
+        return [_jsonable(item) for item in payload]
+    if isinstance(payload, dict):
+        return {str(key): _jsonable(value) for key, value in payload.items()}
+    return payload
+
+
 def _json_dumps(payload: Any) -> str:
-    return json.dumps(payload, ensure_ascii=False)
+    return json.dumps(_jsonable(payload), ensure_ascii=False)
 
 
 def _json_loads(payload: str | None, fallback: Any) -> Any:
@@ -41,6 +52,20 @@ def _json_loads(payload: str | None, fallback: Any) -> Any:
         return json.loads(raw)
     except Exception:
         return fallback
+
+
+def _decode_citations(payload: str | None) -> list[Citation]:
+    rows = _json_loads(payload, [])
+    if not isinstance(rows, list):
+        return []
+    return [Citation.model_validate(item) for item in rows]
+
+
+def _decode_workflow_steps(payload: str | None) -> list[WorkflowStep]:
+    rows = _json_loads(payload, [])
+    if not isinstance(rows, list):
+        return []
+    return [WorkflowStep.model_validate(item) for item in rows]
 
 
 @dataclass(slots=True)
@@ -181,6 +206,28 @@ class SQLiteConversationTruthStore:
                     updated_at INTEGER NOT NULL
                 );
 
+                CREATE TABLE IF NOT EXISTS knowledge_document (
+                    doc_id TEXT PRIMARY KEY,
+                    kb_id TEXT NOT NULL,
+                    title TEXT NOT NULL,
+                    source TEXT NOT NULL,
+                    doc_type TEXT NOT NULL,
+                    symbols_json TEXT NOT NULL,
+                    tags_json TEXT NOT NULL,
+                    file_name TEXT NOT NULL,
+                    content_type TEXT NOT NULL,
+                    checksum TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    chunk_count INTEGER NOT NULL,
+                    uploaded_by TEXT NOT NULL,
+                    published_at INTEGER,
+                    created_at INTEGER NOT NULL,
+                    updated_at INTEGER NOT NULL
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_knowledge_document_updated_at
+                    ON knowledge_document(updated_at DESC);
+
                 CREATE TABLE IF NOT EXISTS conversation_event (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     conversation_id TEXT NOT NULL,
@@ -228,6 +275,123 @@ class SQLiteConversationTruthStore:
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_turn_parent_turn ON conversation_turn(conversation_id, parent_turn_id)"
             )
+
+    def upsert_knowledge_document(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """写入或更新知识库文档元数据。"""
+
+        now = _now_ts()
+        row = {
+            "doc_id": str(payload.get("doc_id") or uuid4()),
+            "kb_id": str(payload.get("kb_id") or "default"),
+            "title": str(payload.get("title") or ""),
+            "source": str(payload.get("source") or "manual"),
+            "doc_type": str(payload.get("doc_type") or "research_report"),
+            "symbols_json": _json_dumps(payload.get("symbols") or []),
+            "tags_json": _json_dumps(payload.get("tags") or []),
+            "file_name": str(payload.get("file_name") or ""),
+            "content_type": str(payload.get("content_type") or "text/plain"),
+            "checksum": str(payload.get("checksum") or ""),
+            "status": str(payload.get("status") or "ready"),
+            "chunk_count": int(payload.get("chunk_count", 0) or 0),
+            "uploaded_by": str(payload.get("uploaded_by") or "unknown"),
+            "published_at": int(payload.get("published_at", 0) or 0) or None,
+            "created_at": int(payload.get("created_at", now) or now),
+            "updated_at": int(payload.get("updated_at", now) or now),
+        }
+        with self._write_guard:
+            with self._connect() as conn:
+                conn.execute(
+                    """
+                    INSERT INTO knowledge_document(
+                      doc_id, kb_id, title, source, doc_type, symbols_json, tags_json,
+                      file_name, content_type, checksum, status, chunk_count,
+                      uploaded_by, published_at, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(doc_id) DO UPDATE SET
+                      kb_id=excluded.kb_id,
+                      title=excluded.title,
+                      source=excluded.source,
+                      doc_type=excluded.doc_type,
+                      symbols_json=excluded.symbols_json,
+                      tags_json=excluded.tags_json,
+                      file_name=excluded.file_name,
+                      content_type=excluded.content_type,
+                      checksum=excluded.checksum,
+                      status=excluded.status,
+                      chunk_count=excluded.chunk_count,
+                      uploaded_by=excluded.uploaded_by,
+                      published_at=excluded.published_at,
+                      updated_at=excluded.updated_at
+                    """,
+                    (
+                        row["doc_id"],
+                        row["kb_id"],
+                        row["title"],
+                        row["source"],
+                        row["doc_type"],
+                        row["symbols_json"],
+                        row["tags_json"],
+                        row["file_name"],
+                        row["content_type"],
+                        row["checksum"],
+                        row["status"],
+                        row["chunk_count"],
+                        row["uploaded_by"],
+                        row["published_at"],
+                        row["created_at"],
+                        row["updated_at"],
+                    ),
+                )
+                stored = conn.execute(
+                    "SELECT * FROM knowledge_document WHERE doc_id=?",
+                    (row["doc_id"],),
+                ).fetchone()
+        return self._decode_knowledge_document_row(stored) if stored is not None else {}
+
+    def list_knowledge_documents(self, *, limit: int = 100, kb_id: str | None = None) -> list[dict[str, Any]]:
+        """获取知识库文档列表。"""
+
+        final_limit = max(1, min(int(limit), 500))
+        sql = "SELECT * FROM knowledge_document WHERE status != 'deleted'"
+        params: list[Any] = []
+        if kb_id:
+            sql += " AND kb_id=?"
+            params.append(str(kb_id))
+        sql += " ORDER BY updated_at DESC LIMIT ?"
+        params.append(final_limit)
+        with self._connect() as conn:
+            rows = conn.execute(sql, tuple(params)).fetchall()
+        return [self._decode_knowledge_document_row(row) for row in rows]
+
+    def get_knowledge_document(self, *, doc_id: str) -> dict[str, Any] | None:
+        """获取单个知识库文档元数据。"""
+
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM knowledge_document WHERE doc_id=?",
+                (str(doc_id),),
+            ).fetchone()
+        if row is None:
+            return None
+        return self._decode_knowledge_document_row(row)
+
+    def mark_knowledge_document_deleted(self, *, doc_id: str) -> dict[str, Any] | None:
+        """软删除知识库文档。"""
+
+        now = _now_ts()
+        with self._write_guard:
+            with self._connect() as conn:
+                conn.execute(
+                    "UPDATE knowledge_document SET status='deleted', updated_at=? WHERE doc_id=?",
+                    (now, str(doc_id)),
+                )
+                row = conn.execute(
+                    "SELECT * FROM knowledge_document WHERE doc_id=?",
+                    (str(doc_id),),
+                ).fetchone()
+        if row is None:
+            return None
+        return self._decode_knowledge_document_row(row)
 
     def prepare_turn(
         self,
@@ -1097,9 +1261,9 @@ class SQLiteConversationTruthStore:
             "assistant_message": str(row["assistant_message_text"] or ""),
             "task_context": _json_loads(str(row["task_context_json"]), {}),
             "report": str(row["response_report"] or ""),
-            "citations": _json_loads(str(row["response_citations_json"]), []),
+            "citations": _decode_citations(str(row["response_citations_json"])),
             "errors": _json_loads(str(row["response_errors_json"]), []),
-            "workflow_steps": _json_loads(str(row["workflow_steps_json"]), []),
+            "workflow_steps": _decode_workflow_steps(str(row["workflow_steps_json"])),
             "trace_id": str(row["trace_id"]),
             "status": str(row["status"]),
             "intent": str(row["intent"] or ""),
@@ -1119,9 +1283,30 @@ class SQLiteConversationTruthStore:
             "based_on_report_id": str(row["based_on_report_id"]) if row["based_on_report_id"] else None,
             "mode": str(row["mode"]),
             "report": str(row["report_text"]),
-            "citations": _json_loads(str(row["citations_json"]), []),
-            "workflow_steps": _json_loads(str(row["workflow_steps_json"]), []),
+            "citations": _decode_citations(str(row["citations_json"])),
+            "workflow_steps": _decode_workflow_steps(str(row["workflow_steps_json"])),
             "status": str(row["status"]),
+            "created_at": int(row["created_at"]),
+            "updated_at": int(row["updated_at"]),
+        }
+
+    def _decode_knowledge_document_row(self, row: sqlite3.Row) -> dict[str, Any]:
+        published_at = row["published_at"]
+        return {
+            "doc_id": str(row["doc_id"]),
+            "kb_id": str(row["kb_id"]),
+            "title": str(row["title"]),
+            "source": str(row["source"]),
+            "doc_type": str(row["doc_type"]),
+            "symbols": _json_loads(str(row["symbols_json"]), []),
+            "tags": _json_loads(str(row["tags_json"]), []),
+            "file_name": str(row["file_name"] or ""),
+            "content_type": str(row["content_type"] or "text/plain"),
+            "checksum": str(row["checksum"] or ""),
+            "status": str(row["status"]),
+            "chunk_count": int(row["chunk_count"] or 0),
+            "uploaded_by": str(row["uploaded_by"]),
+            "published_at": datetime.fromtimestamp(int(published_at), tz=timezone.utc) if published_at else None,
             "created_at": int(row["created_at"]),
             "updated_at": int(row["updated_at"]),
         }

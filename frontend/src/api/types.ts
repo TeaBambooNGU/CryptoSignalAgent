@@ -125,23 +125,52 @@ export interface UserProfileResponse {
   session_memory: JsonDict[];
 }
 
-export interface IngestDocument {
-  doc_id: string;
-  symbol: string;
+export interface KnowledgeDocumentCreate {
+  title: string;
   source: string;
-  published_at: string;
+  doc_type: string;
+  symbols: string[];
+  tags: string[];
   text: string;
-  metadata: JsonDict;
+  kb_id?: string;
+  language?: string;
+  published_at?: string;
+  metadata?: JsonDict;
 }
 
-export interface IngestRequest {
+export interface KnowledgeDocumentRequest {
   user_id: string;
   task_id?: string;
-  documents: IngestDocument[];
+  document: KnowledgeDocumentCreate;
 }
 
-export interface IngestResponse {
+export interface KnowledgeDocumentRecord {
+  doc_id: string;
+  kb_id: string;
+  title: string;
+  source: string;
+  doc_type: string;
+  symbols: string[];
+  tags: string[];
+  language: string;
+  file_name: string;
+  content_type: string;
+  checksum: string;
+  status: string;
+  chunk_count: number;
+  uploaded_by: string;
+  published_at?: string | null;
+  created_at: number;
+  updated_at: number;
+}
+
+export interface KnowledgeDocumentResponse {
   success: boolean;
-  inserted_chunks: number;
   task_id: string;
+  inserted_chunks: number;
+  document: KnowledgeDocumentRecord;
+}
+
+export interface KnowledgeDocumentListResponse {
+  items: KnowledgeDocumentRecord[];
 }

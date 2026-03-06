@@ -166,27 +166,61 @@ class APITestCase(unittest.TestCase):
         detail = conflict.json()["detail"]
         self.assertEqual(detail["error"], "conversation_version_conflict")
 
-    def test_research_ingest(self) -> None:
-        resp = self.client.post(
-            "/v1/research/ingest",
+    def test_knowledge_document_create_and_list(self) -> None:
+        create_resp = self.client.post(
+            "/v1/knowledge/documents",
             json={
-                "user_id": "u-test-3",
-                "documents": [
-                    {
-                        "doc_id": "doc-1",
-                        "symbol": "BTC",
-                        "source": "manual-mcp",
-                        "published_at": "2026-03-01T00:00:00Z",
-                        "text": "BTC funding rate raised and open interest climbed.",
-                        "metadata": {"raw_ref": "https://example.com/doc-1"},
-                    }
-                ],
+                "user_id": "u-kb-1",
+                "document": {
+                    "title": "BTC Liquidity Framework",
+                    "source": "research-desk",
+                    "doc_type": "research_report",
+                    "symbols": ["BTC", "ETH"],
+                    "tags": ["macro", "liquidity"],
+                    "text": "BTC 与 ETH 流动性变化通常会先在 ETF 资金与稳定币供给中体现。",
+                    "kb_id": "macro-research",
+                    "language": "zh",
+                    "published_at": "2026-03-01T00:00:00Z",
+                    "metadata": {"author": "Desk"},
+                },
             },
         )
-        self.assertEqual(resp.status_code, 200)
-        payload = resp.json()
-        self.assertTrue(payload["success"])
-        self.assertGreaterEqual(payload["inserted_chunks"], 1)
+        self.assertEqual(create_resp.status_code, 200)
+        create_payload = create_resp.json()
+        self.assertTrue(create_payload["success"])
+        self.assertGreaterEqual(create_payload["inserted_chunks"], 1)
+        self.assertEqual(create_payload["document"]["title"], "BTC Liquidity Framework")
+
+        list_resp = self.client.get("/v1/knowledge/documents")
+        self.assertEqual(list_resp.status_code, 200)
+        list_payload = list_resp.json()
+        self.assertTrue(list_payload["items"])
+        self.assertEqual(list_payload["items"][0]["kb_id"], "macro-research")
+
+    def test_knowledge_document_delete(self) -> None:
+        create_resp = self.client.post(
+            "/v1/knowledge/documents",
+            json={
+                "user_id": "u-kb-2",
+                "document": {
+                    "title": "ETH Upgrade Note",
+                    "source": "internal",
+                    "doc_type": "event_note",
+                    "symbols": ["ETH"],
+                    "tags": ["upgrade"],
+                    "text": "ETH 升级窗口会影响短期风险偏好与链上活跃度。",
+                },
+            },
+        )
+        self.assertEqual(create_resp.status_code, 200)
+        doc_id = create_resp.json()["document"]["doc_id"]
+
+        delete_resp = self.client.delete(f"/v1/knowledge/documents/{doc_id}")
+        self.assertEqual(delete_resp.status_code, 200)
+        self.assertEqual(delete_resp.json()["status"], "deleted")
+
+        get_resp = self.client.get(f"/v1/knowledge/documents/{doc_id}")
+        self.assertEqual(get_resp.status_code, 404)
 
     def test_research_query_returns_500_when_llm_unavailable(self) -> None:
         runtime = self._app.state.runtime

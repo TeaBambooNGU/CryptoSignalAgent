@@ -3,7 +3,7 @@ import { NavLink } from "react-router-dom";
 const NAV_ITEMS = [
   { to: "/", label: "Console" },
   { to: "/memory", label: "Memory" },
-  { to: "/ingest", label: "Ingest" },
+  { to: "/knowledge", label: "Knowledge" },
   { to: "/settings", label: "Settings" },
 ];
 

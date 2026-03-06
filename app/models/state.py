@@ -32,7 +32,7 @@ class ResearchState(TypedDict, total=False):
 
     raw_signals: list[dict[str, Any]]
     signals: list[NormalizedSignal]
-    retrieved_docs: list[RetrievedChunk]
+    knowledge_docs: list[RetrievedChunk]
 
     analysis_summary: str
     report_draft: str
