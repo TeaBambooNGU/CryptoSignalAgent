@@ -954,6 +954,215 @@ nav {
   max-width: 960px;
 }
 
+.knowledge-layout {
+  gap: var(--space-4);
+}
+
+.knowledge-hero {
+  position: relative;
+  overflow: hidden;
+}
+
+.knowledge-hero::after {
+  content: "";
+  position: absolute;
+  inset: auto -120px -140px auto;
+  width: 360px;
+  height: 360px;
+  border-radius: 50%;
+  background: radial-gradient(circle, rgba(95, 255, 224, 0.2), transparent 68%);
+  pointer-events: none;
+}
+
+.knowledge-hero__head {
+  display: grid;
+  grid-template-columns: minmax(0, 360px) minmax(0, 1fr);
+  gap: var(--space-4);
+  align-items: start;
+  margin-bottom: var(--space-4);
+}
+
+.knowledge-hero__lede {
+  max-width: 64ch;
+  color: #d7e3f7;
+  line-height: 1.7;
+  font-size: 0.96rem;
+}
+
+.knowledge-hero__metrics {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: var(--space-3);
+}
+
+.knowledge-hero__metrics article,
+.support-card,
+.knowledge-panel,
+.upload-dropzone {
+  position: relative;
+}
+
+.knowledge-hero__metrics article {
+  border: 1px solid rgba(73, 203, 181, 0.16);
+  border-radius: var(--radius-sm);
+  background: rgba(7, 12, 20, 0.62);
+  padding: var(--space-3);
+  display: grid;
+  gap: 6px;
+}
+
+.knowledge-hero__metrics span,
+.split-list span,
+.upload-dropzone__eyebrow {
+  color: var(--text-muted);
+  font-size: 0.72rem;
+  font-family: var(--font-mono);
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.knowledge-hero__metrics strong {
+  font-family: var(--font-display);
+  font-size: 0.96rem;
+}
+
+.knowledge-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1.25fr) minmax(320px, 0.75fr);
+  gap: var(--space-4);
+  align-items: start;
+}
+
+.knowledge-dock,
+.knowledge-sidecar {
+  display: grid;
+  gap: var(--space-4);
+}
+
+.upload-dropzone {
+  display: grid;
+  gap: var(--space-2);
+  border: 1px dashed rgba(95, 255, 224, 0.42);
+  border-radius: var(--radius-md);
+  background:
+    linear-gradient(135deg, rgba(95, 255, 224, 0.08), rgba(95, 255, 224, 0.02)),
+    rgba(8, 13, 20, 0.74);
+  padding: 18px;
+  margin-bottom: var(--space-4);
+  cursor: pointer;
+  transition: border-color 0.2s ease, transform 0.2s ease, box-shadow 0.2s ease;
+}
+
+.upload-dropzone:hover {
+  transform: translateY(-1px);
+  border-color: var(--accent);
+  box-shadow: 0 10px 24px rgba(95, 255, 224, 0.08);
+}
+
+.upload-dropzone strong {
+  font-family: var(--font-display);
+  font-size: 1.05rem;
+}
+
+.upload-dropzone span:last-child {
+  color: #d1d8e8;
+  line-height: 1.5;
+}
+
+.upload-dropzone input {
+  position: absolute;
+  inset: 0;
+  opacity: 0;
+  cursor: pointer;
+}
+
+.support-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: var(--space-3);
+  margin-bottom: var(--space-3);
+}
+
+.support-card {
+  border: 1px solid rgba(73, 203, 181, 0.14);
+  border-radius: var(--radius-sm);
+  background: rgba(7, 12, 20, 0.58);
+  padding: var(--space-3);
+  display: grid;
+  gap: 6px;
+}
+
+.support-card strong {
+  font-family: var(--font-mono);
+  font-size: 0.82rem;
+}
+
+.support-card p,
+.split-list p {
+  margin: 0;
+  color: #c0cbdd;
+  font-size: 0.8rem;
+  line-height: 1.55;
+}
+
+.helper-line--status {
+  margin-top: var(--space-3);
+}
+
+.token-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+}
+
+.token-chip {
+  border: 1px solid rgba(138, 147, 163, 0.26);
+  border-radius: 999px;
+  padding: 6px 10px;
+  color: #d4deef;
+  background: rgba(10, 16, 25, 0.82);
+  font-family: var(--font-mono);
+  font-size: 0.74rem;
+}
+
+.token-chip--accent {
+  border-color: rgba(95, 255, 224, 0.34);
+  color: var(--accent);
+}
+
+.payload-preview {
+  margin: 0;
+  border: 1px solid rgba(73, 203, 181, 0.14);
+  border-radius: var(--radius-sm);
+  background: rgba(7, 12, 20, 0.58);
+  padding: var(--space-3);
+  color: #bfcae0;
+  font-size: 0.75rem;
+  line-height: 1.6;
+  overflow: auto;
+}
+
+.knowledge-panel--signal-split {
+  overflow: hidden;
+}
+
+.split-list {
+  display: grid;
+  gap: var(--space-3);
+}
+
+.split-list article {
+  border-top: 1px dashed rgba(95, 255, 224, 0.18);
+  padding-top: var(--space-3);
+  display: grid;
+  gap: 6px;
+}
+
+.split-list article:first-child {
+  border-top: none;
+  padding-top: 0;
+}
+
 .json-grid {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -1024,6 +1233,10 @@ nav {
   }
 
   .inline-form,
+  .knowledge-grid,
+  .knowledge-hero__head,
+  .knowledge-hero__metrics,
+  .support-grid,
   .field-grid,
   .json-grid,
   .kv-list div {

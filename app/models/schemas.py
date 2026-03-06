@@ -233,20 +233,64 @@ class IngestDocument(BaseModel):
     metadata: dict[str, Any] = Field(default_factory=dict, description="附加元信息")
 
 
-class IngestRequest(BaseModel):
-    """入库请求。"""
+class KnowledgeDocumentCreate(BaseModel):
+    """知识库文档创建请求。"""
+
+    title: str = Field(..., description="文档标题")
+    source: str = Field(..., description="文档来源")
+    doc_type: str = Field(default="research_report", description="文档类型")
+    symbols: list[str] = Field(default_factory=list, description="关联标的列表")
+    tags: list[str] = Field(default_factory=list, description="标签列表")
+    text: str = Field(..., description="文档正文")
+    kb_id: str = Field(default="default", description="知识库 ID")
+    language: str = Field(default="zh", description="文档语言")
+    published_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc), description="发布时间")
+    metadata: dict[str, Any] = Field(default_factory=dict, description="附加元信息")
+
+
+class KnowledgeDocumentRequest(BaseModel):
+    """知识库文档入库请求。"""
 
     user_id: str = Field(..., description="触发入库的用户")
     task_id: str | None = Field(default=None, description="可选任务 ID")
-    documents: list[IngestDocument] = Field(default_factory=list, description="待入库文档列表")
+    document: KnowledgeDocumentCreate = Field(..., description="待入库文档")
 
 
-class IngestResponse(BaseModel):
-    """入库响应。"""
+class KnowledgeDocumentRecord(BaseModel):
+    """知识库文档元数据。"""
+
+    doc_id: str = Field(..., description="文档 ID")
+    kb_id: str = Field(..., description="知识库 ID")
+    title: str = Field(..., description="文档标题")
+    source: str = Field(..., description="文档来源")
+    doc_type: str = Field(..., description="文档类型")
+    symbols: list[str] = Field(default_factory=list, description="关联标的")
+    tags: list[str] = Field(default_factory=list, description="标签")
+    language: str = Field(default="zh", description="语言")
+    file_name: str = Field(default="", description="原始文件名")
+    content_type: str = Field(default="text/plain", description="内容类型")
+    checksum: str = Field(default="", description="内容摘要")
+    status: str = Field(default="ready", description="处理状态")
+    chunk_count: int = Field(default=0, ge=0, description="chunk 数量")
+    uploaded_by: str = Field(..., description="上传用户")
+    published_at: datetime | None = Field(default=None, description="发布时间")
+    created_at: int = Field(..., ge=0, description="创建时间")
+    updated_at: int = Field(..., ge=0, description="更新时间")
+
+
+class KnowledgeDocumentResponse(BaseModel):
+    """知识库文档入库响应。"""
 
     success: bool = Field(..., description="是否成功")
-    inserted_chunks: int = Field(..., description="写入 chunk 数")
     task_id: str = Field(..., description="任务 ID")
+    inserted_chunks: int = Field(..., description="写入 chunk 数")
+    document: KnowledgeDocumentRecord = Field(..., description="文档元数据")
+
+
+class KnowledgeDocumentListResponse(BaseModel):
+    """知识库文档列表响应。"""
+
+    items: list[KnowledgeDocumentRecord] = Field(default_factory=list, description="文档列表")
 
 
 class RawSignal(BaseModel):
@@ -299,7 +343,7 @@ class ReportGenerationInput(BaseModel):
     task_id: str
     memory_profile: dict[str, Any] = Field(default_factory=dict)
     signals: list[NormalizedSignal] = Field(default_factory=list)
-    retrieved_docs: list[RetrievedChunk] = Field(default_factory=list)
+    knowledge_docs: list[RetrievedChunk] = Field(default_factory=list)
 
 
 class ReportGenerationOutput(BaseModel):
@@ -308,3 +352,23 @@ class ReportGenerationOutput(BaseModel):
     report: str
     citations: list[Citation] = Field(default_factory=list)
     draft: str = ""
+
+
+def ensure_citations(items: list[Any] | None) -> list[Citation]:
+    """将任意 citation 列表归一化为 `Citation` 模型列表。"""
+
+    return [Citation.model_validate(item) for item in (items or [])]
+
+
+def ensure_workflow_steps(items: list[Any] | None) -> list[WorkflowStep]:
+    """将任意 workflow step 列表归一化为 `WorkflowStep` 模型列表。"""
+
+    return [WorkflowStep.model_validate(item) for item in (items or [])]
+
+
+def ensure_conversation_report(item: Any | None) -> ConversationReport | None:
+    """将任意报告对象归一化为 `ConversationReport`。"""
+
+    if item is None:
+        return None
+    return ConversationReport.model_validate(item)

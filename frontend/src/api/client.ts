@@ -5,8 +5,9 @@ import type {
   PaginationOptions,
   ConversationReport,
   ConversationTurnSummary,
-  IngestRequest,
-  IngestResponse,
+  KnowledgeDocumentListResponse,
+  KnowledgeDocumentRequest,
+  KnowledgeDocumentResponse,
   QueryRequest,
   QueryResponse,
   UserPreferencesRequest,
@@ -31,11 +32,12 @@ class ApiError extends Error {
 }
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
+  const headers = new Headers(init?.headers ?? {});
+  if (!(init?.body instanceof FormData) && !headers.has("Content-Type")) {
+    headers.set("Content-Type", "application/json");
+  }
   const response = await fetch(`${API_BASE}${path}`, {
-    headers: {
-      "Content-Type": "application/json",
-      ...(init?.headers ?? {}),
-    },
+    headers,
     ...init,
   });
 
@@ -152,11 +154,31 @@ export async function getUserProfile(userId: string): Promise<UserProfileRespons
   return request<UserProfileResponse>(`/v1/user/profile/${encodeURIComponent(userId)}`);
 }
 
-export async function ingestDocuments(payload: IngestRequest): Promise<IngestResponse> {
-  return request<IngestResponse>("/v1/research/ingest", {
+export async function createKnowledgeDocument(
+  payload: KnowledgeDocumentRequest,
+): Promise<KnowledgeDocumentResponse> {
+  return request<KnowledgeDocumentResponse>("/v1/knowledge/documents", {
     method: "POST",
     body: JSON.stringify(payload),
   });
+}
+
+export async function uploadKnowledgeDocument(formData: FormData): Promise<KnowledgeDocumentResponse> {
+  return request<KnowledgeDocumentResponse>("/v1/knowledge/upload", {
+    method: "POST",
+    body: formData,
+  });
+}
+
+export async function listKnowledgeDocuments(): Promise<KnowledgeDocumentListResponse> {
+  return request<KnowledgeDocumentListResponse>("/v1/knowledge/documents");
+}
+
+export async function deleteKnowledgeDocument(docId: string): Promise<KnowledgeDocumentResponse["document"]> {
+  return request<KnowledgeDocumentResponse["document"]>(
+    `/v1/knowledge/documents/${encodeURIComponent(docId)}`,
+    { method: "DELETE" },
+  );
 }
 
 export { ApiError };

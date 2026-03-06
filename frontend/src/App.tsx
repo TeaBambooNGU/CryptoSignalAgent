@@ -1,7 +1,7 @@
 import { Route, Routes } from "react-router-dom";
 import { SideNav } from "./components/SideNav";
 import { DashboardPage } from "./pages/DashboardPage";
-import { IngestPage } from "./pages/IngestPage";
+import { KnowledgePage } from "./pages/KnowledgePage";
 import { MemoryPage } from "./pages/MemoryPage";
 import { SettingsPage } from "./pages/SettingsPage";
 
@@ -16,7 +16,7 @@ function App() {
         <Routes>
           <Route path="/" element={<DashboardPage />} />
           <Route path="/memory" element={<MemoryPage />} />
-          <Route path="/ingest" element={<IngestPage />} />
+          <Route path="/knowledge" element={<KnowledgePage />} />
           <Route path="/settings" element={<SettingsPage />} />
         </Routes>
       </main>

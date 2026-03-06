@@ -12,7 +12,15 @@ from langchain_core.messages import HumanMessage, SystemMessage
 
 from app.conversation.store import ConversationLockManager, SQLiteConversationTruthStore
 from app.graph.workflow import ResearchGraphRunner
-from app.models.schemas import ConversationAction, ConversationMessageResponse, QueryResponse
+from app.models.schemas import (
+    ConversationAction,
+    ConversationMessageResponse,
+    QueryResponse,
+    WorkflowStep,
+    ensure_citations,
+    ensure_conversation_report,
+    ensure_workflow_steps,
+)
 
 
 class ConversationService:
@@ -119,8 +127,8 @@ class ConversationService:
             return response.model_copy(
                 update={
                     "report": str(report_meta.get("report", response.report)),
-                    "citations": report_meta.get("citations", response.citations),
-                    "workflow_steps": report_meta.get("workflow_steps", response.workflow_steps),
+                    "citations": ensure_citations(report_meta.get("citations", response.citations)),
+                    "workflow_steps": ensure_workflow_steps(report_meta.get("workflow_steps", response.workflow_steps)),
                 }
             )
 
@@ -470,7 +478,7 @@ class ConversationService:
             "assistant_message": assistant_message,
             "trace_id": trace_id,
             "errors": [],
-            "workflow_steps": [{"node_id": "chat_reply", "status": "success", "duration_ms": max(elapsed_ms, 0)}],
+            "workflow_steps": [WorkflowStep(node_id="chat_reply", status="success", duration_ms=max(elapsed_ms, 0))],
             "report": None,
             "citations": [],
         }
@@ -486,6 +494,7 @@ class ConversationService:
             parent_turn_id=parent_turn_id,
             report_payload=None,
         )
+        response_payload["workflow_steps"] = ensure_workflow_steps(response_payload.get("workflow_steps", []))
         return ConversationMessageResponse.model_validate(response_payload)
 
     def _execute_rewrite_report(
@@ -536,7 +545,7 @@ class ConversationService:
         )
         rewritten_text = self._extract_text(getattr(rewritten, "content", rewritten))
         duration_ms = int((perf_counter() - start) * 1000)
-        workflow_steps = [{"node_id": "rewrite_report", "status": "success", "duration_ms": max(duration_ms, 0)}]
+        workflow_steps = [WorkflowStep(node_id="rewrite_report", status="success", duration_ms=max(duration_ms, 0))]
         report_payload = {
             "mode": "rewrite",
             "based_on_report_id": source_report["report_id"],
@@ -574,9 +583,10 @@ class ConversationService:
             request_id=prepared.request_id,
             response=response_payload,
         )
-        return ConversationMessageResponse.model_validate(
-            response_payload
-        )
+        response_payload["workflow_steps"] = ensure_workflow_steps(response_payload.get("workflow_steps", []))
+        response_payload["citations"] = ensure_citations(response_payload.get("citations", []))
+        response_payload["report"] = ensure_conversation_report(response_payload.get("report"))
+        return ConversationMessageResponse.model_validate(response_payload)
 
     async def _execute_regenerate_report(
         self,
@@ -638,9 +648,10 @@ class ConversationService:
             request_id=prepared.request_id,
             response=response_payload,
         )
-        return ConversationMessageResponse.model_validate(
-            response_payload
-        )
+        response_payload["workflow_steps"] = ensure_workflow_steps(response_payload.get("workflow_steps", []))
+        response_payload["citations"] = ensure_citations(response_payload.get("citations", []))
+        response_payload["report"] = ensure_conversation_report(response_payload.get("report"))
+        return ConversationMessageResponse.model_validate(response_payload)
 
     def _refresh_context_summary(self, *, conversation_id: str, recent_window: int = 8) -> None:
         """为长会话维护摘要。"""

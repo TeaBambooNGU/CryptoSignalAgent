@@ -1,8 +1,8 @@
 """研究语料入库与检索服务。
 
 职责：
-1. 将信号/文档切块并向量化写入 Milvus。
-2. 按查询执行召回与重排，输出可引用证据片段。
+1. 将实时信号与知识库文档切块并向量化写入 Milvus。
+2. 按查询执行知识证据召回与重排，输出可引用证据片段。
 """
 
 from __future__ import annotations
@@ -100,7 +100,7 @@ class ResearchService:
         for row, embedding in zip(rows, embeddings, strict=True):
             row["embedding"] = embedding
 
-        inserted = self.milvus_store.upsert_research_chunks(rows)
+        inserted = self.milvus_store.upsert_signal_chunks(rows)
         with log_context(component="retrieval.ingest"):
             logger.info("信号入库完成 signals=%s chunks=%s inserted=%s", len(signals), len(rows), inserted)
         return inserted
@@ -111,22 +111,25 @@ class ResearchService:
         rows: list[dict[str, Any]] = []
         texts: list[str] = []
         for doc in docs:
+            raw_symbols = doc.metadata.get("symbols") if isinstance(doc.metadata, dict) else None
+            symbols = self._normalize_document_symbols(doc.symbol, raw_symbols)
             for idx, chunk in enumerate(self._split_text(doc.text)):
-                chunk_id = f"{doc.doc_id}-{idx}"
-                rows.append(
-                    {
-                        "id": self._make_row_id(task_id, doc.doc_id, chunk_id),
-                        "doc_id": doc.doc_id,
-                        "chunk_id": chunk_id,
-                        "symbol": doc.symbol.upper(),
-                        "source": doc.source,
-                        "published_at": int(doc.published_at.timestamp()),
-                        "text": chunk,
-                        "metadata": doc.metadata,
-                        "task_id": task_id,
-                    }
-                )
-                texts.append(chunk)
+                for symbol in symbols:
+                    chunk_id = f"{doc.doc_id}-{symbol}-{idx}"
+                    rows.append(
+                        {
+                            "id": self._make_row_id(task_id, doc.doc_id, chunk_id),
+                            "doc_id": doc.doc_id,
+                            "chunk_id": chunk_id,
+                            "symbol": symbol,
+                            "source": doc.source,
+                            "published_at": int(doc.published_at.timestamp()),
+                            "text": chunk,
+                            "metadata": doc.metadata,
+                            "task_id": task_id,
+                        }
+                    )
+                    texts.append(chunk)
 
         if not rows:
             with log_context(component="retrieval.ingest"):
@@ -137,19 +140,19 @@ class ResearchService:
         for row, embedding in zip(rows, embeddings, strict=True):
             row["embedding"] = embedding
 
-        inserted = self.milvus_store.upsert_research_chunks(rows)
+        inserted = self.milvus_store.upsert_knowledge_chunks(rows)
         with log_context(component="retrieval.ingest"):
             logger.info("文档入库完成 docs=%s chunks=%s inserted=%s", len(docs), len(rows), inserted)
         return inserted
 
-    def retrieve(self, query: str, symbols: list[str], top_k: int = 8) -> list[RetrievedChunk]:
-        """执行召回与重排。"""
+    def retrieve_knowledge(self, query: str, symbols: list[str], top_k: int = 8) -> list[RetrievedChunk]:
+        """执行知识库证据召回与重排。"""
 
         with log_context(component="retrieval.search"):
             logger.info("检索开始 symbols=%s top_k=%s", symbols or ["ALL"], top_k)
 
         query_vector = text_to_embedding(query, self.settings)
-        rows = self.milvus_store.search_research_chunks(
+        rows = self.milvus_store.search_knowledge_chunks(
             query_vector=query_vector,
             symbols=symbols,
             top_k=max(top_k * 2, 10),
@@ -178,6 +181,11 @@ class ResearchService:
         with log_context(component="retrieval.search"):
             logger.info("检索完成 raw_hits=%s returned=%s", len(rows), len(result))
         return result
+
+    def retrieve(self, query: str, symbols: list[str], top_k: int = 8) -> list[RetrievedChunk]:
+        """兼容旧接口，默认执行知识库证据召回。"""
+
+        return self.retrieve_knowledge(query=query, symbols=symbols, top_k=top_k)
 
     def _signal_to_text(self, signal: NormalizedSignal) -> str:
         """将结构化信号转为文本，供切块与检索。"""
@@ -215,6 +223,19 @@ class ResearchService:
             chunks.append(text[start : start + chunk_size])
             start += chunk_size
         return chunks
+
+    @staticmethod
+    def _normalize_document_symbols(primary_symbol: str, raw_symbols: Any) -> list[str]:
+        symbols: list[str] = []
+        if isinstance(raw_symbols, list):
+            for item in raw_symbols:
+                normalized = str(item).strip().upper()
+                if normalized and normalized not in symbols:
+                    symbols.append(normalized)
+        fallback_symbol = str(primary_symbol).strip().upper()
+        if fallback_symbol and fallback_symbol not in symbols:
+            symbols.append(fallback_symbol)
+        return symbols or ["GENERAL"]
 
     def _make_row_id(self, task_id: str, doc_id: str, chunk_id: str) -> str:
         """构造幂等行 ID。"""

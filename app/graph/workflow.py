@@ -19,7 +19,7 @@ from app.agents.report_agent import ReportAgent
 from app.config.logging import get_logger, log_context
 from app.graph.mcp_subgraph import MCPSignalSubgraphRunner
 from app.memory.mem0_service import MemoryService
-from app.models.schemas import QueryResponse, ReportGenerationInput
+from app.models.schemas import QueryResponse, ReportGenerationInput, WorkflowStep, ensure_citations, ensure_workflow_steps
 from app.models.state import ResearchState
 from app.retrieval.research_service import ResearchService
 
@@ -68,7 +68,7 @@ class ResearchGraphRunner:
         builder.add_node("resolve_symbols", self.resolve_symbols)
         builder.add_node("collect_signals_via_mcp", self.collect_signals_via_mcp)
         builder.add_node("normalize_and_index", self.normalize_and_index)
-        builder.add_node("retrieve_context", self.retrieve_context)
+        builder.add_node("retrieve_knowledge_evidence", self.retrieve_knowledge_evidence)
         builder.add_node("analyze_signals", self.analyze_signals)
         builder.add_node("generate_report", self.generate_report)
         builder.add_node("persist_memory", self.persist_memory)
@@ -78,8 +78,8 @@ class ResearchGraphRunner:
         builder.add_edge("load_user_memory", "resolve_symbols")
         builder.add_edge("resolve_symbols", "collect_signals_via_mcp")
         builder.add_edge("collect_signals_via_mcp", "normalize_and_index")
-        builder.add_edge("normalize_and_index", "retrieve_context")
-        builder.add_edge("retrieve_context", "analyze_signals")
+        builder.add_edge("normalize_and_index", "retrieve_knowledge_evidence")
+        builder.add_edge("retrieve_knowledge_evidence", "analyze_signals")
         builder.add_edge("analyze_signals", "generate_report")
         builder.add_edge("generate_report", "persist_memory")
         builder.add_edge("persist_memory", "finalize_response")
@@ -139,14 +139,14 @@ class ResearchGraphRunner:
 
         return QueryResponse(
             report=output.get("final_report", "未能生成报告，请稍后重试。"),
-            citations=output.get("citations", []),
+            citations=ensure_citations(output.get("citations", [])),
             trace_id=final_trace_id,
             conversation_id=final_conversation_id,
             turn_id=final_turn_id,
             request_id=final_request_id,
             conversation_version=final_conversation_version,
             errors=output.get("errors", []),
-            workflow_steps=output.get("workflow_steps", []),
+            workflow_steps=ensure_workflow_steps(output.get("workflow_steps", [])),
         )
 
     def run(
@@ -311,11 +311,11 @@ class ResearchGraphRunner:
 
         return self._run_tracked_node(state, node_id="normalize_and_index", handler=_node_logic)
 
-    def retrieve_context(self, state: ResearchState) -> ResearchState:
-        """节点目标：检索历史证据与最新上下文。
+    def retrieve_knowledge_evidence(self, state: ResearchState) -> ResearchState:
+        """节点目标：检索知识库背景证据。
 
         前置条件：state 已包含 `query` 与 `hard_symbols`。
-        状态产出：`retrieved_docs`。
+        状态产出：`knowledge_docs`。
         """
 
         def _node_logic() -> ResearchState:
@@ -323,7 +323,7 @@ class ResearchGraphRunner:
             hard_symbols = state.get("hard_symbols")
             symbols = hard_symbols if isinstance(hard_symbols, list) else state.get("symbols", [])
 
-            with log_context(component="graph.retrieve_context"):
+            with log_context(component="graph.retrieve_knowledge_evidence"):
                 docs = self._retrieve_with_retry(query=query, symbols=symbols)
                 fallback_used = False
                 if not docs and symbols:
@@ -332,12 +332,12 @@ class ResearchGraphRunner:
                     fallback_used = True
                     if not docs:
                         logger.warning("节点完成 docs=0 fallback=%s", fallback_used)
-                        return {"retrieved_docs": [], "errors": [*state.get("errors", []), "检索命中不足"]}
+                        return {"knowledge_docs": [], "errors": [*state.get("errors", []), "知识库检索命中不足"]}
 
                 logger.info("节点完成 docs=%s fallback=%s", len(docs), fallback_used)
-                return {"retrieved_docs": docs}
+                return {"knowledge_docs": docs}
 
-        return self._run_tracked_node(state, node_id="retrieve_context", handler=_node_logic)
+        return self._run_tracked_node(state, node_id="retrieve_knowledge_evidence", handler=_node_logic)
 
     @retry(
         stop=stop_after_attempt(2),
@@ -348,18 +348,18 @@ class ResearchGraphRunner:
     def _retrieve_with_retry(self, query: str, symbols: list[str]):
         """检索重试包装。"""
 
-        return self.research_service.retrieve(query=query, symbols=symbols, top_k=8)
+        return self.research_service.retrieve_knowledge(query=query, symbols=symbols, top_k=8)
 
     def analyze_signals(self, state: ResearchState) -> ResearchState:
         """节点目标：评估信号强弱与冲突。
 
-        前置条件：state 已包含 `signals` 与 `retrieved_docs`。
+        前置条件：state 已包含 `signals` 与 `knowledge_docs`。
         状态产出：`analysis_summary`。
         """
 
         def _node_logic() -> ResearchState:
             signals = state.get("signals", [])
-            docs = state.get("retrieved_docs", [])
+            docs = state.get("knowledge_docs", [])
 
             with log_context(component="graph.analyze_signals"):
                 if not signals:
@@ -384,7 +384,7 @@ class ResearchGraphRunner:
     def generate_report(self, state: ResearchState) -> ResearchState:
         """节点目标：生成结构化研报。
 
-        前置条件：state 已包含 `memory_profile`、`signals`、`retrieved_docs`。
+        前置条件：state 已包含 `memory_profile`、`signals`、`knowledge_docs`。
         状态产出：`report_draft`、`final_report`、`citations`。
         """
 
@@ -395,7 +395,7 @@ class ResearchGraphRunner:
                 task_id=state["task_id"],
                 memory_profile=state.get("memory_profile", {}),
                 signals=state.get("signals", []),
-                retrieved_docs=state.get("retrieved_docs", []),
+                knowledge_docs=state.get("knowledge_docs", []),
             )
 
             with log_context(component="graph.generate_report"):
@@ -497,11 +497,11 @@ class ResearchGraphRunner:
         node_id: str,
         status: str,
         start: float,
-    ) -> list[dict[str, Any]]:
+    ) -> list[WorkflowStep]:
         """追加单个工作流节点执行记录。"""
 
         duration_ms = max(int((perf_counter() - start) * 1000), 0)
-        step = {"node_id": node_id, "status": status, "duration_ms": duration_ms}
+        step = WorkflowStep(node_id=node_id, status=status, duration_ms=duration_ms)
         return [*state.get("workflow_steps", []), step]
 
     def _extract_symbols_from_query(self, query: str) -> list[str]:

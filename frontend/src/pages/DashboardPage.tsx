@@ -25,7 +25,7 @@ const WORKFLOW_LABELS: Record<string, string> = {
   resolve_symbols: "解析标的",
   collect_signals_via_mcp: "采集信号",
   normalize_and_index: "标准化入库",
-  retrieve_context: "检索上下文",
+  retrieve_knowledge_evidence: "检索知识证据",
   analyze_signals: "分析信号",
   generate_report: "生成研报",
   persist_memory: "写回记忆",

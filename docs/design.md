@@ -43,7 +43,8 @@ G --> M0R["Mem0读取记忆"]
 G --> ING["MCP数据采集层"]
 ING --> STD["信号标准化"]
 STD --> IDX["LlamaIndex建索引/检索"]
-IDX --> MILR["Milvus: research_chunks"]
+IDX --> MILS["Milvus: signal_chunks"]
+IDX --> MILK["Milvus: knowledge_chunks"]
 M0R --> MILM["Milvus: user_memory"]
 G --> LLM["MiniMax M2.5"]
 LLM --> REP["研报生成"]
@@ -57,7 +58,7 @@ REP --> U
 - 编排层：LangGraph 管理节点流程、分支和失败重试。
 - 记忆层：Mem0 管理长期记忆与会话记忆。
 - 检索层：LlamaIndex 负责切分、向量化、召回、重排。
-- 存储层：Milvus 存研究语料与用户记忆。
+- 存储层：Milvus 存实时信号、知识证据与用户记忆。
 - 模型层：MiniMax M2.5 负责分析与生成。
 - 观测层：LangSmith 跟踪链路和节点行为。
 
@@ -154,7 +155,7 @@ REP --> U
 
 ## 9. 检索增强设计（LlamaIndex + Milvus）
 
-1. 文档入库：按来源进行清洗、切块、嵌入、写入 `research_chunks`。
+1. 文档入库：按来源进行清洗、切块、嵌入、写入 `knowledge_chunks`。
 2. 查询重写：结合用户偏好和任务上下文生成检索查询。
 3. 多路召回：关键词过滤 + 向量相似检索。
 4. 重排策略：时间衰减 + 来源可信度 + 语义相关度。
@@ -177,7 +178,7 @@ REP --> U
 - `task_context`
 - `memory_profile`
 - `signals`
-- `retrieved_docs`
+- `knowledge_docs`
 - `report_draft`
 - `final_report`
 - `citations`
@@ -189,7 +190,7 @@ REP --> U
 2. `resolve_symbols`：解析本次任务标的（硬路由）并生成 MCP 软提示标的集合。
 3. `collect_signals_via_mcp`：通过 MCP 拉取信号源数据。
 4. `normalize_and_index`：标准化并入库/建索引。
-5. `retrieve_context`：检索历史证据与最新上下文。
+5. `retrieve_knowledge_evidence`：检索知识库背景证据。
 6. `analyze_signals`：评估强弱、方向与冲突证据。
 7. `generate_report`：生成结构化研报。
 8. `persist_memory`：写回长期可复用记忆。
@@ -204,7 +205,17 @@ REP --> U
 
 ## 11. Milvus 数据模型
 
-## 11.1 Collection: `research_chunks`
+## 11.1 Collection: `signal_chunks`
+- `id` (primary key)
+- `doc_id`
+- `chunk_id`
+- `symbol`
+- `source`
+- `published_at`
+- `embedding` (vector)
+- `text`
+
+## 11.2 Collection: `knowledge_chunks`
 - `id` (primary key)
 - `doc_id`
 - `chunk_id`
@@ -281,9 +292,9 @@ REP --> U
 3. `GET /v1/user/profile/{user_id}`
    - 出参：聚合记忆画像
 
-4. `POST /v1/research/ingest`
-   - 入参：MCP 获取到的原始内容与来源信息
-   - 出参：入库结果
+4. `POST /v1/knowledge/documents`
+   - 入参：知识库文档正文与元信息
+   - 出参：知识库入库结果
 
 ---
 

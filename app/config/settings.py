@@ -59,7 +59,8 @@ class Settings:
     milvus_uri: str = "http://127.0.0.1:19530"
     milvus_token: str = ""
     milvus_db_name: str = "default"
-    milvus_research_collection: str = "research_chunks"
+    milvus_signal_collection: str = "signal_chunks"
+    milvus_knowledge_collection: str = "knowledge_chunks"
     milvus_memory_collection: str = "user_memory"
     vector_dim: int = 384
 
@@ -85,6 +86,8 @@ class Settings:
     mcp_servers: dict[str, dict[str, Any]] = field(default_factory=dict)
     mcp_max_rounds: int = 4
 
+    report_signal_detail_limit: int = 20
+    report_signal_value_max_chars: int = 1200
     report_disclaimer: str = "免责声明：本报告仅用于研究与信息交流，不构成任何投资建议。"
 
     @classmethod
@@ -214,9 +217,10 @@ class Settings:
             milvus_uri=os.getenv("MILVUS_URI", defaults.milvus_uri),
             milvus_token=os.getenv("MILVUS_TOKEN", ""),
             milvus_db_name=os.getenv("MILVUS_DB_NAME", defaults.milvus_db_name),
-            milvus_research_collection=os.getenv(
-                "MILVUS_RESEARCH_COLLECTION",
-                defaults.milvus_research_collection,
+            milvus_signal_collection=os.getenv("MILVUS_SIGNAL_COLLECTION", defaults.milvus_signal_collection),
+            milvus_knowledge_collection=os.getenv(
+                "MILVUS_KNOWLEDGE_COLLECTION",
+                defaults.milvus_knowledge_collection,
             ),
             milvus_memory_collection=os.getenv("MILVUS_MEMORY_COLLECTION", defaults.milvus_memory_collection),
             vector_dim=_as_int("VECTOR_DIM", defaults.vector_dim),
@@ -254,6 +258,14 @@ class Settings:
             ),
             mcp_servers=_as_mcp_servers(),
             mcp_max_rounds=_as_int("MCP_MAX_ROUNDS", defaults.mcp_max_rounds),
+            report_signal_detail_limit=_as_int(
+                "REPORT_SIGNAL_DETAIL_LIMIT",
+                defaults.report_signal_detail_limit,
+            ),
+            report_signal_value_max_chars=_as_int(
+                "REPORT_SIGNAL_VALUE_MAX_CHARS",
+                defaults.report_signal_value_max_chars,
+            ),
             report_disclaimer=os.getenv("REPORT_DISCLAIMER", defaults.report_disclaimer),
         )
 
