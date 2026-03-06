@@ -1,12 +1,13 @@
 # 工程架构梳理
 
-- 当前梳理时间: 2026-03-05 00:21:28
+- 当前梳理时间: 2026-03-06 21:33:32
 
 ## 项目概览
 - 项目定位: 面向加密市场研究场景的“对话优先”研报 Agent，支持“持续会话 -> 报告版本化 -> 可恢复回放”。
 - 主要能力:
   - 基于标准 MCP 协议采集多源市场信号（`streamable_http` / `stdio` / `sse`），由官方 `langchain-mcp-adapters` 驱动。
   - MCP 采集按 server 拆分为并行 Agent 执行：多 MCP 配置会并发拉取信号并在节点内合并。
+  - MCP Agent 对工具瞬时失败执行自动重试，并将运行期工具错误回传给模型，具备基础自修复能力。
   - 基于 LangGraph 编排主流程 9 节点，并输出节点级真实耗时 `workflow_steps`。
   - 会话统一入口支持 `auto/chat/rewrite_report/regenerate_report` 四种动作路由。
   - `from_turn_id` 提供真实分支语义：新 turn 通过 `parent_turn_id` 挂接到指定历史节点，并按该链路构建上下文。
@@ -114,7 +115,7 @@
   1. API 路由接收消息并注入/透传 `trace_id`。
   2. `ConversationService.send_message` 执行 `prepare_turn`（CAS + 幂等 + version 分配）。
   3. 若提供 `from_turn_id`，将其作为分支锚点（父节点）；未提供时默认挂接当前最新 turn。
-  4. `action=auto` 时根据历史报告存在性与关键词路由到 `chat/rewrite/regenerate`。
+  4. `action=auto` 时优先调用 DeepSeek 小模型做 `chat/rewrite/regenerate` 动作分类；若模型不可用或分类失败，则回退到规则判断。
   5. `chat`：基于“分支摘要 + 分支最近 turns + 分支最新报告”构造 prompt，调用 LLM 生成对话回复。
   6. `rewrite_report`：优先读取目标报告；未指定时读取分支链路可见的最新报告并改写。
   7. `regenerate_report`：调用 `ResearchGraphRunner.arun` 执行完整 9 节点流程并产出新报告版本（透传分支锚点到记忆加载）。
@@ -126,6 +127,7 @@
 - 控制/调度流程:
   - 主调度引擎为 LangGraph `StateGraph`（线性 9 节点）。
   - MCP 采集由 `MCPSignalSubgraphRunner.arun` 一次执行完成；内部使用 `asyncio.gather` 并行调度各 server Agent。
+  - 每个 server Agent 在 `create_agent` 上挂载工具调用中间层：瞬时失败自动重试，运行期工具错误以结构化 `ToolMessage` 回传给模型做参数修正或换工具。
   - `MCP_MAX_ROUNDS` 作为 Agent 的工具调用预算提示注入 prompt；工具是否调用由 LLM 按 query/symbols 自主决策。
   - 检索/报告生成通过 tenacity 重试；节点执行由 `_run_tracked_node` 统一记录耗时。
 
@@ -209,7 +211,9 @@ sequenceDiagram
   - 同一 `request_id` 处理中返回 `409 request_in_flight`；完成后重试会命中幂等缓存。
   - `rewrite_report` 在无可用报告版本时返回 404；`from_turn_id` 不存在时 resume/message 返回 404。
   - MCP 未配置或无工具可用时返回 `no_tools`，主流程走历史检索降级生成报告。
-  - Agent 执行异常返回 `agent_failed`；若最终 JSON 解析失败但有 ToolMessage 提取结果，仍会继续使用可提取信号。
+  - MCP 工具瞬时失败会先自动重试；若仍失败，则将错误摘要作为 `ToolMessage` 回传给模型，由模型尝试修正参数或改用其他工具。
+  - 非可重试错误（如权限、资源不存在、明显参数错误）不会无意义重试；失败摘要会进入 `errors`，并保留其他 server 的部分成功结果。
+  - Agent 执行异常返回 `agent_failed`；若最终 JSON 解析失败但有 `ToolMessage` 可提取结果，仍会继续使用可提取信号。
   - Milvus 不可用时可降级内存存储（受 `MILVUS_ALLOW_FALLBACK` 控制）。
   - 未配置 LLM 密钥或 LLM 调用失败时，请求返回 500（硬失败）；未配置智谱密钥时降级哈希向量。
   - 未配置 `DEEPSEEK_API_KEY` 或抽取模型调用失败时，仅跳过偏好自动抽取，不影响主链路出报。
@@ -217,6 +221,7 @@ sequenceDiagram
 - 观测与日志:
   - 日志由 `app/config/logging.py` 统一初始化，注入 `trace_id/task_id/user_id/component/round`。
   - API 层通过 `X-Trace-Id` 实现请求链路关联。
+  - MCP 工具失败会记录 `tool/error_type/detail` 摘要，便于区分瞬时错误、参数错误与永久错误。
   - 会话层会记录 `turn.accepted/turn.completed/turn.failed` 事件，可用于恢复与排障。
   - outbox 投影器记录失败重试次数并在超阈值后标记 `failed`。
   - 文件日志支持“按天轮转 + 单文件超限切分 + 超期清理”。
@@ -289,7 +294,17 @@ sequenceDiagram
   - 更新 MCP Agent 执行链路示例：`create_agent` 入参由 `self.llm_client.llm` 修正为当前实现 `self.llm`。
 - 变更动机/需求来源:
   - 来源于当前会话需求：用户要求“同步改掉”旧 LLM 抽象表述。
-- 当前更新时间: 2026-03-03 12:33:12
+- 当前更新时间: 2026-03-06 21:33:32
+
+
+### 2026-03-06 21:33:32
+- 本次新增/更新要点:
+  - 更新 README 与架构文档中的 MCP 自修复表述：统一为“基础自修复能力”，避免将能力描述成完整闭环自愈。
+  - 补充 MCP Agent 工具失败处理机制：瞬时失败自动重试，运行期工具错误以结构化 `ToolMessage` 回传给模型做参数修正或换工具。
+  - 更新异常与观测描述：补充非可重试错误不会重复死磕，并记录 `tool/error_type/detail` 便于排障。
+- 变更动机/需求来源:
+  - 来源于当前会话需求：用户要求同步最新 MCP 工具失败重试与错误回传逻辑到文档。
+- 当前更新时间: 2026-03-06 21:33:32
 
 
 ### 2026-03-03 12:19:47

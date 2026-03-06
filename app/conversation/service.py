@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import json
 from time import perf_counter
 from typing import Any
 from uuid import uuid4
 
+from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import HumanMessage, SystemMessage
 
 from app.conversation.store import ConversationLockManager, SQLiteConversationTruthStore
@@ -22,10 +24,12 @@ class ConversationService:
         graph_runner: ResearchGraphRunner,
         truth_store: SQLiteConversationTruthStore,
         lock_manager: ConversationLockManager | None = None,
+        action_classifier_llm: BaseChatModel | Any | None = None,
     ) -> None:
         self.graph_runner = graph_runner
         self.truth_store = truth_store
         self.lock_manager = lock_manager or ConversationLockManager()
+        self.action_classifier_llm = action_classifier_llm
 
     async def run_research_turn(
         self,
@@ -166,6 +170,7 @@ class ConversationService:
                 action=action,
                 message=message,
                 conversation_id=prepared.conversation_id,
+                anchor_turn_id=resolved_context_anchor_turn_id,
             )
             try:
                 if resolved_action == ConversationAction.CHAT:
@@ -294,10 +299,74 @@ class ConversationService:
         action: ConversationAction,
         message: str,
         conversation_id: str,
+        anchor_turn_id: str | None,
     ) -> ConversationAction:
         if action != ConversationAction.AUTO:
             return action
 
+        llm_action = self._resolve_action_with_llm(
+            message=message,
+            conversation_id=conversation_id,
+            anchor_turn_id=anchor_turn_id,
+        )
+        if llm_action is not None:
+            return llm_action
+
+        return self._resolve_action_with_rules(message=message)
+
+    def _resolve_action_with_llm(
+        self,
+        *,
+        message: str,
+        conversation_id: str,
+        anchor_turn_id: str | None,
+    ) -> ConversationAction | None:
+        if self.action_classifier_llm is None:
+            return None
+        try:
+            visible_report = (
+                self.truth_store.get_latest_report_on_lineage(
+                    conversation_id=conversation_id,
+                    leaf_turn_id=anchor_turn_id,
+                )
+                if anchor_turn_id
+                else self.truth_store.get_latest_report(conversation_id=conversation_id)
+            )
+            latest_turn = self.truth_store.get_latest_turn(conversation_id=conversation_id)
+            latest_version = int(latest_turn.get("version", 0) or 0) if latest_turn else 0
+
+            response = self.action_classifier_llm.invoke(
+                [
+                    SystemMessage(
+                        content=(
+                            "你是会话动作分类器。"
+                            "请在 chat、rewrite_report、regenerate_report 中严格选择一个动作。"
+                            "chat: 用户是在追问、讨论、解释、澄清，不要求生成新报告。"
+                            "rewrite_report: 用户要基于现有报告改写、润色、改口吻、改结构、改风险偏好。"
+                            "regenerate_report: 用户要重新分析、重跑、按最新信息生成新报告，或明确要求出一版报告。"
+                            "若当前没有可见报告，不要返回 rewrite_report，应在 chat 和 regenerate_report 中选择更合适者。"
+                            "输出必须是单行 JSON，例如 {\"action\":\"chat\"}。"
+                        )
+                    ),
+                    HumanMessage(
+                        content=(
+                            f"会话ID: {conversation_id}\n"
+                            f"当前最新轮次版本: {latest_version}\n"
+                            f"当前是否存在可见报告: {'yes' if visible_report else 'no'}\n"
+                            f"用户消息:\n{message}\n\n"
+                            "请只返回 JSON。"
+                        )
+                    ),
+                ]
+            )
+            return self._parse_action_classifier_response(
+                self._extract_text(getattr(response, "content", response)),
+                has_visible_report=visible_report is not None,
+            )
+        except Exception:
+            return None
+
+    def _resolve_action_with_rules(self, *, message: str) -> ConversationAction:
         lowered = message.lower()
         generate_keywords = (
             "生成研报",
@@ -323,6 +392,35 @@ class ConversationService:
         if any(keyword in lowered for keyword in rewrite_keywords):
             return ConversationAction.REWRITE_REPORT
         return ConversationAction.CHAT
+
+    @staticmethod
+    def _parse_action_classifier_response(content: str, *, has_visible_report: bool) -> ConversationAction | None:
+        normalized = content.strip()
+        if not normalized:
+            return None
+
+        parsed_action: str | None = None
+        if normalized in {item.value for item in ConversationAction if item != ConversationAction.AUTO}:
+            parsed_action = normalized
+        else:
+            start = normalized.find("{")
+            end = normalized.rfind("}")
+            if start != -1 and end != -1 and start < end:
+                normalized = normalized[start : end + 1]
+            try:
+                payload = json.loads(normalized)
+            except json.JSONDecodeError:
+                payload = None
+            if isinstance(payload, dict):
+                raw_action = payload.get("action")
+                if isinstance(raw_action, str):
+                    parsed_action = raw_action.strip().lower()
+
+        if parsed_action not in {item.value for item in ConversationAction if item != ConversationAction.AUTO}:
+            return None
+        if parsed_action == ConversationAction.REWRITE_REPORT.value and not has_visible_report:
+            return ConversationAction.REGENERATE_REPORT
+        return ConversationAction(parsed_action)
 
     def _execute_chat(
         self,

@@ -6,7 +6,7 @@ import unittest
 
 from langchain_openai import ChatOpenAI
 
-from app.agents.llm import create_llm_client
+from app.agents.llm import create_deepseek_client, create_llm_client
 from app.config.settings import Settings
 
 
@@ -43,6 +43,27 @@ class LLMFactoryTestCase(unittest.TestCase):
         )
         with self.assertRaises(ValueError):
             create_llm_client(settings)
+
+    def test_create_deepseek_client_success(self) -> None:
+        settings = Settings(
+            deepseek_api_key="test-deepseek-key",
+            deepseek_base_url="https://api.deepseek.com/v1",
+        )
+        client = create_deepseek_client(
+            settings,
+            model_name="deepseek-chat",
+            timeout_seconds=15,
+        )
+        self.assertIsInstance(client, ChatOpenAI)
+
+    def test_create_deepseek_client_requires_api_key(self) -> None:
+        settings = Settings(deepseek_api_key="")
+        with self.assertRaises(ValueError):
+            create_deepseek_client(
+                settings,
+                model_name="deepseek-chat",
+                timeout_seconds=15,
+            )
 
     def test_unknown_provider_raises(self) -> None:
         settings = Settings(llm_provider="unknown-provider")

@@ -71,6 +71,8 @@ class Settings:
     mem0_project_id: str = ""
     memory_extractor_model: str = "deepseek-chat"
     memory_extractor_timeout_seconds: int = 20
+    conversation_action_model: str = "deepseek-chat"
+    conversation_action_timeout_seconds: int = 15
     deepseek_api_key: str = ""
     deepseek_base_url: str = "https://api.deepseek.com/v1"
 
@@ -228,6 +230,14 @@ class Settings:
             memory_extractor_timeout_seconds=_as_int(
                 "MEMORY_EXTRACTOR_TIMEOUT_SECONDS",
                 defaults.memory_extractor_timeout_seconds,
+            ),
+            conversation_action_model=os.getenv(
+                "CONVERSATION_ACTION_MODEL",
+                defaults.conversation_action_model,
+            ),
+            conversation_action_timeout_seconds=_as_int(
+                "CONVERSATION_ACTION_TIMEOUT_SECONDS",
+                defaults.conversation_action_timeout_seconds,
             ),
             deepseek_api_key=os.getenv("DEEPSEEK_API_KEY", ""),
             deepseek_base_url=os.getenv("DEEPSEEK_BASE_URL", defaults.deepseek_base_url),

@@ -16,6 +16,7 @@ from datetime import datetime, timezone
 from typing import Any, Callable, TypedDict
 
 from langchain.agents import create_agent
+from langchain.agents.middleware import ToolRetryMiddleware, wrap_tool_call
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import AIMessage, ToolMessage
 
@@ -25,6 +26,35 @@ logger = get_logger(__name__)
 
 URL_PATTERN = re.compile(r"https?://\\S+")
 VALID_SIGNAL_TYPES = {"price", "news", "sentiment", "onchain"}
+RETRYABLE_STATUS_CODES = {408, 425, 429, 500, 502, 503, 504}
+NON_RETRYABLE_STATUS_CODES = {400, 401, 403, 404, 405, 422}
+RETRYABLE_ERROR_KEYWORDS = (
+    "timeout",
+    "timed out",
+    "temporarily unavailable",
+    "connection reset",
+    "connection refused",
+    "connection aborted",
+    "server disconnected",
+    "service unavailable",
+    "gateway timeout",
+    "bad gateway",
+    "too many requests",
+    "rate limit",
+    "econnreset",
+    "unreachable",
+)
+INPUT_ERROR_KEYWORDS = (
+    "missing required",
+    "missing field",
+    "invalid argument",
+    "invalid parameter",
+    "invalid input",
+    "unexpected argument",
+    "unexpected keyword",
+    "validation",
+    "schema",
+)
 
 
 class MCPSubgraphState(TypedDict, total=False):
@@ -243,14 +273,57 @@ class MCPSignalSubgraphRunner:
             model=self.llm,
             tools=tools,
             system_prompt=system_prompt,
+            middleware=self._build_agent_middleware(),
             name=agent_name,
         )
+
+    def _build_agent_middleware(self) -> list[Any]:
+        retry_middleware = ToolRetryMiddleware(
+            max_retries=2,
+            retry_on=self._is_retryable_tool_error,
+            on_failure="error",
+            initial_delay=0.5,
+            max_delay=3.0,
+            jitter=True,
+        )
+
+        @wrap_tool_call(name="MCPToolErrorMiddleware")
+        async def handle_tool_errors(request, handler):
+            try:
+                return await handler(request)
+            except Exception as exc:
+                tool_call = getattr(request, "tool_call", {}) or {}
+                tool_name = self._resolve_tool_name(request)
+                error_type = self._classify_tool_error(exc)
+                error_detail = self._build_exception_error_detail(exc)
+                content = self._format_tool_error_message(
+                    tool_name=tool_name,
+                    tool_call=tool_call,
+                    tool=getattr(request, "tool", None),
+                    exc=exc,
+                    error_type=error_type,
+                )
+                logger.warning(
+                    "MCP 工具调用失败 tool=%s error_type=%s detail=%s",
+                    tool_name,
+                    error_type,
+                    self._safe_json(error_detail),
+                )
+                return ToolMessage(
+                    content=content,
+                    name=str(tool_call.get("name") or tool_name),
+                    tool_call_id=str(tool_call.get("id") or f"call-{tool_name}"),
+                    status="error",
+                )
+
+        return [handle_tool_errors, retry_middleware]
 
     def _build_agent_system_prompt(self) -> str:
         return (
             "你是加密市场信号采集 Agent。"
             "你可以自行选择和调用 MCP 工具。"
             "请根据 query 与 symbols 选择最相关的工具调用。"
+            "当工具返回错误时，优先根据错误摘要修正参数，或改用同一 server 下更合适的工具。"
             "优先返回结构化数据，并尽量覆盖用户关注 symbols。"
             "最后一条回复必须是 JSON 对象，不要使用 markdown 代码块。"
             "JSON 格式为 {\"raw_signals\": [...], \"errors\": [...]}。"
@@ -281,6 +354,7 @@ class MCPSignalSubgraphRunner:
             f"tool_call_budget_hint={self.max_rounds}\n\n"
             "target_symbols 是硬目标，hint_symbols 仅作参考提示。"
             "请根据 query 与 symbols 自主选择合适工具，再输出最终 JSON。"
+            "如果工具返回错误 ToolMessage，先依据其中错误摘要修正参数后重试一次，或改用其他合适工具。"
             "如果某个工具失败，把错误摘要写入 errors。"
             "不要输出解释性文本，只输出最终 JSON。\n\n"
             f"可用工具目录：{self._safe_json(tool_catalog)}"
@@ -365,6 +439,86 @@ class MCPSignalSubgraphRunner:
         if isinstance(input_schema, dict):
             return input_schema
         return {"type": "object", "properties": {}, "required": []}
+
+    def _resolve_tool_name(self, request: Any) -> str:
+        tool_call = getattr(request, "tool_call", {}) or {}
+        tool_name = tool_call.get("name")
+        if isinstance(tool_name, str) and tool_name.strip():
+            return tool_name.strip()
+        tool = getattr(request, "tool", None)
+        runtime_name = getattr(tool, "name", None)
+        if isinstance(runtime_name, str) and runtime_name.strip():
+            return runtime_name.strip()
+        return "unknown_tool"
+
+    def _classify_tool_error(self, exc: BaseException) -> str:
+        status_code = self._coerce_status_code(getattr(exc, "status_code", None))
+        text = f"{type(exc).__name__} {exc}".lower()
+
+        if status_code == 429 or "rate limit" in text or "too many requests" in text:
+            return "rate_limit"
+        if status_code in {408, 425, 504} or isinstance(exc, TimeoutError) or "timeout" in text or "timed out" in text:
+            return "timeout"
+        if status_code in {500, 502, 503} or any(keyword in text for keyword in RETRYABLE_ERROR_KEYWORDS):
+            return "service_unavailable"
+        if status_code in {400, 422} or any(keyword in text for keyword in INPUT_ERROR_KEYWORDS):
+            return "invalid_input"
+        if status_code in {401, 403} or any(keyword in text for keyword in ("unauthorized", "forbidden", "permission denied")):
+            return "permission_denied"
+        if status_code == 404 or "not found" in text:
+            return "not_found"
+        return "tool_error"
+
+    def _is_retryable_tool_error(self, exc: BaseException) -> bool:
+        status_code = self._coerce_status_code(getattr(exc, "status_code", None))
+        if status_code in RETRYABLE_STATUS_CODES:
+            return True
+        if status_code in NON_RETRYABLE_STATUS_CODES:
+            return False
+
+        text = f"{type(exc).__name__} {exc}".lower()
+        if isinstance(exc, (TimeoutError, ConnectionError, asyncio.TimeoutError)):
+            return True
+        if any(keyword in text for keyword in RETRYABLE_ERROR_KEYWORDS):
+            return True
+        if any(keyword in text for keyword in INPUT_ERROR_KEYWORDS):
+            return False
+        if any(keyword in text for keyword in ("unauthorized", "forbidden", "permission denied", "not found")):
+            return False
+        return False
+
+    def _build_tool_error_hint(self, error_type: str) -> str:
+        if error_type == "invalid_input":
+            return "请依据 schema 修正参数后再试；如果当前工具不适合，可改用同 server 下其他工具。"
+        if error_type in {"timeout", "rate_limit", "service_unavailable"}:
+            return "这更像瞬时服务异常；若自动重试后仍失败，请改用其他工具或减少参数范围。"
+        if error_type in {"permission_denied", "not_found"}:
+            return "这更像永久错误；请不要原样重试，优先换工具或调整目标。"
+        return "请结合错误摘要判断是修正参数还是切换工具。"
+
+    def _format_tool_error_message(
+        self,
+        *,
+        tool_name: str,
+        tool_call: dict[str, Any],
+        tool: Any,
+        exc: BaseException,
+        error_type: str,
+    ) -> str:
+        payload: dict[str, Any] = {
+            "tool": tool_name,
+            "error_type": error_type,
+            "retryable": self._is_retryable_tool_error(exc),
+            "message": str(exc),
+            "input_args": tool_call.get("args", {}),
+            "hint": self._build_tool_error_hint(error_type),
+        }
+        if error_type == "invalid_input":
+            payload["schema"] = self._extract_tool_schema(tool)
+        status_code = self._coerce_status_code(getattr(exc, "status_code", None))
+        if status_code is not None:
+            payload["status_code"] = status_code
+        return self._safe_json(payload)
 
     def _parse_agent_payload(self, messages: list[Any]) -> tuple[dict[str, Any], str | None]:
         final_text = ""
