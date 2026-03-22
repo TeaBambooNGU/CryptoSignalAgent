@@ -42,6 +42,20 @@ class ConversationAPITestCase(unittest.TestCase):
             del messages
             raise RuntimeError("classifier unavailable")
 
+    class _HardLimitContextManager:
+        class _Settings:
+            context_compression_hard_limit_tokens = 200000
+
+        settings = _Settings()
+
+        def ensure_context_budget(self, **kwargs):
+            del kwargs
+            return {
+                "did_compress": True,
+                "token_estimate": 210001,
+                "hard_limit_exceeded": True,
+            }
+
     @classmethod
     def setUpClass(cls) -> None:
         cls._tmpdir = tempfile.TemporaryDirectory()
@@ -296,8 +310,29 @@ class ConversationAPITestCase(unittest.TestCase):
         payload = response.json()
         self.assertEqual(payload["action_taken"], "regenerate_report")
 
-    def test_context_summary_is_generated_for_long_conversation(self) -> None:
-        conversation_id = "conv-summary-1"
+    def test_context_hard_limit_only_logs_warning(self) -> None:
+        runtime = self._app.state.runtime
+        original_context_manager = runtime.conversation_service.context_manager
+        runtime.conversation_service.context_manager = self._HardLimitContextManager()
+        try:
+            with self.assertLogs("app.conversation.service", level="WARNING") as captured:
+                response = self.client.post(
+                    "/v1/research/query",
+                    json={
+                        "user_id": "u-hard-limit",
+                        "query": "生成一版超长上下文测试报告",
+                        "conversation_id": "conv-hard-limit",
+                        "request_id": "req-hard-limit",
+                    },
+                )
+        finally:
+            runtime.conversation_service.context_manager = original_context_manager
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("context.hard_limit.exceeded", "\n".join(captured.output))
+
+    def test_context_state_tracks_prompt_token_estimate(self) -> None:
+        conversation_id = "conv-context-state-1"
         for idx in range(1, 11):
             resp = self.client.post(
                 f"/v1/conversation/{conversation_id}/message",
@@ -310,11 +345,11 @@ class ConversationAPITestCase(unittest.TestCase):
                 },
             )
             self.assertEqual(resp.status_code, 200)
-        summary = self._app.state.runtime.conversation_store.get_context_summary(conversation_id=conversation_id)
-        self.assertIsNotNone(summary)
-        assert summary is not None
-        self.assertGreaterEqual(summary["through_version"], 1)
-        self.assertTrue(summary["summary_text"])
+        state = self._app.state.runtime.conversation_store.get_context_state(conversation_id=conversation_id)
+        self.assertIsNotNone(state)
+        assert state is not None
+        self.assertGreater(state["latest_prompt_token_estimate"], 0)
+        self.assertEqual(state["compression_round_count"], 0)
 
     def test_resume_conversation_api(self) -> None:
         conversation_id = "conv-resume-api"

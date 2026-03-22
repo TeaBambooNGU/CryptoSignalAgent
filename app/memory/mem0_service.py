@@ -41,12 +41,14 @@ class MemoryService:
         session_store: SessionMemoryStore,
         outbox_store: Any | None = None,
         conversation_store: Any | None = None,
+        context_manager: Any | None = None,
     ) -> None:
         self.settings = settings
         self.milvus_store = milvus_store
         self.session_store = session_store
         self.outbox_store = outbox_store
         self.conversation_store = conversation_store
+        self.context_manager = context_manager
         self._mem0_client: Any | None = self._init_mem0_client()
         self._preference_extractor_client: Any | None = self._init_preference_extractor_client()
 
@@ -450,37 +452,12 @@ class MemoryService:
         if not conversation_id or self.conversation_store is None:
             return None
         try:
-            if context_anchor_turn_id:
-                lineage_turns = self.conversation_store.list_turn_lineage(
-                    conversation_id=conversation_id,
-                    leaf_turn_id=context_anchor_turn_id,
-                    limit=24,
-                )
-                if len(lineage_turns) <= 8:
-                    return None
-                older_turns = lineage_turns[8:]
-                if not older_turns:
-                    return None
-                lines: list[str] = []
-                for turn in reversed(older_turns[:16]):
-                    query = str(turn.get("query", "")).strip().replace("\n", " ")
-                    answer = str(turn.get("assistant_message", "")).strip().replace("\n", " ")
-                    if len(answer) > 120:
-                        answer = answer[:120] + "..."
-                    lines.append(f"- v{turn.get('version')}[{turn.get('intent', '')}] Q:{query} A:{answer}")
-                return {
-                    "through_version": int(older_turns[0].get("version", 0) or 0),
-                    "summary_text": "\n".join(lines),
-                    "updated_at": int(lineage_turns[0].get("updated_at", 0) or 0),
-                }
-            row = self.conversation_store.get_context_summary(conversation_id=conversation_id)
-            if not row:
+            if self.context_manager is None:
                 return None
-            return {
-                "through_version": int(row.get("through_version", 0) or 0),
-                "summary_text": str(row.get("summary_text", "")),
-                "updated_at": int(row.get("updated_at", 0) or 0),
-            }
+            return self.context_manager.build_summary_snapshot(
+                conversation_id=conversation_id,
+                anchor_turn_id=context_anchor_turn_id,
+            )
         except Exception:
             logger.exception("读取会话摘要失败，已降级为空")
             return None

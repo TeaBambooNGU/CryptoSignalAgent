@@ -78,6 +78,13 @@ class Settings:
     deepseek_base_url: str = "https://api.deepseek.com/v1"
 
     conversation_store_path: str = "data/conversation_state.db"
+    context_archive_dir: str = "data/context_archives"
+    context_compression_trigger_tokens: int = 100000
+    context_compression_hard_limit_tokens: int = 200000
+    context_recent_turn_window: int = 8
+    context_compression_model: str = "deepseek-chat"
+    context_compression_timeout_seconds: int = 20
+    context_full_summary_every_n_compressions: int = 5
     session_store_backend: str = "memory"
     redis_url: str = ""
     session_memory_ttl_seconds: int = 86400
@@ -246,6 +253,31 @@ class Settings:
             deepseek_api_key=os.getenv("DEEPSEEK_API_KEY", ""),
             deepseek_base_url=os.getenv("DEEPSEEK_BASE_URL", defaults.deepseek_base_url),
             conversation_store_path=os.getenv("CONVERSATION_STORE_PATH", defaults.conversation_store_path),
+            context_archive_dir=os.getenv("CONTEXT_ARCHIVE_DIR", defaults.context_archive_dir),
+            context_compression_trigger_tokens=_as_int(
+                "CONTEXT_COMPRESSION_TRIGGER_TOKENS",
+                defaults.context_compression_trigger_tokens,
+            ),
+            context_compression_hard_limit_tokens=_as_int(
+                "CONTEXT_COMPRESSION_HARD_LIMIT_TOKENS",
+                defaults.context_compression_hard_limit_tokens,
+            ),
+            context_recent_turn_window=_as_int(
+                "CONTEXT_RECENT_TURN_WINDOW",
+                defaults.context_recent_turn_window,
+            ),
+            context_compression_model=os.getenv(
+                "CONTEXT_COMPRESSION_MODEL",
+                defaults.context_compression_model,
+            ),
+            context_compression_timeout_seconds=_as_int(
+                "CONTEXT_COMPRESSION_TIMEOUT_SECONDS",
+                defaults.context_compression_timeout_seconds,
+            ),
+            context_full_summary_every_n_compressions=_as_int(
+                "CONTEXT_FULL_SUMMARY_EVERY_N_COMPRESSIONS",
+                defaults.context_full_summary_every_n_compressions,
+            ),
             session_store_backend=os.getenv("SESSION_STORE_BACKEND", defaults.session_store_backend),
             redis_url=os.getenv("REDIS_URL", defaults.redis_url),
             session_memory_ttl_seconds=_as_int(

@@ -79,7 +79,7 @@ class ConversationRecoveryTestCase(unittest.TestCase):
         assert detail is not None
         self.assertEqual(detail["query"], "query-3")
         self.assertEqual(detail["report"], "report-3")
-        self.assertEqual(detail["workflow_steps"][0]["node_id"], "finalize_response")
+        self.assertEqual(detail["workflow_steps"][0].node_id, "finalize_response")
 
     def test_request_id_retry_returns_cached_result(self) -> None:
         conversation_id = "conv-idem"
