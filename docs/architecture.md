@@ -1,6 +1,6 @@
 # 工程架构梳理
 
-- 当前梳理时间: 2026-03-06 21:33:32
+- 当前梳理时间: 2026-03-22 13:31:17
 
 ## 项目概览
 - 项目定位: 面向加密市场研究场景的“对话优先”研报 Agent，支持“持续会话 -> 报告版本化 -> 可恢复回放”。
@@ -11,7 +11,7 @@
   - 基于 LangGraph 编排主流程 9 节点，并输出节点级真实耗时 `workflow_steps`。
   - 会话统一入口支持 `auto/chat/rewrite_report/regenerate_report` 四种动作路由。
   - `from_turn_id` 提供真实分支语义：新 turn 通过 `parent_turn_id` 挂接到指定历史节点，并按该链路构建上下文。
-  - 报告版本资产化（`conversation_report`）+ 会话轮次真相库（`conversation_turn`）+ 长会话摘要压缩（`conversation_context_summary`）。
+  - 报告版本资产化（`conversation_report`）+ 会话轮次真相库（`conversation_turn`）+ 长会话上下文物化压缩（`conversation_context_state / compression / full_summary`）。
   - 会话一致性采用“同会话单写者锁 + CAS version + request_id 幂等”保障并发安全与重试稳定。
   - 长期偏好由 DeepSeek 小模型自动抽取，写入前统一归一化并按规则合并为“单条画像”（watchlist 并集、risk/reading 覆盖）。
   - Milvus/Mem0 写入通过 outbox 异步投影，保证会话真相库强一致、外部记忆最终一致。
@@ -59,8 +59,10 @@
   - `app/main.py`: 应用创建、生命周期管理、请求级 trace middleware。
   - `app/runtime.py`: 统一装配运行时依赖，并启动 `OutboxProjector`。
   - `app/api/routes.py`: 暴露研究、会话消息、turn/report 查询、resume、记忆与入库接口。
-  - `app/conversation/service.py`: 会话动作路由（auto/chat/rewrite/regenerate）、上下文拼装、摘要刷新。
-  - `app/conversation/store.py`: snapshot/turn/report/summary/idempotency/event/outbox 的事务化读写。
+  - `app/conversation/service.py`: 会话动作路由（auto/chat/rewrite/regenerate）、上下文拼装、预算检查与超限观测日志。
+  - `app/conversation/store.py`: snapshot/turn/report/context-state/context-compression/context-full-summary/idempotency/event/outbox 的事务化读写。
+  - `app/conversation/context_manager.py`: 按 anchor 管理 token 估算、单轮压缩、原文归档、全文摘要与 prompt 物化组装。
+  - `app/conversation/token_counter.py`: 使用 `tiktoken` 估算 prompt token 成本。
   - `app/conversation/projector.py`: 消费 outbox 并异步投影到长期记忆写接口。
   - `app/graph/workflow.py`: 主流程 9 节点编排（load memory / resolve symbols / collect via MCP / normalize & index / retrieve knowledge evidence / analyze / generate / persist memory / finalize）。
   - `app/memory/mem0_service.py`: DeepSeek 偏好抽取、偏好归一化/合并、单条画像写回、recent turns + summary 注入、Mem0 platform/oss 兼容。
@@ -94,7 +96,9 @@
   - `idempotency_request`：`request_id` 状态机（`pending/completed/failed`）。
   - `conversation_turn`：每轮完整记录（query/assistant_message/report/citations/errors/workflow/intent/turn_type/parent_turn_id/report_id）。
   - `conversation_report`：报告版本资产（`report_version` 会话内递增，支持 `based_on_report_id` 重写链）。
-  - `conversation_context_summary`：长会话压缩摘要（`through_version` 指示覆盖边界）。
+  - `conversation_context_state`：按 `(conversation_id, anchor_turn_id)` 记录当前物化进度、压缩轮次、全文摘要进度、最近一次 prompt token 估算。
+  - `conversation_context_compression`：按 `(conversation_id, anchor_turn_id, round_no)` 记录每轮压缩结果、版本覆盖范围、压缩前原文归档文件路径与 token 估算。
+  - `conversation_context_full_summary`：按 `(conversation_id, anchor_turn_id)` 记录基于归档原文生成的全文摘要、覆盖轮次/版本与原文 manifest。
   - `conversation_event` + `outbox_event`：事件日志与异步投影队列。
   - `conversation_state_checkpoint`：节点级 checkpoint 预留。
 - 并发与幂等规则:
@@ -110,18 +114,21 @@
 - 数据来源:
   - 用户消息（`message/action/task_context/expected_version/from_turn_id`）。
   - MCP tools 返回的结构化或文本内容。
-  - 实时信号向量库（`signal_chunks`）、知识证据向量库（`knowledge_chunks`）、用户记忆（`user_memory`）以及会话真相库 turn/report/summary。
+  - 实时信号向量库（`signal_chunks`）、知识证据向量库（`knowledge_chunks`）、用户记忆（`user_memory`）以及会话真相库 turn/report/context-state/context-compression/context-full-summary。
 - 主链路（`POST /v1/conversation/{conversation_id}/message`）:
   1. API 路由接收消息并注入/透传 `trace_id`。
   2. `ConversationService.send_message` 执行 `prepare_turn`（CAS + 幂等 + version 分配）。
   3. 若提供 `from_turn_id`，将其作为分支锚点（父节点）；未提供时默认挂接当前最新 turn。
   4. `action=auto` 时优先调用 DeepSeek 小模型做 `chat/rewrite/regenerate` 动作分类；若模型不可用或分类失败，则回退到规则判断。
-  5. `chat`：基于“分支摘要 + 分支最近 turns + 分支最新报告”构造 prompt，调用 LLM 生成对话回复。
+  5. `chat`：基于“全文摘要 + 增量压缩片段 + 未压缩原始轮次 + 分支最新报告”构造 prompt，调用 LLM 生成对话回复。
   6. `rewrite_report`：优先读取目标报告；未指定时读取分支链路可见的最新报告并改写。
   7. `regenerate_report`：调用 `ResearchGraphRunner.arun` 执行完整 9 节点流程并产出新报告版本（透传分支锚点到记忆加载）。
   8. 报告记忆写回阶段会调用偏好抽取模型，仅保留可跨任务复用偏好字段并做脏数据过滤后再入库。
   9. 事务写入 `conversation_turn`，必要时写入 `conversation_report`，并更新 `idempotency_request=completed`。
-  10. 刷新 `conversation_context_summary`（超过窗口后增量压缩历史轮次）。
+  10. `ConversationContextManager` 按 `anchor_turn_id` 独立物化上下文资产；主线使用 `anchor_turn_id=NULL`，历史分支使用显式 `from_turn_id`。
+  11. 达到 `100k token` 时最多只做 `1` 轮压缩，并先把压缩前原文落盘到 `data/context_archives/{conversation_id}/{anchor_key}/`。
+  12. 每累计 `5` 轮压缩，同步从 `conversation_context_compression.raw_file_path` 读取归档原文生成 `conversation_context_full_summary`，不复用压缩文本二次摘要。
+  13. 单轮压缩后若估算仍超过 `200k token`，本次请求不再继续压缩，也不拒绝请求；仅记录 warning，等待后续会话再次触发下一轮压缩。
 - 兼容链路（`POST /v1/research/query`）:
   - 直接调用 `ConversationService.run_research_turn`，内部固定走 `regenerate_report` 路径并复用同一套一致性语义。
 - 控制/调度流程:
@@ -160,7 +167,10 @@ sequenceDiagram
     end
     CS->>TS: save_turn_result(+optional report version)
     CS->>TS: update_idempotency_response
-    CS->>TS: upsert_context_summary(optional)
+    CS->>TS: upsert_context_state / insert_context_compression(optional)
+    opt 满足 5 轮压缩
+        CS->>TS: upsert_context_full_summary
+    end
     CS-->>MW: ConversationMessageResponse
     MW-->>API: 附加 X-Trace-Id
     API-->>U: action_taken/assistant_message/report?/workflow_steps
@@ -187,6 +197,7 @@ sequenceDiagram
   - 记忆：`MEM0_ENABLED`、`MEM0_MODE`、`MEM0_OSS_COLLECTION`、`MEM0_API_KEY`、`MEM0_ORG_ID`、`MEM0_PROJECT_ID`。
   - 偏好抽取：`MEMORY_EXTRACTOR_MODEL`、`MEMORY_EXTRACTOR_TIMEOUT_SECONDS`、`DEEPSEEK_API_KEY`、`DEEPSEEK_BASE_URL`。
   - 会话持久化：`CONVERSATION_STORE_PATH`（SQLite 真相库路径）。
+  - 上下文压缩：`CONTEXT_ARCHIVE_DIR`、`CONTEXT_COMPRESSION_TRIGGER_TOKENS`、`CONTEXT_COMPRESSION_HARD_LIMIT_TOKENS`、`CONTEXT_RECENT_TURN_WINDOW`、`CONTEXT_COMPRESSION_MODEL`、`CONTEXT_COMPRESSION_TIMEOUT_SECONDS`、`CONTEXT_FULL_SUMMARY_EVERY_N_COMPRESSIONS`。
   - 短期会话缓存：`SESSION_STORE_BACKEND`（`memory|redis`）、`REDIS_URL`、`SESSION_MEMORY_TTL_SECONDS`、`SESSION_MEMORY_MAX_ITEMS`。
   - MCP: `MCP_CONFIG_PATH`（默认 `.mcp.json`，Claude Code 风格 `mcpServers`）、`MCP_MAX_ROUNDS`（Agent 工具调用预算提示）。
   - 报告合规：`REPORT_DISCLAIMER`（报告结尾免责声明文案）。
@@ -216,18 +227,39 @@ sequenceDiagram
   - Agent 执行异常返回 `agent_failed`；若最终 JSON 解析失败但有 `ToolMessage` 可提取结果，仍会继续使用可提取信号。
   - Milvus 不可用时可降级内存存储（受 `MILVUS_ALLOW_FALLBACK` 控制）。
   - 未配置 LLM 密钥或 LLM 调用失败时，请求返回 500（硬失败）；未配置智谱密钥时降级哈希向量。
+  - 未配置 `DEEPSEEK_API_KEY` 时，动作分类与上下文压缩会降级关闭；主链路仍可运行，但不会自动压缩上下文。
   - 未配置 `DEEPSEEK_API_KEY` 或抽取模型调用失败时，仅跳过偏好自动抽取，不影响主链路出报。
   - Mem0 初始化或调用失败仅告警，不阻断主流程。
+  - 单轮压缩后若仍超过 `200k token`，仅记录 `context.hard_limit.exceeded` warning，不会直接拒绝当前请求。
 - 观测与日志:
   - 日志由 `app/config/logging.py` 统一初始化，注入 `trace_id/task_id/user_id/component/round`。
   - API 层通过 `X-Trace-Id` 实现请求链路关联。
   - MCP 工具失败会记录 `tool/error_type/detail` 摘要，便于区分瞬时错误、参数错误与永久错误。
   - 会话层会记录 `turn.accepted/turn.completed/turn.failed` 事件，可用于恢复与排障。
+  - 上下文治理会记录 `context.budget.evaluated`、`context.compress.triggered`、`context.compress.completed`、`context.full_summary.triggered`、`context.full_summary.completed`、`context.hard_limit.exceeded`，用于追踪压缩/全文摘要触发与预算超限观测。
   - outbox 投影器记录失败重试次数并在超阈值后标记 `failed`。
   - 文件日志支持“按天轮转 + 单文件超限切分 + 超期清理”。
   - LangSmith 通过 `configure_langsmith` 以环境变量控制开启。
 
 ## 改动概要/变更记录
+### 2026-03-22 13:31:17
+- 本次新增/更新要点:
+  - README 补充长会话上下文治理说明，明确 `100k` 单轮压缩、`5` 轮全文摘要、`200k` 硬上限，以及 `deepseek-chat + MiniMax` 的模型分工。
+  - 架构文档补充上下文治理观测事件，明确 `context.*` 日志可用于排查压缩触发、全文摘要完成与预算超限观测。
+- 变更动机/需求来源:
+  - 来源于当前会话需求：用户要求把最新的压缩/全文摘要逻辑同步到 `docs/architecture.md` 和 `README`。
+- 当前更新时间: 2026-03-22 13:31:17
+
+### 2026-03-22 12:23:09
+- 本次新增/更新要点:
+  - 会话长上下文机制从单表 `conversation_context_summary` 升级为三表物化资产：`conversation_context_state`、`conversation_context_compression`、`conversation_context_full_summary`。
+  - 新增 `ConversationContextManager` 与 `TokenCounter`，实现 `100k` 触发单轮压缩、原文归档落盘、每 `5` 轮同步全文摘要，并对 `200k` 预算阈值做持续观测。
+  - 分支上下文按 `anchor_turn_id` 隔离存储；主线与“从历史分支继续”的非主线 anchor 不共享压缩资产。
+  - SQLite 初始化阶段显式执行 `DROP TABLE IF EXISTS conversation_context_summary`，移除旧上下文摘要表。
+- 变更动机/需求来源:
+  - 来源于当前会话需求：用户要求区分“压缩”和“全文摘要”两类动作，按 `100k/200k` 阈值与 `5` 轮摘要规则重构长会话上下文机制，并删除旧表与旧兼容逻辑。
+- 当前更新时间: 2026-03-22 12:23:09
+
 ### 2026-03-05 00:21:28
 - 本次新增/更新要点:
   - 记忆链路新增 DeepSeek 偏好抽取模型配置（`MEMORY_EXTRACTOR_*`、`DEEPSEEK_*`），并在 `MemoryService` 中引入模型初始化与 JSON 结构化抽取流程。
@@ -251,7 +283,7 @@ sequenceDiagram
 ### 2026-03-04 00:11:08
 - 本次新增/更新要点:
   - 架构主入口从“单次 query”扩展为“会话消息驱动”：新增 `POST /v1/conversation/{conversation_id}/message`，支持 `auto/chat/rewrite_report/regenerate_report`。
-  - 会话真相库新增报告版本与摘要压缩能力：`conversation_report`、`conversation_context_summary`，并补齐 turn 结构字段（`assistant_message/intent/turn_type/parent_turn_id/report_id`）。
+  - 会话真相库新增报告版本与长上下文物化能力：`conversation_report` 与后续扩展出的上下文资产表，并补齐 turn 结构字段（`assistant_message/intent/turn_type/parent_turn_id/report_id`）。
   - 新增会话读取 API：`GET /v1/conversation/{id}`、`GET /v1/conversation/{id}/turns`、`GET /v1/conversation/{id}/turns/{turn_id}`、`GET /v1/conversation/{id}/reports`、`GET /v1/conversation/{id}/reports/{report_id}`，支持冷重启恢复与历史回放。
   - 运行时链路补充 `ConversationService + OutboxProjector + SessionStore`，明确“会话真相强一致、Milvus/Mem0 最终一致”的双写策略。
   - 前端 Dashboard 交互链路同步为持续对话模式：Message Composer + Dialogue + Timeline + Version Tape。

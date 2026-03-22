@@ -9,6 +9,7 @@ from app.agents.llm import create_deepseek_client, create_llm_client
 from app.agents.report_agent import ReportAgent
 from app.config.logging import get_logger, log_context
 from app.config.settings import Settings
+from app.conversation.context_manager import ConversationContextManager
 from app.conversation.projector import OutboxProjector
 from app.conversation.service import ConversationService
 from app.conversation.store import SQLiteConversationTruthStore
@@ -52,11 +53,30 @@ class AppRuntime:
             except Exception:
                 self.conversation_action_llm = None
                 logger.exception("会话动作分类模型初始化失败，auto 动作路由将回退到规则判断")
+            try:
+                self.context_compression_llm = create_deepseek_client(
+                    settings,
+                    model_name=settings.context_compression_model,
+                    timeout_seconds=settings.context_compression_timeout_seconds,
+                )
+                logger.info("上下文压缩模型初始化完成 model=%s", settings.context_compression_model)
+            except ValueError:
+                self.context_compression_llm = None
+                logger.warning("未配置 DEEPSEEK_API_KEY，上下文压缩将保持关闭")
+            except Exception:
+                self.context_compression_llm = None
+                logger.exception("上下文压缩模型初始化失败，将跳过自动压缩")
             self.session_store = build_session_memory_store(
                 backend=settings.session_store_backend,
                 redis_url=settings.redis_url,
                 ttl_seconds=settings.session_memory_ttl_seconds,
                 max_items=settings.session_memory_max_items,
+            )
+            self.context_manager = ConversationContextManager(
+                settings=settings,
+                truth_store=self.conversation_store,
+                compression_llm=self.context_compression_llm,
+                full_summary_llm=self.llm,
             )
             self.memory_service = MemoryService(
                 settings=settings,
@@ -64,6 +84,7 @@ class AppRuntime:
                 session_store=self.session_store,
                 outbox_store=self.conversation_store,
                 conversation_store=self.conversation_store,
+                context_manager=self.context_manager,
             )
             self.mcp_subgraph = MCPSignalSubgraphRunner(
                 llm=self.llm,
@@ -85,6 +106,7 @@ class AppRuntime:
                 graph_runner=self.graph_runner,
                 truth_store=self.conversation_store,
                 action_classifier_llm=self.conversation_action_llm,
+                context_manager=self.context_manager,
             )
             self.outbox_projector = OutboxProjector(
                 truth_store=self.conversation_store,

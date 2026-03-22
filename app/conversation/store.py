@@ -3,6 +3,9 @@
 当前实现使用 SQLite 落地以下数据：
 - conversation_snapshot: 会话最新版本快照
 - conversation_turn: 每轮完整记录（恢复主表）
+- conversation_context_state: 按 anchor 维度记录上下文压缩/全文摘要状态
+- conversation_context_compression: 按 anchor 维度记录压缩轮次结果
+- conversation_context_full_summary: 按 anchor 维度记录全文摘要结果
 - conversation_state_checkpoint: 节点级状态快照（预留）
 - idempotency_request: request_id 幂等记录
 - conversation_event: 事件日志
@@ -199,11 +202,52 @@ class SQLiteConversationTruthStore:
                 CREATE INDEX IF NOT EXISTS idx_report_conversation_version
                     ON conversation_report(conversation_id, report_version DESC);
 
-                CREATE TABLE IF NOT EXISTS conversation_context_summary (
-                    conversation_id TEXT PRIMARY KEY,
+                CREATE TABLE IF NOT EXISTS conversation_context_state (
+                    conversation_id TEXT NOT NULL,
+                    anchor_turn_id TEXT NOT NULL,
+                    latest_materialized_version INTEGER NOT NULL,
+                    compression_round_count INTEGER NOT NULL,
+                    compressions_since_full_summary INTEGER NOT NULL,
+                    last_full_summary_round INTEGER NOT NULL,
+                    last_full_summary_version INTEGER NOT NULL,
+                    latest_prompt_token_estimate INTEGER NOT NULL,
+                    updated_at INTEGER NOT NULL,
+                    PRIMARY KEY(conversation_id, anchor_turn_id)
+                );
+
+                CREATE TABLE IF NOT EXISTS conversation_context_compression (
+                    compression_id TEXT PRIMARY KEY,
+                    conversation_id TEXT NOT NULL,
+                    anchor_turn_id TEXT NOT NULL,
+                    round_no INTEGER NOT NULL,
+                    source_start_version INTEGER NOT NULL,
+                    source_end_version INTEGER NOT NULL,
+                    source_turn_ids_json TEXT NOT NULL,
+                    raw_file_path TEXT NOT NULL,
+                    raw_token_estimate INTEGER NOT NULL,
+                    compressed_text TEXT NOT NULL,
+                    compressed_token_estimate INTEGER NOT NULL,
+                    model_name TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    created_at INTEGER NOT NULL,
+                    updated_at INTEGER NOT NULL,
+                    UNIQUE(conversation_id, anchor_turn_id, round_no)
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_context_compression_conversation_round
+                    ON conversation_context_compression(conversation_id, anchor_turn_id, round_no ASC);
+
+                CREATE TABLE IF NOT EXISTS conversation_context_full_summary (
+                    conversation_id TEXT NOT NULL,
+                    anchor_turn_id TEXT NOT NULL,
                     summary_text TEXT NOT NULL,
-                    through_version INTEGER NOT NULL,
-                    updated_at INTEGER NOT NULL
+                    source_round_upto INTEGER NOT NULL,
+                    source_version_upto INTEGER NOT NULL,
+                    source_turn_ids_json TEXT NOT NULL,
+                    raw_manifest_json TEXT NOT NULL,
+                    model_name TEXT NOT NULL,
+                    updated_at INTEGER NOT NULL,
+                    PRIMARY KEY(conversation_id, anchor_turn_id)
                 );
 
                 CREATE TABLE IF NOT EXISTS knowledge_document (
@@ -258,6 +302,7 @@ class SQLiteConversationTruthStore:
             existing = {str(row["name"]) for row in conn.execute("PRAGMA table_info(outbox_event)")}
             if "last_error" not in existing:
                 conn.execute("ALTER TABLE outbox_event ADD COLUMN last_error TEXT")
+            conn.execute("DROP TABLE IF EXISTS conversation_context_summary")
             turn_columns = {str(row["name"]) for row in conn.execute("PRAGMA table_info(conversation_turn)")}
             migrations = [
                 ("assistant_message_text", "ALTER TABLE conversation_turn ADD COLUMN assistant_message_text TEXT NOT NULL DEFAULT ''"),
@@ -1109,71 +1154,274 @@ class SQLiteConversationTruthStore:
             return None
         return self._decode_report_row(row)
 
-    def get_context_summary(self, *, conversation_id: str) -> dict[str, Any] | None:
+    def get_context_state(self, *, conversation_id: str) -> dict[str, Any] | None:
+        return self.get_context_state_for_anchor(conversation_id=conversation_id, anchor_turn_id=None)
+
+    def get_context_state_for_anchor(
+        self,
+        *,
+        conversation_id: str,
+        anchor_turn_id: str | None,
+    ) -> dict[str, Any] | None:
+        anchor_key = self._normalize_anchor_turn_id(anchor_turn_id)
         with self._connect() as conn:
             row = conn.execute(
                 """
-                SELECT conversation_id, summary_text, through_version, updated_at
-                FROM conversation_context_summary
-                WHERE conversation_id = ?
+                SELECT conversation_id, anchor_turn_id, latest_materialized_version, compression_round_count,
+                       compressions_since_full_summary, last_full_summary_round,
+                       last_full_summary_version, latest_prompt_token_estimate, updated_at
+                FROM conversation_context_state
+                WHERE conversation_id = ? AND anchor_turn_id = ?
                 LIMIT 1
                 """,
-                (conversation_id,),
+                (conversation_id, anchor_key),
             ).fetchone()
         if row is None:
             return None
         return {
             "conversation_id": str(row["conversation_id"]),
-            "summary_text": str(row["summary_text"]),
-            "through_version": int(row["through_version"]),
+            "anchor_turn_id": None if not str(row["anchor_turn_id"]) else str(row["anchor_turn_id"]),
+            "latest_materialized_version": int(row["latest_materialized_version"]),
+            "compression_round_count": int(row["compression_round_count"]),
+            "compressions_since_full_summary": int(row["compressions_since_full_summary"]),
+            "last_full_summary_round": int(row["last_full_summary_round"]),
+            "last_full_summary_version": int(row["last_full_summary_version"]),
+            "latest_prompt_token_estimate": int(row["latest_prompt_token_estimate"]),
             "updated_at": int(row["updated_at"]),
         }
 
-    def upsert_context_summary(
+    def upsert_context_state(
         self,
         *,
         conversation_id: str,
-        summary_text: str,
-        through_version: int,
+        anchor_turn_id: str | None,
+        latest_materialized_version: int,
+        compression_round_count: int,
+        compressions_since_full_summary: int,
+        last_full_summary_round: int,
+        last_full_summary_version: int,
+        latest_prompt_token_estimate: int,
     ) -> None:
+        anchor_key = self._normalize_anchor_turn_id(anchor_turn_id)
         now = _now_ts()
         with self._write_guard:
             with self._connect() as conn:
                 conn.execute(
                     """
-                    INSERT INTO conversation_context_summary(conversation_id, summary_text, through_version, updated_at)
-                    VALUES (?, ?, ?, ?)
-                    ON CONFLICT(conversation_id) DO UPDATE SET
-                      summary_text=excluded.summary_text,
-                      through_version=excluded.through_version,
+                    INSERT INTO conversation_context_state(
+                      conversation_id, anchor_turn_id, latest_materialized_version, compression_round_count,
+                      compressions_since_full_summary, last_full_summary_round,
+                      last_full_summary_version, latest_prompt_token_estimate, updated_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(conversation_id, anchor_turn_id) DO UPDATE SET
+                      latest_materialized_version=excluded.latest_materialized_version,
+                      compression_round_count=excluded.compression_round_count,
+                      compressions_since_full_summary=excluded.compressions_since_full_summary,
+                      last_full_summary_round=excluded.last_full_summary_round,
+                      last_full_summary_version=excluded.last_full_summary_version,
+                      latest_prompt_token_estimate=excluded.latest_prompt_token_estimate,
                       updated_at=excluded.updated_at
                     """,
-                    (conversation_id, summary_text, int(through_version), now),
+                    (
+                        conversation_id,
+                        anchor_key,
+                        int(latest_materialized_version),
+                        int(compression_round_count),
+                        int(compressions_since_full_summary),
+                        int(last_full_summary_round),
+                        int(last_full_summary_version),
+                        int(latest_prompt_token_estimate),
+                        now,
+                    ),
                 )
 
-    def list_turns_up_to_version(
+    def insert_context_compression(
+        self,
+        *,
+        compression_id: str,
+        conversation_id: str,
+        anchor_turn_id: str | None,
+        round_no: int,
+        source_start_version: int,
+        source_end_version: int,
+        source_turn_ids: list[str],
+        raw_file_path: str,
+        raw_token_estimate: int,
+        compressed_text: str,
+        compressed_token_estimate: int,
+        model_name: str,
+        status: str = "completed",
+    ) -> None:
+        anchor_key = self._normalize_anchor_turn_id(anchor_turn_id)
+        now = _now_ts()
+        with self._write_guard:
+            with self._connect() as conn:
+                conn.execute(
+                    """
+                    INSERT INTO conversation_context_compression(
+                      compression_id, conversation_id, anchor_turn_id, round_no, source_start_version, source_end_version,
+                      source_turn_ids_json, raw_file_path, raw_token_estimate,
+                      compressed_text, compressed_token_estimate, model_name, status,
+                      created_at, updated_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        compression_id,
+                        conversation_id,
+                        anchor_key,
+                        int(round_no),
+                        int(source_start_version),
+                        int(source_end_version),
+                        _json_dumps(source_turn_ids),
+                        raw_file_path,
+                        int(raw_token_estimate),
+                        compressed_text,
+                        int(compressed_token_estimate),
+                        model_name,
+                        status,
+                        now,
+                        now,
+                    ),
+                )
+
+    def list_context_compressions(
         self,
         *,
         conversation_id: str,
-        through_version: int,
-        limit: int = 200,
+        anchor_turn_id: str | None,
+        after_round_no: int | None = None,
     ) -> list[dict[str, Any]]:
-        final_limit = min(max(int(limit), 1), 500)
+        anchor_key = self._normalize_anchor_turn_id(anchor_turn_id)
         with self._connect() as conn:
-            rows = conn.execute(
+            if after_round_no is None:
+                rows = conn.execute(
+                    """
+                    SELECT compression_id, conversation_id, anchor_turn_id, round_no, source_start_version, source_end_version,
+                           source_turn_ids_json, raw_file_path, raw_token_estimate, compressed_text,
+                           compressed_token_estimate, model_name, status, created_at, updated_at
+                    FROM conversation_context_compression
+                    WHERE conversation_id = ? AND anchor_turn_id = ?
+                    ORDER BY round_no ASC
+                    """,
+                    (conversation_id, anchor_key),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    """
+                    SELECT compression_id, conversation_id, anchor_turn_id, round_no, source_start_version, source_end_version,
+                           source_turn_ids_json, raw_file_path, raw_token_estimate, compressed_text,
+                           compressed_token_estimate, model_name, status, created_at, updated_at
+                    FROM conversation_context_compression
+                    WHERE conversation_id = ? AND anchor_turn_id = ? AND round_no > ?
+                    ORDER BY round_no ASC
+                    """,
+                    (conversation_id, anchor_key, int(after_round_no)),
+                ).fetchall()
+        result: list[dict[str, Any]] = []
+        for row in rows:
+            result.append(
+                {
+                    "compression_id": str(row["compression_id"]),
+                    "conversation_id": str(row["conversation_id"]),
+                    "anchor_turn_id": None if not str(row["anchor_turn_id"]) else str(row["anchor_turn_id"]),
+                    "round_no": int(row["round_no"]),
+                    "source_start_version": int(row["source_start_version"]),
+                    "source_end_version": int(row["source_end_version"]),
+                    "source_turn_ids": _json_loads(str(row["source_turn_ids_json"]), []),
+                    "raw_file_path": str(row["raw_file_path"]),
+                    "raw_token_estimate": int(row["raw_token_estimate"]),
+                    "compressed_text": str(row["compressed_text"]),
+                    "compressed_token_estimate": int(row["compressed_token_estimate"]),
+                    "model_name": str(row["model_name"]),
+                    "status": str(row["status"]),
+                    "created_at": int(row["created_at"]),
+                    "updated_at": int(row["updated_at"]),
+                }
+            )
+        return result
+
+    def get_full_context_summary(
+        self,
+        *,
+        conversation_id: str,
+        anchor_turn_id: str | None,
+    ) -> dict[str, Any] | None:
+        anchor_key = self._normalize_anchor_turn_id(anchor_turn_id)
+        with self._connect() as conn:
+            row = conn.execute(
                 """
-                SELECT conversation_id, turn_id, version, request_id, user_id, query_text,
-                       assistant_message_text, task_context_json, response_report, response_citations_json,
-                       response_errors_json, workflow_steps_json, trace_id, status, intent, turn_type,
-                       parent_turn_id, report_id, created_at, updated_at
-                FROM conversation_turn
-                WHERE conversation_id = ? AND version <= ?
-                ORDER BY version ASC
-                LIMIT ?
+                SELECT conversation_id, anchor_turn_id, summary_text, source_round_upto, source_version_upto,
+                       source_turn_ids_json, raw_manifest_json, model_name, updated_at
+                FROM conversation_context_full_summary
+                WHERE conversation_id = ? AND anchor_turn_id = ?
+                LIMIT 1
                 """,
-                (conversation_id, int(through_version), final_limit),
-            ).fetchall()
-        return [self._decode_turn_row(row) for row in rows]
+                (conversation_id, anchor_key),
+            ).fetchone()
+        if row is None:
+            return None
+        return {
+            "conversation_id": str(row["conversation_id"]),
+            "anchor_turn_id": None if not str(row["anchor_turn_id"]) else str(row["anchor_turn_id"]),
+            "summary_text": str(row["summary_text"]),
+            "source_round_upto": int(row["source_round_upto"]),
+            "source_version_upto": int(row["source_version_upto"]),
+            "source_turn_ids": _json_loads(str(row["source_turn_ids_json"]), []),
+            "raw_manifest": _json_loads(str(row["raw_manifest_json"]), []),
+            "model_name": str(row["model_name"]),
+            "updated_at": int(row["updated_at"]),
+        }
+
+    def upsert_full_context_summary(
+        self,
+        *,
+        conversation_id: str,
+        anchor_turn_id: str | None,
+        summary_text: str,
+        source_round_upto: int,
+        source_version_upto: int,
+        source_turn_ids: list[str],
+        raw_manifest: list[dict[str, Any]],
+        model_name: str,
+    ) -> None:
+        anchor_key = self._normalize_anchor_turn_id(anchor_turn_id)
+        now = _now_ts()
+        with self._write_guard:
+            with self._connect() as conn:
+                conn.execute(
+                    """
+                    INSERT INTO conversation_context_full_summary(
+                      conversation_id, anchor_turn_id, summary_text, source_round_upto, source_version_upto,
+                      source_turn_ids_json, raw_manifest_json, model_name, updated_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(conversation_id, anchor_turn_id) DO UPDATE SET
+                      summary_text=excluded.summary_text,
+                      source_round_upto=excluded.source_round_upto,
+                      source_version_upto=excluded.source_version_upto,
+                      source_turn_ids_json=excluded.source_turn_ids_json,
+                      raw_manifest_json=excluded.raw_manifest_json,
+                      model_name=excluded.model_name,
+                      updated_at=excluded.updated_at
+                    """,
+                    (
+                        conversation_id,
+                        anchor_key,
+                        summary_text,
+                        int(source_round_upto),
+                        int(source_version_upto),
+                        _json_dumps(source_turn_ids),
+                        _json_dumps(raw_manifest),
+                        model_name,
+                        now,
+                    ),
+                )
+
+    @staticmethod
+    def _normalize_anchor_turn_id(anchor_turn_id: str | None) -> str:
+        return str(anchor_turn_id or "").strip()
 
     def enqueue_outbox_event(
         self,

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import json
 from time import perf_counter
 from typing import Any
@@ -22,6 +23,8 @@ from app.models.schemas import (
     ensure_workflow_steps,
 )
 
+logger = logging.getLogger(__name__)
+
 
 class ConversationService:
     """封装会话串行、幂等、对话路由与报告版本管理。"""
@@ -33,11 +36,13 @@ class ConversationService:
         truth_store: SQLiteConversationTruthStore,
         lock_manager: ConversationLockManager | None = None,
         action_classifier_llm: BaseChatModel | Any | None = None,
+        context_manager: Any | None = None,
     ) -> None:
         self.graph_runner = graph_runner
         self.truth_store = truth_store
         self.lock_manager = lock_manager or ConversationLockManager()
         self.action_classifier_llm = action_classifier_llm
+        self.context_manager = context_manager
 
     async def run_research_turn(
         self,
@@ -63,7 +68,7 @@ class ConversationService:
             latest_turn = self.truth_store.get_latest_turn(conversation_id=resolved_conversation_id)
             if not resolved_parent_turn_id and latest_turn is not None:
                 resolved_parent_turn_id = str(latest_turn.get("turn_id", "")).strip() or None
-            resolved_context_anchor_turn_id = context_anchor_turn_id or resolved_parent_turn_id
+            resolved_context_anchor_turn_id = context_anchor_turn_id
 
             prepared = self.truth_store.prepare_turn(
                 conversation_id=resolved_conversation_id,
@@ -77,6 +82,12 @@ class ConversationService:
                 return cached.model_copy(update={"trace_id": trace_id})
 
             try:
+                self._ensure_context_budget(
+                    conversation_id=prepared.conversation_id,
+                    anchor_turn_id=resolved_context_anchor_turn_id,
+                    include_latest_report=True,
+                    pending_user_message=query,
+                )
                 response = await self.graph_runner.arun(
                     user_id=user_id,
                     query=query,
@@ -121,7 +132,6 @@ class ConversationService:
                 parent_turn_id=resolved_parent_turn_id,
                 report_payload=report_payload,
             )
-            self._refresh_context_summary(conversation_id=prepared.conversation_id)
             if report_meta is None:
                 return response
             return response.model_copy(
@@ -161,7 +171,7 @@ class ConversationService:
             latest_turn = self.truth_store.get_latest_turn(conversation_id=resolved_conversation_id)
             if not resolved_parent_turn_id and latest_turn is not None:
                 resolved_parent_turn_id = str(latest_turn.get("turn_id", "")).strip() or None
-            resolved_context_anchor_turn_id = from_turn_id or resolved_parent_turn_id
+            resolved_context_anchor_turn_id = from_turn_id
 
             prepared = self.truth_store.prepare_turn(
                 conversation_id=resolved_conversation_id,
@@ -231,7 +241,6 @@ class ConversationService:
                 )
                 raise
 
-            self._refresh_context_summary(conversation_id=prepared.conversation_id)
             return response
 
     async def resume_research_turn(
@@ -443,6 +452,12 @@ class ConversationService:
         context_anchor_turn_id: str | None,
     ) -> ConversationMessageResponse:
         llm = self.graph_runner.report_agent.llm
+        self._ensure_context_budget(
+            conversation_id=conversation_id,
+            anchor_turn_id=context_anchor_turn_id,
+            include_latest_report=True,
+            pending_user_message=message,
+        )
         context_prompt = self._build_context_prompt(
             conversation_id=conversation_id,
             include_latest_report=True,
@@ -524,6 +539,17 @@ class ConversationService:
             raise ValueError("no report available for rewrite")
 
         llm = self.graph_runner.report_agent.llm
+        self._ensure_context_budget(
+            conversation_id=conversation_id,
+            anchor_turn_id=context_anchor_turn_id,
+            include_latest_report=True,
+            pending_user_message=message,
+        )
+        context_prompt = self._build_context_prompt(
+            conversation_id=conversation_id,
+            include_latest_report=True,
+            anchor_turn_id=context_anchor_turn_id,
+        )
         start = perf_counter()
         rewritten = llm.invoke(
             [
@@ -537,6 +563,7 @@ class ConversationService:
                     content=(
                         f"用户ID: {user_id}\n"
                         f"会话ID: {conversation_id}\n"
+                        f"上下文:\n{context_prompt}\n\n"
                         f"原报告:\n{source_report['report']}\n\n"
                         f"改写要求:\n{message}"
                     )
@@ -600,6 +627,12 @@ class ConversationService:
         parent_turn_id: str | None,
         context_anchor_turn_id: str | None,
     ) -> ConversationMessageResponse:
+        self._ensure_context_budget(
+            conversation_id=conversation_id,
+            anchor_turn_id=context_anchor_turn_id,
+            include_latest_report=True,
+            pending_user_message=message,
+        )
         response = await self.graph_runner.arun(
             user_id=user_id,
             query=message,
@@ -653,41 +686,6 @@ class ConversationService:
         response_payload["report"] = ensure_conversation_report(response_payload.get("report"))
         return ConversationMessageResponse.model_validate(response_payload)
 
-    def _refresh_context_summary(self, *, conversation_id: str, recent_window: int = 8) -> None:
-        """为长会话维护摘要。"""
-
-        meta = self.truth_store.get_conversation_meta(conversation_id)
-        if not meta:
-            return
-        latest_version = int(meta.get("latest_version", 0) or 0)
-        if latest_version <= recent_window:
-            return
-        through_version = latest_version - recent_window
-        summary_row = self.truth_store.get_context_summary(conversation_id=conversation_id)
-        if summary_row and int(summary_row.get("through_version", 0)) >= through_version:
-            return
-        turns = self.truth_store.list_turns_up_to_version(
-            conversation_id=conversation_id,
-            through_version=through_version,
-            limit=200,
-        )
-        if not turns:
-            return
-        lines: list[str] = []
-        for row in turns[-24:]:
-            role_text = f"v{row.get('version')}[{row.get('intent', '')}]"
-            query = str(row.get("query", "")).strip().replace("\n", " ")
-            answer = str(row.get("assistant_message", "")).strip().replace("\n", " ")
-            if len(answer) > 120:
-                answer = answer[:120] + "..."
-            lines.append(f"- {role_text} Q:{query} A:{answer}")
-        summary_text = "\n".join(lines)
-        self.truth_store.upsert_context_summary(
-            conversation_id=conversation_id,
-            summary_text=summary_text,
-            through_version=through_version,
-        )
-
     def _build_context_prompt(
         self,
         *,
@@ -695,58 +693,36 @@ class ConversationService:
         include_latest_report: bool,
         anchor_turn_id: str | None = None,
     ) -> str:
-        summary: dict[str, Any] | None = None
-        if anchor_turn_id:
-            lineage_turns = self.truth_store.list_turn_lineage(
-                conversation_id=conversation_id,
-                leaf_turn_id=anchor_turn_id,
-                limit=24,
+        return self.context_manager.build_context_prompt(
+            conversation_id=conversation_id,
+            anchor_turn_id=anchor_turn_id,
+            include_latest_report=include_latest_report,
+        )
+
+    def _ensure_context_budget(
+        self,
+        *,
+        conversation_id: str,
+        anchor_turn_id: str | None,
+        include_latest_report: bool,
+        pending_user_message: str,
+    ) -> None:
+        if self.context_manager is None:
+            return
+        result = self.context_manager.ensure_context_budget(
+            conversation_id=conversation_id,
+            anchor_turn_id=anchor_turn_id,
+            include_latest_report=include_latest_report,
+            pending_user_message=pending_user_message,
+        )
+        if bool(result.get("hard_limit_exceeded")):
+            logger.warning(
+                "context.hard_limit.exceeded conversation_id=%s anchor_turn_id=%s token_estimate=%s hard_limit_tokens=%s",
+                conversation_id,
+                anchor_turn_id or "__mainline__",
+                int(result.get("token_estimate", 0) or 0),
+                int(getattr(self.context_manager.settings, "context_compression_hard_limit_tokens", 0) or 0),
             )
-            recent_turns = list(reversed(lineage_turns[:8]))
-            older_turns = list(reversed(lineage_turns[8:]))
-            if older_turns:
-                lines: list[str] = []
-                for turn in older_turns:
-                    query = str(turn.get("query", "")).strip().replace("\n", " ")
-                    answer = str(turn.get("assistant_message", "")).strip().replace("\n", " ")
-                    if len(answer) > 120:
-                        answer = answer[:120] + "..."
-                    lines.append(f"- v{turn.get('version')}[{turn.get('intent', '')}] Q:{query} A:{answer}")
-                summary = {
-                    "through_version": older_turns[-1].get("version", 0),
-                    "summary_text": "\n".join(lines),
-                }
-        else:
-            summary = self.truth_store.get_context_summary(conversation_id=conversation_id)
-            recent_turns = self.truth_store.list_turns(conversation_id=conversation_id, limit=8)
-            recent_turns = list(reversed(recent_turns))
-        sections: list[str] = []
-        if summary:
-            sections.append(
-                f"[历史摘要(截至v{summary['through_version']})]\n{summary['summary_text']}"
-            )
-        if include_latest_report:
-            latest_report = (
-                self.truth_store.get_latest_report_on_lineage(
-                    conversation_id=conversation_id,
-                    leaf_turn_id=anchor_turn_id,
-                )
-                if anchor_turn_id
-                else self.truth_store.get_latest_report(conversation_id=conversation_id)
-            )
-            if latest_report:
-                sections.append(
-                    f"[最新报告 v{latest_report['report_version']}]\n{latest_report['report']}"
-                )
-        if recent_turns:
-            lines = []
-            for turn in recent_turns:
-                lines.append(
-                    f"- v{turn['version']}[{turn.get('intent', '')}] Q:{turn.get('query', '')} "
-                    f"A:{turn.get('assistant_message', '')}"
-                )
-            sections.append("[最近轮次]\n" + "\n".join(lines))
-        return "\n\n".join(sections) if sections else "暂无历史上下文"
 
     @staticmethod
     def _extract_text(content: Any) -> str:

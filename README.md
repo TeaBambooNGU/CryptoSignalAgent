@@ -51,6 +51,7 @@
 
 - **对话优先**：统一入口支持 `auto/chat/rewrite_report/regenerate_report`，其中 `auto` 优先由 DeepSeek 小模型判定动作。
 - **可追溯**：会话与报告版本可回放，支持从历史 `turn` 分支恢复。
+- **长会话可控**：上下文在 `100k token` 触发单轮压缩，累计 `5` 轮压缩后基于原文归档生成全文摘要；`200k token` 仅作为预算观测阈值，不会直接拒绝当前请求。
 - **多源信号**：通过标准 MCP 协议接入行情、链上、新闻等数据。
 - **工程化可观测**：请求级 `X-Trace-Id`、节点级耗时、重试与降级策略。
 
@@ -65,6 +66,9 @@
 - 长期偏好自动抽取（使用小模型）并聚合为单条画像
 - `action=auto` 优先使用 DeepSeek 小模型分类为 `chat / rewrite_report / regenerate_report`
 - DeepSeek 动作分类失败或未配置时，自动回退到规则判断
+- 长会话上下文治理：`100k token` 触发单轮压缩，使用 `deepseek-chat`；每 `5` 轮压缩基于原文归档生成一次全文摘要，使用主 LLM（默认 MiniMax）
+- 上下文资产按 `anchor_turn_id` 隔离存储，主线与从历史节点继续的分支不会复用同一套压缩结果
+- `200k token` 仅作为上下文预算观测阈值，超过时会记录 warning，并在后续会话继续触发下一轮压缩/摘要推进
 - 会话一致性保障：`request_id` 幂等 + `expected_version` CAS
 - 异步 outbox 投影：会话真相库强一致、外部记忆最终一致
 
@@ -119,7 +123,7 @@ cp .env.example .env
 最少请配置：
 
 - `LLM_PROVIDER` + 对应密钥（默认 MiniMax）
-- `DEEPSEEK_API_KEY`（用于长期偏好抽取与 `auto` 动作分类）
+- `DEEPSEEK_API_KEY`（用于长期偏好抽取、`auto` 动作分类与上下文压缩）
 - `MCP_CONFIG_PATH` 指向 `.mcp.json`
 - 若启用向量库：`MILVUS_URI`
 - 建议同时确认集合配置：`MILVUS_SIGNAL_COLLECTION`、`MILVUS_KNOWLEDGE_COLLECTION`
@@ -173,6 +177,7 @@ npm --prefix frontend run dev
 | 记忆抽取 | `MEMORY_EXTRACTOR_MODEL` / `MEMORY_EXTRACTOR_TIMEOUT_SECONDS` / `DEEPSEEK_API_KEY` / `DEEPSEEK_BASE_URL` | 长期偏好自动抽取模型配置 |
 | 动作分类 | `CONVERSATION_ACTION_MODEL` / `CONVERSATION_ACTION_TIMEOUT_SECONDS` / `DEEPSEEK_API_KEY` / `DEEPSEEK_BASE_URL` | `action=auto` 的 DeepSeek 动作分类配置 |
 | 会话 | `CONVERSATION_STORE_PATH` | SQLite 真相库存储路径 |
+| 上下文压缩 | `CONTEXT_ARCHIVE_DIR` / `CONTEXT_COMPRESSION_TRIGGER_TOKENS` / `CONTEXT_COMPRESSION_HARD_LIMIT_TOKENS` / `CONTEXT_COMPRESSION_MODEL` / `CONTEXT_FULL_SUMMARY_EVERY_N_COMPRESSIONS` | 长会话压缩、原文归档、全文摘要与预算观测控制 |
 | Session | `SESSION_STORE_BACKEND` / `REDIS_URL` | 短期会话记忆存储 |
 | MCP | `MCP_CONFIG_PATH` / `MCP_MAX_ROUNDS` | MCP 配置与调用预算 |
 | Report | `REPORT_SIGNAL_DETAIL_LIMIT` / `REPORT_SIGNAL_VALUE_MAX_CHARS` | 研报 Prompt 中实时信号明细条数上限与单条 value 截断上限 |
@@ -354,6 +359,12 @@ uv run python scripts/inspect_mcp.py
 
 - **Q: `action=auto` 现在怎么判定？**  
   A: 优先由 DeepSeek 小模型判定 `chat / rewrite_report / regenerate_report`；若 DeepSeek 未配置或分类失败，则回退到规则判断。
+
+- **Q: 长会话上下文是怎么处理的？**  
+  A: 到 `100k token` 时只会触发 `1` 轮压缩，并先把压缩前原文落到 `data/context_archives/`；累计 `5` 轮压缩后，会基于这些原文归档同步生成一次全文摘要。压缩模型默认是 `deepseek-chat`，全文摘要使用主 LLM（默认 MiniMax）。
+
+- **Q: `200k token` 的作用是什么？**  
+  A: 它现在只作为预算观测阈值。单次请求仍然只会压缩 `1` 轮，不会因为超过 `200k` 直接失败；后续会话再继续触发下一轮压缩，达到压缩轮次后再同步触发全文摘要。
 
 ## 许可证
 

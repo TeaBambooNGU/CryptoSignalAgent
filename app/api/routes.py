@@ -14,7 +14,10 @@ from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Reques
 
 from app.api.deps import get_runtime
 from app.config.logging import get_current_trace_id, get_logger, log_context
-from app.conversation.errors import ConversationConflictError, DuplicateRequestInFlightError
+from app.conversation.errors import (
+    ConversationConflictError,
+    DuplicateRequestInFlightError,
+)
 from app.models.schemas import (
     ConversationAction,
     ConversationMessageRequest,

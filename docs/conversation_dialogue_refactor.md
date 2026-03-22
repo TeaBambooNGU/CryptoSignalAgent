@@ -80,12 +80,29 @@
 
 - `UNIQUE(conversation_id, report_version)`
 
-### 4.3 conversation_context_summary（新增）
+### 4.3 上下文压缩与全文摘要（新增）
 
-- `conversation_id`（PK）
-- `summary_text`
-- `through_version`（摘要覆盖到的版本）
-- `updated_at`
+- `conversation_context_state`
+  - `(conversation_id, anchor_turn_id)` 维度状态
+  - `latest_materialized_version`
+  - `compression_round_count`
+  - `compressions_since_full_summary`
+  - `last_full_summary_round/last_full_summary_version`
+  - `latest_prompt_token_estimate`
+- `conversation_context_compression`
+  - `(conversation_id, anchor_turn_id, round_no)` 维度压缩结果
+  - `source_start_version/source_end_version`
+  - `source_turn_ids_json`
+  - `raw_file_path/raw_token_estimate`
+  - `compressed_text/compressed_token_estimate`
+  - `model_name/status`
+- `conversation_context_full_summary`
+  - `(conversation_id, anchor_turn_id)` 维度全文摘要
+  - `summary_text`
+  - `source_round_upto/source_version_upto`
+  - `source_turn_ids_json`
+  - `raw_manifest_json`
+  - `model_name/updated_at`
 
 ## 5. API 设计
 
@@ -116,9 +133,10 @@
 
 ## Phase 3：上下文压缩
 
-- 新增 `conversation_context_summary`
-- 按版本推进摘要（摘要 + 最近窗口）
-- 对话与报告执行统一使用压缩上下文
+- 新增 `conversation_context_state / conversation_context_compression / conversation_context_full_summary`
+- `100k token` 触发单轮压缩，原始文本先落盘归档，再调用 `deepseek-chat`
+- 每累计 `5` 轮压缩，基于归档原文同步触发一次全文摘要，模型使用主 LLM（MiniMax）
+- 分支上下文按 `anchor_turn_id` 独立物化，不复用主线压缩资产
 
 ## 7. 关键一致性规则
 
@@ -133,4 +151,3 @@
 2. 指定 `report_id` 能获取完整报告版本数据。
 3. 同 `request_id` 重试返回同 `turn_id/version/action/result`。
 4. 长会话摘要可稳定推进，且不影响最近轮次可追溯性。
-
